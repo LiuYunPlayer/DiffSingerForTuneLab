@@ -7,6 +7,7 @@ using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using TuneLab.Foundation;
 using TuneLab.SDK;
+using static DiffSingerForTuneLab.DiffSingerDeclarations;
 
 namespace DiffSingerForTuneLab;
 
@@ -14,52 +15,20 @@ namespace DiffSingerForTuneLab;
 // 据 use_*_embed 暴露可编辑曲线、据 predict_* 暴露只读回显轨、据 speakers/languages 暴露 part/note 属性。
 // 调度与 6 级合成管线、产物发布为后续阶段：GetNextSegment 暂报「无待合成」，故宿主不驱动 SynthesizeNext，
 // 会话呈现属性面板与轨但不产音——诚实的中间态。
+// 声明面（轨集合/属性面板）已上移到 DiffSingerVoiceEngine（经 DiffSingerDeclarations）；本会话仅承载运行时：
+// 调度、6 级推理管线、产物发布。轨 key 与 variance/gender/speed 规格复用 DiffSingerDeclarations（using static 引入）。
 public sealed class DiffSingerSynthesisSession : ISynthesisSession
 {
-    // —— 暴露给用户的参数键（避开宿主保留名 Volume / VibratoEnvelope）——
-    const string KeyGender = "gender";
-    const string KeySpeed = "speed";
-    const string KeySpeaker = "speaker";
-    const string KeyLanguage = "language";
-
-    // Gender(GENC) / Speed(VELC) 连续轨：忠实采 OpenUtau 原生 UI 量程（非半音/倍率），convert 据此逐字移植。
-    //   · GENC ∈ [-100,100]，基线 0 = 不移位，正 = formant 下移；增广范围 KeyShift* 仅入 convert 缩放，不做轨边界。
-    //     与 energy/breath/tension 轨的 [-100,100] 一致。
-    //   · VELC ∈ [0,200]，基线 100 = 原速，对数（每 +100 速度 ×2）；纯帧级声学条件，不改 durations / 帧数。
-    const double GenderBaseline = 0, GenderMin = -100, GenderMax = 100;
-    const double SpeedBaseline = 100, SpeedMin = 0, SpeedMax = 200;
-
-    // 四个 variance 量的声明规格 + 合成语义（单一真相源，忠实移植 OpenUtau）：
-    //   · 可编辑轨 = 增量 delta（OpenUtau UI 单位 [EditMin,EditMax]）；连续轨、基线=Neutral（处处有值）。
-    //     Use(config) ⇒ 暴露此轨。日后若加「绝对覆盖式实参」，在 Render 的合成处另开分支即可，量程表不动。
-    //   · 合成喂声学 = clamp(Delta(预测 x, 用户 y), AcousticMin, AcousticMax)；Neutral 代入 Delta 恒得纯预测。
-    //   · 回显轨 = 纯预测值（同声学单位 [AcousticMin,AcousticMax]）；Use && Predict ⇒ 附此只读轨。
-    // 注：voicing 的中性值为 100（OpenUtau 语义：默认 100、量程 [0,100]、只降不升），故其 NaN 自由区对应 100=纯预测。
-    readonly record struct VarianceSpec(
-        string Key, string Display, string Color,
-        Func<VoicebankConfig, bool> Use, Func<VoicebankConfig, bool> Predict,
-        double EditMin, double EditMax, double Neutral,
-        double AcousticMin, double AcousticMax,
-        Func<float, float, float> Delta);
-
-    static readonly VarianceSpec[] Variances =
-    {
-        new("energy",      "Energy",      "#E573A5", c => c.UseEnergyEmbed,      c => c.PredictEnergy,      -100, 100,   0, -96, 0, (x, y) => x + y * 12 / 100),
-        new("breathiness", "Breathiness", "#73E5C2", c => c.UseBreathinessEmbed, c => c.PredictBreathiness, -100, 100,   0, -96, 0, (x, y) => x + y * 12 / 100),
-        new("voicing",     "Voicing",     "#C2E573", c => c.UseVoicingEmbed,     c => c.PredictVoicing,        0, 100, 100, -96, 0, (x, y) => x + (y - 100) * 12 / 100),
-        new("tension",     "Tension",     "#A573E5", c => c.UseTensionEmbed,     c => c.PredictTension,     -100, 100,   0, -10, 10, (x, y) => x + y / 20),
-    };
-
     readonly VoicebankConfig mConfig;
     readonly ISynthesisContext mContext;
     readonly string mVoiceId;
     readonly DiffSingerModelCache mModelCache;
     readonly int mSamplingSteps;
 
-    // 轨集合与 part 面板只依赖声库能力集（每会话固定），构造期算一次即可；note 面板默认值随 part 当前值变，逐次构建。
-    readonly OrderedMap<string, AutomationConfig> mAutomationConfigs = new();
-    readonly OrderedMap<string, AutomationConfig> mReadbackConfigs = new();
-    readonly ObjectConfig mPartConfig;
+    // 运行时复用的声明派生物（每会话固定，构造期据声库能力集算一次）：
+    //   可编辑轨集合（构造期订阅其区间编辑）+ 回显轨集合（产物 SynthesizedParameters 按其 key 聚合）。
+    readonly OrderedMap<string, AutomationConfig> mAutomationConfigs;
+    readonly OrderedMap<string, AutomationConfig> mReadbackConfigs;
 
     // —— 调度状态（数据线程；按 note 间隙分块，账本式托管失效与产物）——
     readonly IDisposable mNotesSubscription;
@@ -67,7 +36,6 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
     readonly Dictionary<ILiveNote, Action> mNoteHandlers = new();
     readonly List<Piece> mPieces = new();
     bool mNeedResegment;
-    bool mAutomationsWired;   // 可编辑轨 RangeModified 是否已惰性订阅（见 EnsureAutomationSubscriptions）
 
     public DiffSingerSynthesisSession(VoicebankConfig config, ISynthesisContext context,
         string voiceId, DiffSingerModelCache modelCache, int samplingSteps)
@@ -78,24 +46,9 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         mModelCache = modelCache;
         mSamplingSteps = samplingSteps;
 
-        // 可编辑曲线：variance 量（连续 delta，基线=中性值=纯预测）+ Gender/Speed（连续，基线为中性值）。
-        //   必须连续（非分段）：宿主仅把连续轨接进合成（存 mAutomations、快照可读、RangeModified 触发失效）；
-        //   非音高分段轨在宿主里读不到也不失效（仅 Pitch 被特判）。中性基线上画偏移正是 delta 的天然形态。
-        foreach (var v in Variances)
-            if (v.Use(config))
-                mAutomationConfigs.Add(v.Key, Continuous(v.Display, v.Color, v.Neutral, v.EditMin, v.EditMax));
-
-        if (config.UseKeyShiftEmbed)
-            mAutomationConfigs.Add(KeyGender, Continuous("Gender", "#E5A573", GenderBaseline, GenderMin, GenderMax));
-        if (config.UseSpeedEmbed)
-            mAutomationConfigs.Add(KeySpeed, Continuous("Speed", "#73B5E5", SpeedBaseline, SpeedMin, SpeedMax));
-
-        // 只读回显轨：仅当声学接受该量为输入且方差器能产基线时——显示方差器纯预测（内容感知基线，真实声学单位）。
-        foreach (var v in Variances)
-            if (v.Use(config) && v.Predict(config))
-                mReadbackConfigs.Add(v.Key, Piecewise(v.Display, v.Color, v.AcousticMin, v.AcousticMax));
-
-        mPartConfig = BuildPartConfig();
+        // 声明派生物据声库能力集算一次（与引擎声明同一套 DiffSingerDeclarations，单一真相源）。
+        mAutomationConfigs = BuildAutomationConfigs(config);
+        mReadbackConfigs = BuildReadbackConfigs(config);
 
         // 变更接线（handler 只做廉价标脏；重活延迟到 Committed 重分块）——见 §5.9。
         mNotesSubscription = NotifiableExtensions.WhenAny(context.Notes, SubscribeNote, UnsubscribeNote);
@@ -104,57 +57,26 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         context.PartProperties.Modified += MarkAllDirtyAndResegment;
         context.Pitch.RangeModified += OnRangeModified;
         context.PitchDeviation.RangeModified += OnRangeModified;
-        // 可编辑轨（variance / gender / speed）的订阅推迟到首次调度：宿主在 session 构造之后才
-        // RefreshDeclarations 填充 Voice.AutomationConfigs，构造期 TryGetAutomation 必失败（proxy 未建）。
         context.Committed += OnCommitted;
+
+        // 可编辑轨（variance / gender / speed）区间编辑订阅：SDK 把声明上移到引擎后，宿主在「建会话之前」即
+        //   RefreshDeclarations 填好 Voice.AutomationConfigs（见 MidiPart 时序），故构造期 TryGetAutomation 即命中、直接订阅。
+        foreach (var key in mAutomationConfigs.Keys)
+            if (context.TryGetAutomation(key, out var automation))
+            {
+                automation.RangeModified += OnRangeModified;
+                mSubscribedAutomations.Add(automation);
+            }
+
         mNeedResegment = true;
     }
 
     // 新建 note 的默认歌词：中性占位，待词典 G2P 阶段按声库词典择一有效词细化。
     public string DefaultLyric => "a";
 
-    public IReadOnlyOrderedMap<string, AutomationConfig> GetAutomationConfigs(IPartPropertyContext context) => mAutomationConfigs;
-    public IReadOnlyOrderedMap<string, AutomationConfig> GetSynthesizedParameterConfigs(IPartPropertyContext context) => mReadbackConfigs;
-    public ObjectConfig GetPartPropertyConfig(IPartPropertyContext context) => mPartConfig;
-
-    // note 级：多语言声库暴露 per-note 语言覆盖；默认值取 part 当前默认语言（依赖 part 值 ⇒ 逐次构建）。
-    public ObjectConfig GetNotePropertyConfig(INotePropertyContext context)
-    {
-        var properties = new OrderedMap<string, IControllerConfig>();
-        if (HasLanguageChoice)
-        {
-            var partDefault = context.PartProperties.GetString(KeyLanguage, mConfig.Languages[0]);
-            properties.Add(KeyLanguage, LanguageCombo(partDefault));
-        }
-        return new ObjectConfig { Properties = properties };
-    }
-
     // —— 调度：窗内第一个脏块的纯值边界（peek 廉价、确定性）——
     public SynthesisSegment? GetNextSegment(double startTime, double endTime)
-    {
-        EnsureAutomationSubscriptions();
-        return FindNextDirtyPiece(startTime, endTime) is { } p ? new SynthesisSegment(p.StartTime, p.EndTime) : null;
-    }
-
-    // 惰性订阅可编辑轨的区间编辑（否则画了曲线不重渲染）：宿主转发 RangeModified 需 live proxy，
-    // 而 proxy 由 TryGetAutomation 惰性创建、其又依赖 Voice.AutomationConfigs 已填充（构造后才发生）。
-    // 故首次调度（已过 RefreshDeclarations）时订阅；订上即止（轨集合每会话固定）。数据线程调用。
-    void EnsureAutomationSubscriptions()
-    {
-        if (mAutomationsWired)
-            return;
-
-        bool any = false;
-        foreach (var key in mAutomationConfigs.Keys)
-            if (mContext.TryGetAutomation(key, out var automation))
-            {
-                automation.RangeModified += OnRangeModified;
-                mSubscribedAutomations.Add(automation);
-                any = true;
-            }
-        if (any || mAutomationConfigs.Count == 0)
-            mAutomationsWired = true;
-    }
+        => FindNextDirtyPiece(startTime, endTime) is { } p ? new SynthesisSegment(p.StartTime, p.EndTime) : null;
 
     // peek 与 commit 共用同一查找（确定性 + 同调度 tick 无编辑 ⇒ commit 重算得到 peek 报出的同一块）。
     Piece? FindNextDirtyPiece(double startTime, double endTime)
@@ -218,7 +140,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
     // 推理链（worker，只读冻结快照）：忠实移植 OpenUtau phonemizer + renderer（见记忆 openutau-is-authority）。
     //   phonemizer(dsdur) → 音素时间线；renderer 加 head/tail SP padding、tokens[SP..SP]、durations[8..8]、
     //   f0(Hz over totalFrames)、variance 预测+用户 delta 合成喂声学（纯预测产回显轨）、spk by frame、depth/steps。
-    //   gender/velocity 走用户曲线 + OpenUtau GENC/VELC convert；pitch 走用户曲线（stage 4 接预测器）。
+    //   gender/velocity 走用户曲线 + OpenUtau GENC/VELC convert；pitch 自由区走 dspitch 预测轮廓、已画处用户值覆盖。
     RenderResult? Render(SynthesisSnapshot snapshot, IReadOnlyList<ILiveNote> origins,
         IProgress<double>? progress, CancellationToken cancellation)
     {
@@ -276,7 +198,16 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
             for (int k = 0; k < durations[seg]; k++) framePitch[fi++] = pitch;
         }
 
-        // 逐帧 f0(Hz) + 半音曲线（variance 用）：帧中心采样双通道音高，NaN 自由区回退 note 音高。
+        // —— dspitch 自然音高预测（纯从音符、retake 全 true、不吃用户音高）：替代自由区的矩形 note-step 兜底 ——
+        //   用户已画处（Pitch 非 NaN）用户值覆盖；NaN 自由区用预测轮廓（无 dspitch ⇒ 仍用矩形 framePitch）；PITD/vibrato 叠加在上。
+        var predictedPitch = DiffSingerPitch.Predict(
+            models.GetPredictor("dspitch"), phones, notes, durations,
+            renderStart, frameSec, speaker, mConfig, mSamplingSteps);
+        progress?.Report(0.28);
+        if (cancellation.IsCancellationRequested)
+            return null;
+
+        // 逐帧 f0(Hz) + 半音曲线（variance 用）：帧中心采样双通道音高，NaN 自由区回退预测轮廓（无则 note 音高）。
         var frameTimes = new double[nFrames];
         for (int f = 0; f < nFrames; f++) frameTimes[f] = renderStart + (f + 0.5) * frameSec;
         var pitchCurve = snapshot.Pitch.Evaluator.Evaluate(frameTimes);
@@ -286,7 +217,10 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         var pitchReadback = new List<Point>(nFrames);
         for (int f = 0; f < nFrames; f++)
         {
-            double semitone = (double.IsNaN(pitchCurve[f]) ? framePitch[f] : pitchCurve[f]) + deviation[f];
+            double fallback = predictedPitch != null
+                ? (f < predictedPitch.Length ? predictedPitch[f] : predictedPitch[^1])
+                : framePitch[f];
+            double semitone = (double.IsNaN(pitchCurve[f]) ? fallback : pitchCurve[f]) + deviation[f];
             semis[f] = (float)semitone;
             f0[f] = DiffSingerFrames.ToneToFreq(semitone);
             pitchReadback.Add(new Point(frameTimes[f], semitone));
@@ -667,71 +601,4 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         public IReadOnlyList<Point> PitchReadback = [];
         public IReadOnlyDictionary<string, IReadOnlyList<Point>> VarianceReadback = new Dictionary<string, IReadOnlyList<Point>>();
     }
-
-    // —— 构建辅助 ——
-    bool HasLanguageChoice => mConfig.UseLanguageId && mConfig.Languages.Count > 1;
-
-    ObjectConfig BuildPartConfig()
-    {
-        var properties = new OrderedMap<string, IControllerConfig>();
-
-        if (mConfig.Speakers.Count > 1)
-            properties.Add(KeySpeaker, new ComboBoxConfig
-            {
-                DisplayText = L.Tr("Speaker"),
-                Options = SpeakerOptions(mConfig.Speakers),
-            });
-
-        if (HasLanguageChoice)
-            properties.Add(KeyLanguage, LanguageCombo(mConfig.Languages[0]));
-
-        return new ObjectConfig { Properties = properties };
-    }
-
-    ComboBoxConfig LanguageCombo(string defaultValue) => new()
-    {
-        DisplayText = L.Tr("Language"),
-        Options = ToOptions(mConfig.Languages),
-        DefaultOption = PropertyValue.Create(defaultValue),
-    };
-
-    static List<ComboBoxOption> ToOptions(IReadOnlyList<string> values)
-    {
-        var options = new List<ComboBoxOption>(values.Count);
-        foreach (var value in values)
-            options.Add(value);   // 隐式转换：string → ComboBoxOption（值即显示文本）
-        return options;
-    }
-
-    // 说话人：值保留 dsconfig 原始条目（下游据此选 .emb），显示去模型名前缀（"260509a.Miku" → "Miku"）。
-    // 注：character.yaml 的 subbanks 带更友好的本地化名（如「01: 初音未来」），按 suffix 关联可作后续增强。
-    static List<ComboBoxOption> SpeakerOptions(IReadOnlyList<string> speakers)
-    {
-        var options = new List<ComboBoxOption>(speakers.Count);
-        foreach (var speaker in speakers)
-        {
-            int dot = speaker.LastIndexOf('.');
-            var display = dot >= 0 && dot < speaker.Length - 1 ? speaker[(dot + 1)..] : speaker;
-            options.Add(new ComboBoxOption(PropertyValue.Create(speaker), display));
-        }
-        return options;
-    }
-
-    static AutomationConfig Piecewise(string display, string color, double min, double max) => new()
-    {
-        DisplayText = L.Tr(display),
-        DefaultValue = double.NaN,   // 分段：无基线、段间断开（NaN 自由区）
-        MinValue = min,
-        MaxValue = max,
-        Color = color,
-    };
-
-    static AutomationConfig Continuous(string display, string color, double baseline, double min, double max) => new()
-    {
-        DisplayText = L.Tr(display),
-        DefaultValue = baseline,
-        MinValue = min,
-        MaxValue = max,
-        Color = color,
-    };
 }

@@ -34,13 +34,39 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
 
     public ISynthesisSession CreateSession(string voiceId, ISynthesisContext context)
     {
-        if (!mState.Banks.TryGetValue(voiceId, out var bank))
+        if (!mState.Banks.ContainsKey(voiceId))
             throw new ArgumentException($"未知声库 voiceId: {voiceId}");
 
-        // 声明面据声库能力集（dsconfig）暴露属性面板与自动化轨；推理走引擎级模型缓存（懒加载、按 voiceId 共享）。
-        var config = VoicebankConfig.Load(bank.RootPath, TuneLabContext.Global.GetLogger());
+        // 推理走引擎级模型缓存（懒加载、按 voiceId 共享）；声明面（轨/面板）已上移到引擎方法、建会话前即填好。
+        var config = ConfigFor(voiceId)!;
         var samplingSteps = mSettings.GetInt(KeySamplingSteps, 20);
         return new DiffSingerSynthesisSession(config, context, voiceId, EnsureModelCache(), samplingSteps);
+    }
+
+    // —— 声明（引擎层、纯函数 of (voiceId, part 值)；宿主在每次 part 参数 commit 时按当前值重算 diff 到 UI）——
+    //   据 context.VoiceId 取声库能力集，委托 DiffSingerDeclarations 建轨/面板。未知声库 → 空声明（不抛，见接口契约）。
+    public IReadOnlyOrderedMap<string, AutomationConfig> GetAutomationConfigs(IPartPropertyContext context)
+        => ConfigFor(context.VoiceId) is { } c ? DiffSingerDeclarations.BuildAutomationConfigs(c) : EmptyAutomations;
+
+    public IReadOnlyOrderedMap<string, AutomationConfig> GetSynthesizedParameterConfigs(IPartPropertyContext context)
+        => ConfigFor(context.VoiceId) is { } c ? DiffSingerDeclarations.BuildReadbackConfigs(c) : EmptyAutomations;
+
+    public ObjectConfig GetPartPropertyConfig(IPartPropertyContext context)
+        => ConfigFor(context.VoiceId) is { } c ? DiffSingerDeclarations.BuildPartConfig(c) : EmptyConfig;
+
+    public ObjectConfig GetNotePropertyConfig(INotePropertyContext context)
+        => ConfigFor(context.VoiceId) is { } c ? DiffSingerDeclarations.BuildNoteConfig(c, context) : EmptyConfig;
+
+    // 声库能力集按 voiceId 缓存（声明每次 commit 都调，避免重复解析 dsconfig）；config 随声库不可变，扫描重建时清空。
+    VoicebankConfig? ConfigFor(string voiceId)
+    {
+        if (mConfigCache.TryGetValue(voiceId, out var cached))
+            return cached;
+        if (!mState.Banks.TryGetValue(voiceId, out var bank))
+            return null;
+        var config = VoicebankConfig.Load(bank.RootPath, TuneLabContext.Global.GetLogger());
+        mConfigCache[voiceId] = config;
+        return config;
     }
 
     // 模型缓存按当前执行设备设置懒建；provider 变更则弃旧建新（旧缓存 Dispose 释放原生会话）。
@@ -113,6 +139,7 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
         }
 
         mState = new State(infos, byId);
+        mConfigCache.Clear();   // 声库集变更：弃旧声明缓存（RootPath 可能变）
         logger.Info($"DiffSinger：在 {roots.Count} 个根目录下发现 {banks.Count} 个声库。");
     }
 
@@ -146,6 +173,11 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
         new Dictionary<string, DiscoveredVoicebank>());
 
     PropertyObject mSettings = PropertyObject.Empty;
+
+    // 声明缓存（声库能力集按 voiceId）与空声明兜底（未知声库 / 引擎未就绪时返回）。
+    readonly Dictionary<string, VoicebankConfig> mConfigCache = new(StringComparer.Ordinal);
+    static readonly OrderedMap<string, AutomationConfig> EmptyAutomations = new();
+    static readonly ObjectConfig EmptyConfig = new() { Properties = new OrderedMap<string, IControllerConfig>() };
 
     // 引擎级模型缓存（跨会话共享、按 voiceId/声码器名缓存）；mProviderInUse 记当前缓存所用执行设备。
     DiffSingerModelCache? mModelCache;
