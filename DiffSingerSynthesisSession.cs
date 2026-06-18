@@ -27,19 +27,26 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
     // —— 占位区间：曲线形态（连续 / 分段）已按声学语义定死，Min/Max/基线为占位值，
     //    待声学阶段按模型实际值域校准（此前无合成、无用户数据，调整无损）——
     const double SpeedMin = 0.5, SpeedMax = 2.0, SpeedBaseline = 1.0;     // 连续，基线 1.0 = 不变速（语义待声学阶段确认）
-    const double VarianceMin = -1.0, VarianceMax = 1.0;                   // 分段（NaN 自由），值域占位
 
-    // 四个 variance 量的声明规格：Use(config) ⇒ 暴露可编辑分段轨；Use && Predict ⇒ 附只读回显轨。
+    // 四个 variance 量的声明规格 + 合成语义（单一真相源，忠实移植 OpenUtau）：
+    //   · 可编辑轨 = 增量 delta（OpenUtau UI 单位 [EditMin,EditMax]）；连续轨、基线=Neutral（处处有值）。
+    //     Use(config) ⇒ 暴露此轨。日后若加「绝对覆盖式实参」，在 Render 的合成处另开分支即可，量程表不动。
+    //   · 合成喂声学 = clamp(Delta(预测 x, 用户 y), AcousticMin, AcousticMax)；Neutral 代入 Delta 恒得纯预测。
+    //   · 回显轨 = 纯预测值（同声学单位 [AcousticMin,AcousticMax]）；Use && Predict ⇒ 附此只读轨。
+    // 注：voicing 的中性值为 100（OpenUtau 语义：默认 100、量程 [0,100]、只降不升），故其 NaN 自由区对应 100=纯预测。
     readonly record struct VarianceSpec(
         string Key, string Display, string Color,
-        Func<VoicebankConfig, bool> Use, Func<VoicebankConfig, bool> Predict);
+        Func<VoicebankConfig, bool> Use, Func<VoicebankConfig, bool> Predict,
+        double EditMin, double EditMax, double Neutral,
+        double AcousticMin, double AcousticMax,
+        Func<float, float, float> Delta);
 
     static readonly VarianceSpec[] Variances =
     {
-        new("energy",      "Energy",      "#E573A5", c => c.UseEnergyEmbed,      c => c.PredictEnergy),
-        new("breathiness", "Breathiness", "#73E5C2", c => c.UseBreathinessEmbed, c => c.PredictBreathiness),
-        new("voicing",     "Voicing",     "#C2E573", c => c.UseVoicingEmbed,     c => c.PredictVoicing),
-        new("tension",     "Tension",     "#A573E5", c => c.UseTensionEmbed,     c => c.PredictTension),
+        new("energy",      "Energy",      "#E573A5", c => c.UseEnergyEmbed,      c => c.PredictEnergy,      -100, 100,   0, -96, 0, (x, y) => x + y * 12 / 100),
+        new("breathiness", "Breathiness", "#73E5C2", c => c.UseBreathinessEmbed, c => c.PredictBreathiness, -100, 100,   0, -96, 0, (x, y) => x + y * 12 / 100),
+        new("voicing",     "Voicing",     "#C2E573", c => c.UseVoicingEmbed,     c => c.PredictVoicing,        0, 100, 100, -96, 0, (x, y) => x + (y - 100) * 12 / 100),
+        new("tension",     "Tension",     "#A573E5", c => c.UseTensionEmbed,     c => c.PredictTension,     -100, 100,   0, -10, 10, (x, y) => x + y / 20),
     };
 
     readonly VoicebankConfig mConfig;
@@ -55,9 +62,11 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
 
     // —— 调度状态（数据线程；按 note 间隙分块，账本式托管失效与产物）——
     readonly IDisposable mNotesSubscription;
+    readonly List<ILiveAutomation> mSubscribedAutomations = new();   // 已订阅 RangeModified 的可编辑轨（Dispose 退订）
     readonly Dictionary<ILiveNote, Action> mNoteHandlers = new();
     readonly List<Piece> mPieces = new();
     bool mNeedResegment;
+    bool mAutomationsWired;   // 可编辑轨 RangeModified 是否已惰性订阅（见 EnsureAutomationSubscriptions）
 
     public DiffSingerSynthesisSession(VoicebankConfig config, ISynthesisContext context,
         string voiceId, DiffSingerModelCache modelCache, int samplingSteps)
@@ -68,20 +77,22 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         mModelCache = modelCache;
         mSamplingSteps = samplingSteps;
 
-        // 可编辑曲线：variance 量（分段，NaN 自由区由方差器/中性默认填充）+ Gender/Speed（连续，基线为中性值）。
+        // 可编辑曲线：variance 量（连续 delta，基线=中性值=纯预测）+ Gender/Speed（连续，基线为中性值）。
+        //   必须连续（非分段）：宿主仅把连续轨接进合成（存 mAutomations、快照可读、RangeModified 触发失效）；
+        //   非音高分段轨在宿主里读不到也不失效（仅 Pitch 被特判）。中性基线上画偏移正是 delta 的天然形态。
         foreach (var v in Variances)
             if (v.Use(config))
-                mAutomationConfigs.Add(v.Key, Piecewise(v.Display, v.Color));
+                mAutomationConfigs.Add(v.Key, Continuous(v.Display, v.Color, v.Neutral, v.EditMin, v.EditMax));
 
         if (config.UseKeyShiftEmbed)
             mAutomationConfigs.Add(KeyGender, Continuous("Gender", "#E5A573", GenderBaseline, config.KeyShiftMin, config.KeyShiftMax));
         if (config.UseSpeedEmbed)
             mAutomationConfigs.Add(KeySpeed, Continuous("Speed", "#73B5E5", SpeedBaseline, SpeedMin, SpeedMax));
 
-        // 只读回显轨：仅当声学接受该量为输入且方差器能产基线时——自由区显示方差器的内容感知输出（这正是新信息）。
+        // 只读回显轨：仅当声学接受该量为输入且方差器能产基线时——显示方差器纯预测（内容感知基线，真实声学单位）。
         foreach (var v in Variances)
             if (v.Use(config) && v.Predict(config))
-                mReadbackConfigs.Add(v.Key, Piecewise(v.Display, v.Color));
+                mReadbackConfigs.Add(v.Key, Piecewise(v.Display, v.Color, v.AcousticMin, v.AcousticMax));
 
         mPartConfig = BuildPartConfig();
 
@@ -92,6 +103,8 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         context.PartProperties.Modified += MarkAllDirtyAndResegment;
         context.Pitch.RangeModified += OnRangeModified;
         context.PitchDeviation.RangeModified += OnRangeModified;
+        // 可编辑轨（variance / gender / speed）的订阅推迟到首次调度：宿主在 session 构造之后才
+        // RefreshDeclarations 填充 Voice.AutomationConfigs，构造期 TryGetAutomation 必失败（proxy 未建）。
         context.Committed += OnCommitted;
         mNeedResegment = true;
     }
@@ -117,7 +130,30 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
 
     // —— 调度：窗内第一个脏块的纯值边界（peek 廉价、确定性）——
     public SynthesisSegment? GetNextSegment(double startTime, double endTime)
-        => FindNextDirtyPiece(startTime, endTime) is { } p ? new SynthesisSegment(p.StartTime, p.EndTime) : null;
+    {
+        EnsureAutomationSubscriptions();
+        return FindNextDirtyPiece(startTime, endTime) is { } p ? new SynthesisSegment(p.StartTime, p.EndTime) : null;
+    }
+
+    // 惰性订阅可编辑轨的区间编辑（否则画了曲线不重渲染）：宿主转发 RangeModified 需 live proxy，
+    // 而 proxy 由 TryGetAutomation 惰性创建、其又依赖 Voice.AutomationConfigs 已填充（构造后才发生）。
+    // 故首次调度（已过 RefreshDeclarations）时订阅；订上即止（轨集合每会话固定）。数据线程调用。
+    void EnsureAutomationSubscriptions()
+    {
+        if (mAutomationsWired)
+            return;
+
+        bool any = false;
+        foreach (var key in mAutomationConfigs.Keys)
+            if (mContext.TryGetAutomation(key, out var automation))
+            {
+                automation.RangeModified += OnRangeModified;
+                mSubscribedAutomations.Add(automation);
+                any = true;
+            }
+        if (any || mAutomationConfigs.Count == 0)
+            mAutomationsWired = true;
+    }
 
     // peek 与 commit 共用同一查找（确定性 + 同调度 tick 无编辑 ⇒ commit 重算得到 peek 报出的同一块）。
     Piece? FindNextDirtyPiece(double startTime, double endTime)
@@ -162,6 +198,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
                 piece.Segment.Commit();
                 piece.Phonemes = rendered.Phonemes;
                 piece.PitchReadback = rendered.PitchReadback;
+                piece.VarianceReadback = rendered.VarianceReadback;
             }
         }
         catch (Exception ex)
@@ -179,7 +216,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
 
     // 推理链（worker，只读冻结快照）：忠实移植 OpenUtau phonemizer + renderer（见记忆 openutau-is-authority）。
     //   phonemizer(dsdur) → 音素时间线；renderer 加 head/tail SP padding、tokens[SP..SP]、durations[8..8]、
-    //   f0(Hz over totalFrames)、variance 预测喂声学（无用户编辑）、spk by frame、depth/steps。
+    //   f0(Hz over totalFrames)、variance 预测+用户 delta 合成喂声学（纯预测产回显轨）、spk by frame、depth/steps。
     //   gender/velocity 暂中性（stage 3）、pitch 走用户曲线（stage 4 接预测器）。
     RenderResult? Render(SynthesisSnapshot snapshot, IReadOnlyList<ILiveNote> origins,
         IProgress<double>? progress, CancellationToken cancellation)
@@ -257,7 +294,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         if (cancellation.IsCancellationRequested)
             return null;
 
-        // —— variance 预测（喂声学，无用户编辑/回显——stage 2）——
+        // —— variance 预测（基线；下方与用户 delta 合成喂声学、纯预测产回显）——
         var varCurves = DiffSingerVariance.Predict(
             models.GetPredictor("dsvariance"), phones.Select(p => p.Symbol).ToList(),
             durations, semis, speaker, mConfig, mSamplingSteps);
@@ -277,10 +314,25 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         AddL("languages", langs, new[] { 1, nTokens });
         AddL("durations", durations.Select(x => (long)x).ToArray(), new[] { 1, nTokens });
         AddF("f0", f0, new[] { 1, nFrames });
-        AddF("energy", Clamp(varCurves.Energy, nFrames, -96f, 0f), new[] { 1, nFrames });
-        AddF("breathiness", Clamp(varCurves.Breathiness, nFrames, -96f, 0f), new[] { 1, nFrames });
-        AddF("voicing", Clamp(varCurves.Voicing, nFrames, -96f, 0f), new[] { 1, nFrames });
-        AddF("tension", Clamp(varCurves.Tension, nFrames, -10f, 10f), new[] { 1, nFrames });
+
+        // —— variance：预测 + 用户 delta 合成喂声学，同时产纯预测回显 ——
+        //   用户曲线按帧求值（连续轨：未编辑处=中性基线 → Delta 恒得纯预测；编辑处 → 叠加），clamp 到声学值域。
+        //   回显（Use && Predict）= 纯预测值，不含用户编辑。
+        var varReadback = new Dictionary<string, IReadOnlyList<Point>>();
+        foreach (var spec in Variances)
+        {
+            float[]? predicted = varCurves[spec.Key];
+            double[]? user = snapshot.TryGetAutomation(spec.Key, out var auto)
+                ? auto.Evaluator.Evaluate(frameTimes)
+                : null;
+
+            if (ac.InputMetadata.ContainsKey(spec.Key))
+                AddF(spec.Key, CombineVariance(spec, predicted, user, nFrames), new[] { 1, nFrames });
+
+            if (spec.Use(mConfig) && spec.Predict(mConfig) && predicted != null)
+                varReadback[spec.Key] = BuildReadbackSegment(spec, predicted, frameTimes, nFrames);
+        }
+
         AddF("gender", new float[nFrames], new[] { 1, nFrames });          // 中性（stage 3）
         AddF("velocity", Const(nFrames, 1f), new[] { 1, nFrames });        // 常速（stage 3）
 
@@ -330,7 +382,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
             StretchWeight = p.IsVowel ? 1 : 0,
         }).ToList();
 
-        return new RenderResult(audio, renderStart, sr, phonemes, pitchReadback);
+        return new RenderResult(audio, renderStart, sr, phonemes, pitchReadback, varReadback);
     }
 
     // 无 dur 预测器兜底：每 note 一元音、占满 note 时长（无对齐/无 head/tail 之外的处理）。
@@ -354,14 +406,30 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         return slash > 0 ? phoneme[..slash] : string.Empty;
     }
 
-    // 预测曲线 clamp 到声学输入值域；null（无预测）→ 全 0（降级）。
-    static float[] Clamp(float[]? curve, int n, float lo, float hi)
+    // 预测 x 与用户值 y（UI 单位，NaN 自由区代入中性）按 OpenUtau delta 函数合成，clamp 到声学值域。
+    //   预测缺失（null，即 !Predict 而声学仍需该输入）→ 以 0 为基线降级，仅叠加用户 delta。
+    static float[] CombineVariance(VarianceSpec spec, float[]? predicted, double[]? user, int n)
     {
         var result = new float[n];
-        if (curve == null) return result;
-        for (int i = 0; i < n; i++)
-            result[i] = Math.Clamp(i < curve.Length ? curve[i] : curve[^1], lo, hi);
+        for (int f = 0; f < n; f++)
+        {
+            float x = predicted == null ? 0f : (f < predicted.Length ? predicted[f] : predicted[^1]);
+            double y = user != null && !double.IsNaN(user[f]) ? user[f] : spec.Neutral;
+            result[f] = (float)Math.Clamp(spec.Delta(x, (float)y), spec.AcousticMin, spec.AcousticMax);
+        }
         return result;
+    }
+
+    // 回显段：纯预测值（不含用户编辑），clamp 到声学值域，逐帧 (全局秒, 值)。
+    static List<Point> BuildReadbackSegment(VarianceSpec spec, float[] predicted, double[] frameTimes, int n)
+    {
+        var points = new List<Point>(n);
+        for (int f = 0; f < n; f++)
+        {
+            float x = f < predicted.Length ? predicted[f] : predicted[^1];
+            points.Add(new Point(frameTimes[f], Math.Clamp(x, spec.AcousticMin, spec.AcousticMax)));
+        }
+        return points;
     }
 
     // G2P 查无时的单音素兜底：优先该语言的 /a，回退裸 a，再回退 SP（静音）。
@@ -384,7 +452,24 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
     public IReadOnlyList<IReadOnlyList<Point>> SynthesizedPitch
         => mPieces.Where(p => p.PitchReadback.Count > 0).Select(p => p.PitchReadback).ToList();
 
-    public IReadOnlyMap<string, SynthesizedParameter> SynthesizedParameters => mEmptyParameters;
+    // 回显产物（数据线程发布、可跨线程读）：按声明的回显轨 key 聚合各 piece 的纯预测段（每 piece 一段、段间断开）。
+    public IReadOnlyMap<string, SynthesizedParameter> SynthesizedParameters
+    {
+        get
+        {
+            var map = new Map<string, SynthesizedParameter>();
+            foreach (var kvp in mReadbackConfigs)
+            {
+                var segments = new List<IReadOnlyList<Point>>();
+                foreach (var piece in mPieces)
+                    if (piece.VarianceReadback.TryGetValue(kvp.Key, out var segment) && segment.Count > 0)
+                        segments.Add(segment);
+                if (segments.Count > 0)
+                    map.Add(kvp.Key, new SynthesizedParameter { Segments = segments });
+            }
+            return map;
+        }
+    }
 
     public IReadOnlyList<SynthesizedPhoneme> Phonemes
         => mPieces.SelectMany(p => p.Phonemes).ToList();
@@ -420,6 +505,8 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         mContext.PartProperties.Modified -= MarkAllDirtyAndResegment;
         mContext.Pitch.RangeModified -= OnRangeModified;
         mContext.PitchDeviation.RangeModified -= OnRangeModified;
+        foreach (var automation in mSubscribedAutomations)
+            automation.RangeModified -= OnRangeModified;
         mContext.Committed -= OnCommitted;
         foreach (var piece in mPieces)
             piece.Segment?.Dispose();
@@ -537,7 +624,8 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
     }
 
     sealed record RenderResult(float[] Audio, double StartTime, int SampleRate,
-        List<SynthesizedPhoneme> Phonemes, List<Point> PitchReadback);
+        List<SynthesizedPhoneme> Phonemes, List<Point> PitchReadback,
+        Dictionary<string, IReadOnlyList<Point>> VarianceReadback);
 
     sealed class Piece
     {
@@ -552,6 +640,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         public IAudioSegment? Segment;
         public IReadOnlyList<SynthesizedPhoneme> Phonemes = [];
         public IReadOnlyList<Point> PitchReadback = [];
+        public IReadOnlyDictionary<string, IReadOnlyList<Point>> VarianceReadback = new Dictionary<string, IReadOnlyList<Point>>();
     }
 
     // —— 构建辅助 ——
@@ -603,12 +692,12 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         return options;
     }
 
-    static AutomationConfig Piecewise(string display, string color) => new()
+    static AutomationConfig Piecewise(string display, string color, double min, double max) => new()
     {
         DisplayText = L.Tr(display),
         DefaultValue = double.NaN,   // 分段：无基线、段间断开（NaN 自由区）
-        MinValue = VarianceMin,
-        MaxValue = VarianceMax,
+        MinValue = min,
+        MaxValue = max,
         Color = color,
     };
 
@@ -620,6 +709,4 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         MaxValue = max,
         Color = color,
     };
-
-    static readonly Map<string, SynthesizedParameter> mEmptyParameters = new();
 }

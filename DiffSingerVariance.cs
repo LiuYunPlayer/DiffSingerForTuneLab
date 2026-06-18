@@ -10,7 +10,18 @@ namespace DiffSingerForTuneLab;
 //   linguistic(词模式：word_div/word_dur 由已知 ph_dur 按元音分组) + variance；
 //   energy/breathiness/voicing/tension 基值喂 0 + retake 全 true → 全量预测；pitch 输入为半音；输出预测曲线。
 // 当前阶段只把预测值喂声学（无用户编辑/回显——留作下一阶段）。
-public readonly record struct VarianceCurves(float[]? Energy, float[]? Breathiness, float[]? Voicing, float[]? Tension);
+public readonly record struct VarianceCurves(float[]? Energy, float[]? Breathiness, float[]? Voicing, float[]? Tension)
+{
+    // 按声学输入名取对应预测曲线（无该通道返回 null）。
+    public float[]? this[string name] => name switch
+    {
+        "energy" => Energy,
+        "breathiness" => Breathiness,
+        "voicing" => Voicing,
+        "tension" => Tension,
+        _ => null,
+    };
+}
 
 public static class DiffSingerVariance
 {
