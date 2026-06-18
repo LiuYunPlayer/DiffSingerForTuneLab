@@ -1,0 +1,13 @@
+{
+  "id": "diffsingerfortunelab",
+  "name": "DiffSinger",
+  "version": "0.1.0",
+  "author": "Jingang",
+  "description": "DiffSinger 歌声合成引擎。",
+  "sdk-version": "1.0",
+  "type": "voice",
+  "engine": "DiffSinger",
+  "class": "DiffSingerForTuneLab.DiffSingerVoiceEngine",
+  "assembly": "DiffSingerForTuneLab.dll",
+  "platforms": ["win"]
+}

@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- DiffSinger voice 插件。
+       引用宿主提供的 SDK 契约程序集（Private=false，不打进包）；net8.0 锁 SDK ABI 地板。
+       开发期用跨仓 ProjectReference 指向并排的 TuneLab 源（跳定义/即改即生效）；
+       临发布可改为对编译出的 SDK dll 的 <Reference>，验证脱离源码也能编。 -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>DiffSingerForTuneLab</RootNamespace>
+    <AssemblyName>DiffSingerForTuneLab</AssemblyName>
+    <!-- 插件作为动态加载的程序集：令 NuGet 私有依赖随输出复制进包目录（宿主 ALC 从包目录加载，
+         不会从本机 NuGet 缓存解析），并生成适配动态加载的 deps.json。Private=false 的 SDK 引用不受影响、仍不复制。 -->
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+  </PropertyGroup>
+
+  <!-- SDK 契约：宿主统一提供、所有插件共享，Private=false 不复制进输出、打包时别带。 -->
+  <ItemGroup>
+    <ProjectReference Include="..\TuneLab\TuneLab.Foundation\TuneLab.Foundation.csproj" Private="false" />
+    <ProjectReference Include="..\TuneLab\TuneLab.SDK\TuneLab.SDK.csproj" Private="false" />
+  </ItemGroup>
+
+  <!-- manifest 随输出，宿主据此免反射即知插件提供什么。 -->
+  <ItemGroup>
+    <Content Include="description.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <!-- 私有依赖：随包分发、进本插件专属 ALC。YamlDotNet 解析声库的 dsconfig / character / dsdict。 -->
+  <ItemGroup>
+    <PackageReference Include="YamlDotNet" Version="18.0.0" />
+  </ItemGroup>
+
+</Project>

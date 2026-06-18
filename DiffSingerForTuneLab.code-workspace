@@ -1,0 +1,15 @@
+{
+  "folders": [
+    {
+      "name": "DiffSingerForTuneLab",
+      "path": "."
+    },
+    {
+      "name": "TuneLab (参考：SDK/docs/范例)",
+      "path": "../TuneLab"
+    }
+  ],
+  "settings": {
+    "dotnet.defaultSolution": "disable"
+  }
+}

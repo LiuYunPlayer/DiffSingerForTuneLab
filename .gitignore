@@ -1,0 +1,19 @@
+# .NET build output
+bin/
+obj/
+*.user
+*.suo
+
+# IDE
+.vs/
+.idea/
+
+# 模型权重与本地声库（体积大，不入 git；用资源包或本地路径分发）
+*.onnx
+*.onnx.data
+/voicebanks/
+/models/
+
+# 打包产物
+*.tlx
+/build/
