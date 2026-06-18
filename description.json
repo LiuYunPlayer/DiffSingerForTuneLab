@@ -7,7 +7,7 @@
   "sdk-version": "1.0",
   "type": "voice",
   "engine": "DiffSinger",
-  "class": "DiffSingerForTuneLab.DiffSingerVoiceEngine",
+  "classes": ["DiffSingerForTuneLab.DiffSingerVoiceEngine"],
   "assembly": "DiffSingerForTuneLab.dll",
   "platforms": ["win"]
 }

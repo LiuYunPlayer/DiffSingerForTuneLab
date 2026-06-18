@@ -16,6 +16,7 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
 {
     const string KeyVoicebankDirs = "voicebank_dirs";
     const string KeyExecutionProvider = "execution_provider";
+    const string KeySamplingSteps = "sampling_steps";
 
     public IReadOnlyOrderedMap<string, VoiceSourceInfo> VoiceSourceInfos => mState.Infos;
 
@@ -32,8 +33,9 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
         if (!mState.Banks.TryGetValue(voiceId, out var bank))
             throw new ArgumentException($"未知声库 voiceId: {voiceId}");
 
-        // 合成会话（声明 + 分块调度 + 6 级管线 + 产物）后续实现。
-        throw new NotImplementedException($"DiffSinger 合成会话尚未实现（声库目录 {bank.RootPath}）。");
+        // 声明面据声库能力集（dsconfig）暴露属性面板与自动化轨；分块调度 + 6 级管线 + 产物后续实现。
+        var config = VoicebankConfig.Load(bank.RootPath, TuneLabContext.Global.GetLogger());
+        return new DiffSingerSynthesisSession(config, context);
     }
 
     // —— 扩展设置（设置 > 扩展 面板，随宿主持久化、跨工程共享）——
@@ -56,6 +58,15 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
                         new("directml", L.Tr("GPU (DirectML)")),
                         new("cpu", L.Tr("CPU")),
                     },
+                }
+            },
+            {
+                // 浅扩散采样步数（质量↔速度旋钮）：全局、跨工程共享；由声学合成阶段消费，量程待该阶段校准。
+                KeySamplingSteps,
+                new SliderConfig
+                {
+                    DisplayText = L.Tr("Sampling steps"),
+                    DefaultValue = 20, MinValue = 1, MaxValue = 1000, IsInteger = true,
                 }
             },
         };

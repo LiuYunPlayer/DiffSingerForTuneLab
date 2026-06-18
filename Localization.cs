@@ -15,6 +15,15 @@ internal static class L
             ["Execution device"] = "执行设备",
             ["GPU (DirectML)"] = "GPU（DirectML）",
             ["CPU"] = "CPU",
+            ["Sampling steps"] = "采样步数",
+            ["Speaker"] = "说话人",
+            ["Language"] = "语言",
+            ["Gender"] = "性别",
+            ["Speed"] = "语速",
+            ["Energy"] = "能量",
+            ["Breathiness"] = "气声",
+            ["Voicing"] = "发声",
+            ["Tension"] = "张力",
         },
     };
 
