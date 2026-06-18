@@ -15,6 +15,14 @@
     <EnableDynamicLoading>true</EnableDynamicLoading>
   </PropertyGroup>
 
+  <!-- tools/ 是 dev-only 独立项目（冒烟测试），有自己的 csproj/入口；从插件编译中排除，否则 SDK 默认 glob 会
+       连其源码与 obj 生成文件一起编进插件（重复入口/特性）。 -->
+  <ItemGroup>
+    <Compile Remove="tools/**/*.cs" />
+    <Content Remove="tools/**" />
+    <None Remove="tools/**" />
+  </ItemGroup>
+
   <!-- SDK 契约：宿主统一提供、所有插件共享，Private=false 不复制进输出、打包时别带。 -->
   <ItemGroup>
     <ProjectReference Include="..\TuneLab\TuneLab.Foundation\TuneLab.Foundation.csproj" Private="false" />
@@ -25,9 +33,13 @@
   <ItemGroup>
     <Content Include="description.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
-  <!-- 私有依赖：随包分发、进本插件专属 ALC。YamlDotNet 解析声库的 dsconfig / character / dsdict。 -->
+  <!-- 私有依赖：随包分发、进本插件专属 ALC。
+       · YamlDotNet 解析声库的 dsconfig / character / dsdict。
+       · OnnxRuntime.DirectML 单包内的 onnxruntime.dll 同含 DirectML EP 与 CPU EP；原生库随 EnableDynamicLoading
+         输出到 runtimes/win-x64/native/，宿主 ALC 经 deps.json（AssemblyDependencyResolver）解析——勿扁平化。 -->
   <ItemGroup>
     <PackageReference Include="YamlDotNet" Version="18.0.0" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.DirectML" Version="1.20.1" />
   </ItemGroup>
 
 </Project>

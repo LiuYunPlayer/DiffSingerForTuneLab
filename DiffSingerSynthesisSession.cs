@@ -1,7 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.ML.OnnxRuntime;
+using Microsoft.ML.OnnxRuntime.Tensors;
 using TuneLab.Foundation;
 using TuneLab.SDK;
 
@@ -41,16 +44,29 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
 
     readonly VoicebankConfig mConfig;
     readonly ISynthesisContext mContext;
+    readonly string mVoiceId;
+    readonly DiffSingerModelCache mModelCache;
+    readonly int mSamplingSteps;
 
     // 轨集合与 part 面板只依赖声库能力集（每会话固定），构造期算一次即可；note 面板默认值随 part 当前值变，逐次构建。
     readonly OrderedMap<string, AutomationConfig> mAutomationConfigs = new();
     readonly OrderedMap<string, AutomationConfig> mReadbackConfigs = new();
     readonly ObjectConfig mPartConfig;
 
-    public DiffSingerSynthesisSession(VoicebankConfig config, ISynthesisContext context)
+    // —— 调度状态（数据线程；按 note 间隙分块，账本式托管失效与产物）——
+    readonly IDisposable mNotesSubscription;
+    readonly Dictionary<ILiveNote, Action> mNoteHandlers = new();
+    readonly List<Piece> mPieces = new();
+    bool mNeedResegment;
+
+    public DiffSingerSynthesisSession(VoicebankConfig config, ISynthesisContext context,
+        string voiceId, DiffSingerModelCache modelCache, int samplingSteps)
     {
         mConfig = config;
         mContext = context;
+        mVoiceId = voiceId;
+        mModelCache = modelCache;
+        mSamplingSteps = samplingSteps;
 
         // 可编辑曲线：variance 量（分段，NaN 自由区由方差器/中性默认填充）+ Gender/Speed（连续，基线为中性值）。
         foreach (var v in Variances)
@@ -68,6 +84,16 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
                 mReadbackConfigs.Add(v.Key, Piecewise(v.Display, v.Color));
 
         mPartConfig = BuildPartConfig();
+
+        // 变更接线（handler 只做廉价标脏；重活延迟到 Committed 重分块）——见 §5.9。
+        mNotesSubscription = NotifiableExtensions.WhenAny(context.Notes, SubscribeNote, UnsubscribeNote);
+        context.Notes.ItemAdded += OnNotesStructureChanged;
+        context.Notes.ItemRemoved += OnNotesStructureChanged;
+        context.PartProperties.Modified += MarkAllDirtyAndResegment;
+        context.Pitch.RangeModified += OnRangeModified;
+        context.PitchDeviation.RangeModified += OnRangeModified;
+        context.Committed += OnCommitted;
+        mNeedResegment = true;
     }
 
     // 新建 note 的默认歌词：中性占位，待词典 G2P 阶段按声库词典择一有效词细化。
@@ -89,18 +115,376 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         return new ObjectConfig { Properties = properties };
     }
 
-    // —— 调度 / 产物：管线未接入，呈「无待合成、无产物」 ——
-    public SynthesisSegment? GetNextSegment(double startTime, double endTime) => null;
-    public Task SynthesizeNext(SynthesisSegment segment, CancellationToken cancellation = default) => Task.CompletedTask;
+    // —— 调度：窗内第一个脏块的纯值边界（peek 廉价、确定性）——
+    public SynthesisSegment? GetNextSegment(double startTime, double endTime)
+        => FindNextDirtyPiece(startTime, endTime) is { } p ? new SynthesisSegment(p.StartTime, p.EndTime) : null;
 
-    public IReadOnlyList<IReadOnlyList<Point>> SynthesizedPitch => [];
+    // peek 与 commit 共用同一查找（确定性 + 同调度 tick 无编辑 ⇒ commit 重算得到 peek 报出的同一块）。
+    Piece? FindNextDirtyPiece(double startTime, double endTime)
+    {
+        if (mNeedResegment)
+            Resegment();
+
+        foreach (var piece in mPieces)
+        {
+            if (!piece.Dirty || piece.Failed || piece.Synthesizing)
+                continue;
+            if (piece.EndTime < startTime || piece.StartTime > endTime)
+                continue;
+            return piece;
+        }
+        return null;
+    }
+
+    public async Task SynthesizeNext(SynthesisSegment segment, CancellationToken cancellation = default)
+    {
+        if (FindNextDirtyPiece(segment.StartTime, segment.EndTime) is not { } piece)
+            return;
+
+        // 同步前缀（数据线程）：物化不可变快照（本块 note 全集 + 按 note 范围开窗）。
+        var snapshot = mContext.GetSnapshot(piece.Notes, piece.Notes[0].StartTime.Value, piece.Notes.Max(n => n.EndTime.Value));
+        piece.Dirty = false;
+        piece.Synthesizing = true;
+        piece.Progress = 0;
+        StatusChanged?.Invoke();
+
+        var report = new Progress<double>(p => { piece.Progress = p; StatusChanged?.Invoke(); });
+        try
+        {
+            // offload：worker 只读冻结快照跑 ONNX（绝不碰活视图）；模型懒加载经引擎级缓存（首载触发原生加载）。
+            var rendered = await Task.Run(() => Render(snapshot, piece.Notes, report, cancellation), CancellationToken.None);
+            if (rendered != null && mPieces.Contains(piece))
+            {
+                int rate = rendered.SampleRate;
+                piece.Segment?.Dispose();
+                piece.Segment = mContext.CreateAudioSegment((long)(rendered.StartTime * rate), rendered.Audio.Length, rate);
+                piece.Segment.Write(0, rendered.Audio);
+                piece.Segment.Commit();
+                piece.Phonemes = rendered.Phonemes;
+                piece.PitchReadback = rendered.PitchReadback;
+            }
+        }
+        catch (Exception ex)
+        {
+            piece.Failed = true;
+            piece.Error = ex.Message;
+            TuneLabContext.Global.GetLogger().Warning($"DiffSinger：合成失败 [{piece.StartTime:F2}s]：{ex}");
+        }
+        finally
+        {
+            piece.Synthesizing = false;
+            StatusChanged?.Invoke();
+        }
+    }
+
+    // 最小推理链（worker，只读冻结快照）：每 note 一个元音、真实音高/时长/说话人，variance/gender/speed 暂中性常量。
+    // 仅按 acoustic.InputMetadata 存在的输入构造张量 → 兼容不同 use_*_embed / use_lang_id / 多说话人配置。
+    RenderResult? Render(SynthesisSnapshot snapshot, IReadOnlyList<ILiveNote> origins,
+        IProgress<double>? progress, CancellationToken cancellation)
+    {
+        var notes = snapshot.Notes;
+        if (notes.Count == 0)
+            return null;
+        if (cancellation.IsCancellationRequested)
+            return null;
+
+        var models = mModelCache.GetOrLoad(mVoiceId, mConfig);
+        int hop = models.HopSize, sr = models.SampleRate, hidden = models.HiddenSize;
+
+        string partLang = snapshot.PartProperties.GetString(KeyLanguage, mConfig.Languages.Count > 0 ? mConfig.Languages[0] : string.Empty);
+        string speaker = snapshot.PartProperties.GetString(KeySpeaker, mConfig.Speakers.Count > 0 ? mConfig.Speakers[0] : string.Empty);
+
+        // 逐 note：元音 token + 帧时长（和 = nFrames）；同时累积音素产物与逐帧 note 音高（f0 NaN 自由区回退）。
+        double startTime = notes[0].StartTime;
+        var tokens = new List<long>(notes.Count);
+        var langs = new List<long>(notes.Count);
+        var durations = new List<long>(notes.Count);
+        var phonemes = new List<SynthesizedPhoneme>(notes.Count);
+        var frameNotePitch = new List<double>();
+        for (int i = 0; i < notes.Count; i++)
+        {
+            var note = notes[i];
+            string lang = note.Properties.GetString(KeyLanguage, partLang);
+            (int tokenId, string symbol) = PickVowel(models, lang);
+            int frames = Math.Max(1, (int)Math.Round((note.EndTime - note.StartTime) * sr / hop));
+
+            tokens.Add(tokenId);
+            langs.Add(models.TryGetLanguage(lang, out var langId) ? langId : 0);
+            durations.Add(frames);
+            for (int f = 0; f < frames; f++)
+                frameNotePitch.Add(note.Pitch);
+
+            phonemes.Add(new SynthesizedPhoneme
+            {
+                Symbol = symbol,
+                StartTime = note.StartTime,
+                EndTime = note.EndTime,
+                Note = origins[i],
+                StretchWeight = note.EndTime - note.StartTime,
+            });
+        }
+
+        int nTokens = tokens.Count;
+        int nFrames = frameNotePitch.Count;
+
+        // 逐帧 f0：在帧中心时间批量求值双通道音高（NaN 自由区回退 note 音高），半音→Hz。
+        var frameTimes = new double[nFrames];
+        for (int f = 0; f < nFrames; f++)
+            frameTimes[f] = startTime + (f + 0.5) * hop / sr;
+        var pitchCurve = snapshot.Pitch.Evaluator.Evaluate(frameTimes);
+        var deviation = snapshot.PitchDeviation.Evaluator.Evaluate(frameTimes);
+        var f0 = new float[nFrames];
+        var pitchReadback = new List<Point>(nFrames);
+        for (int f = 0; f < nFrames; f++)
+        {
+            double semitone = (double.IsNaN(pitchCurve[f]) ? frameNotePitch[f] : pitchCurve[f]) + deviation[f];
+            f0[f] = (float)(440.0 * Math.Pow(2, (semitone - 69) / 12.0));
+            pitchReadback.Add(new Point(frameTimes[f], semitone));
+        }
+        progress?.Report(0.3);
+        if (cancellation.IsCancellationRequested)
+            return null;
+
+        // —— 按 InputMetadata 条件构造声学输入 ——
+        var ac = models.Acoustic;
+        var inputs = new List<NamedOnnxValue>();
+        void AddL(string name, long[] data, int[] dims)
+        { if (ac.InputMetadata.ContainsKey(name)) inputs.Add(NamedOnnxValue.CreateFromTensor(name, new DenseTensor<long>(data, dims))); }
+        void AddF(string name, float[] data, int[] dims)
+        { if (ac.InputMetadata.ContainsKey(name)) inputs.Add(NamedOnnxValue.CreateFromTensor(name, new DenseTensor<float>(data, dims))); }
+
+        AddL("tokens", tokens.ToArray(), new[] { 1, nTokens });
+        AddL("languages", langs.ToArray(), new[] { 1, nTokens });
+        AddL("durations", durations.ToArray(), new[] { 1, nTokens });
+        AddF("f0", f0, new[] { 1, nFrames });
+        AddF("energy", Const(nFrames, 0f), new[] { 1, nFrames });
+        AddF("breathiness", Const(nFrames, 0f), new[] { 1, nFrames });
+        AddF("voicing", Const(nFrames, 0f), new[] { 1, nFrames });
+        AddF("tension", Const(nFrames, 0f), new[] { 1, nFrames });
+        AddF("gender", Const(nFrames, 0f), new[] { 1, nFrames });
+        AddF("velocity", Const(nFrames, 1f), new[] { 1, nFrames });
+
+        if (ac.InputMetadata.ContainsKey("spk_embed"))
+        {
+            var emb = models.GetSpeakerEmbedding(speaker);
+            var spk = new float[nFrames * hidden];
+            for (int f = 0; f < nFrames; f++)
+                Array.Copy(emb, 0, spk, f * hidden, hidden);
+            inputs.Add(NamedOnnxValue.CreateFromTensor("spk_embed", new DenseTensor<float>(spk, new[] { 1, nFrames, hidden })));
+        }
+        if (ac.InputMetadata.ContainsKey("depth"))
+            inputs.Add(NamedOnnxValue.CreateFromTensor("depth", new DenseTensor<float>(new[] { (float)models.MaxDepth }, Array.Empty<int>())));
+        if (ac.InputMetadata.ContainsKey("steps"))
+            inputs.Add(NamedOnnxValue.CreateFromTensor("steps", new DenseTensor<long>(new[] { (long)mSamplingSteps }, Array.Empty<int>())));
+
+        using var melOut = ac.Run(inputs);
+        var mel = melOut.First(v => v.Name == "mel").AsTensor<float>();
+        progress?.Report(0.7);
+        if (cancellation.IsCancellationRequested)
+            return null;
+
+        // —— 声码器：mel (+ f0) → 波形 ——
+        var voc = models.Vocoder;
+        var vInputs = new List<NamedOnnxValue> { NamedOnnxValue.CreateFromTensor("mel", mel) };
+        if (voc.InputMetadata.ContainsKey("f0"))
+            vInputs.Add(NamedOnnxValue.CreateFromTensor("f0", new DenseTensor<float>(f0, new[] { 1, nFrames })));
+        using var wavOut = voc.Run(vInputs);
+        var audio = wavOut.First(v => v.Name == "waveform").AsTensor<float>().ToArray();
+        progress?.Report(1.0);
+
+        return new RenderResult(audio, startTime, sr, phonemes, pitchReadback);
+    }
+
+    // 元音选择（最小链占位，待 G2P）：优先该语言的 /a，回退裸 a，再回退 SP（静音）。
+    (int, string) PickVowel(VoiceModels models, string lang)
+    {
+        string keyed = string.IsNullOrEmpty(lang) ? "a" : $"{lang}/a";
+        if (models.TryGetPhoneme(keyed, out var id)) return (id, keyed);
+        if (models.TryGetPhoneme("a", out id)) return (id, "a");
+        if (models.TryGetPhoneme("SP", out id)) return (id, "SP");
+        return (0, "SP");
+    }
+
+    static float[] Const(int n, float v)
+    {
+        var a = new float[n];
+        if (v != 0f) Array.Fill(a, v);
+        return a;
+    }
+
+    // —— 产物（数据线程发布、可跨线程读）——
+    public IReadOnlyList<IReadOnlyList<Point>> SynthesizedPitch
+        => mPieces.Where(p => p.PitchReadback.Count > 0).Select(p => p.PitchReadback).ToList();
+
     public IReadOnlyMap<string, SynthesizedParameter> SynthesizedParameters => mEmptyParameters;
-    public IReadOnlyList<SynthesizedPhoneme> Phonemes => [];
-    public IReadOnlyList<SynthesisStatusSegment> GetStatus() => [];
+
+    public IReadOnlyList<SynthesizedPhoneme> Phonemes
+        => mPieces.SelectMany(p => p.Phonemes).ToList();
+
+    public IReadOnlyList<SynthesisStatusSegment> GetStatus()
+    {
+        var result = new List<SynthesisStatusSegment>(mPieces.Count);
+        foreach (var piece in mPieces)
+        {
+            var status = piece.Failed ? SynthesisSegmentStatus.Failed
+                : piece.Synthesizing ? SynthesisSegmentStatus.Synthesizing
+                : piece.Dirty || piece.Segment == null ? SynthesisSegmentStatus.Pending
+                : SynthesisSegmentStatus.Synthesized;
+            result.Add(new SynthesisStatusSegment
+            {
+                StartTime = piece.StartTime,
+                EndTime = piece.EndTime,
+                Status = status,
+                Message = piece.Failed ? piece.Error : piece.Synthesizing ? L.Tr("Synthesizing") : null,
+                Progress = piece.Synthesizing ? piece.Progress : 0,
+            });
+        }
+        return result;
+    }
 
     public event Action? StatusChanged;
 
-    public void Dispose() { }   // 本阶段未订阅活视图；接入调度时在此退订。
+    public void Dispose()
+    {
+        mNotesSubscription.Dispose();
+        mContext.Notes.ItemAdded -= OnNotesStructureChanged;
+        mContext.Notes.ItemRemoved -= OnNotesStructureChanged;
+        mContext.PartProperties.Modified -= MarkAllDirtyAndResegment;
+        mContext.Pitch.RangeModified -= OnRangeModified;
+        mContext.PitchDeviation.RangeModified -= OnRangeModified;
+        mContext.Committed -= OnCommitted;
+        foreach (var piece in mPieces)
+            piece.Segment?.Dispose();
+        mPieces.Clear();
+        // 模型会话归引擎级缓存所有、跨会话共享，不在此释放（引擎 Destroy 统一释放）。
+    }
+
+    // —— 分块（数据线程；按 note 间隙分块，note 集等价的块保留缓存与状态）——见 §5.9 重叠陷阱 ——
+    void Resegment()
+    {
+        mNeedResegment = false;
+
+        var groups = new List<List<ILiveNote>>();
+        List<ILiveNote>? current = null;
+        double groupMaxEnd = 0;
+        foreach (var note in mContext.Notes)
+        {
+            if (current == null || note.StartTime.Value > groupMaxEnd)
+            {
+                current = new List<ILiveNote>();
+                groups.Add(current);
+                groupMaxEnd = note.EndTime.Value;
+            }
+            else
+            {
+                groupMaxEnd = Math.Max(groupMaxEnd, note.EndTime.Value);
+            }
+            current.Add(note);
+        }
+
+        var newPieces = new List<Piece>(groups.Count);
+        foreach (var groupNotes in groups)
+        {
+            double pieceEnd = groupNotes.Max(n => n.EndTime.Value);
+            var existing = mPieces.FirstOrDefault(p => p.Notes.SequenceEqual(groupNotes));
+            if (existing != null)
+            {
+                mPieces.Remove(existing);
+                existing.StartTime = groupNotes[0].StartTime.Value;
+                existing.EndTime = pieceEnd;
+                newPieces.Add(existing);
+            }
+            else
+            {
+                newPieces.Add(new Piece
+                {
+                    Notes = groupNotes,
+                    StartTime = groupNotes[0].StartTime.Value,
+                    EndTime = pieceEnd,
+                    Dirty = true,
+                });
+            }
+        }
+
+        foreach (var piece in mPieces)
+            piece.Segment?.Dispose();
+        mPieces.Clear();
+        mPieces.AddRange(newPieces);
+        StatusChanged?.Invoke();
+    }
+
+    void SubscribeNote(ILiveNote note)
+    {
+        void Handler()
+        {
+            foreach (var piece in mPieces)
+                if (piece.Notes.Contains(note)) { piece.Dirty = true; piece.Failed = false; }
+            mNeedResegment = true;
+        }
+        mNoteHandlers[note] = Handler;
+        note.StartTime.Modified += Handler;
+        note.EndTime.Modified += Handler;
+        note.Pitch.Modified += Handler;
+        note.Lyric.Modified += Handler;
+        note.Phonemes.Modified += Handler;
+        note.Properties.Modified += Handler;
+    }
+
+    void UnsubscribeNote(ILiveNote note)
+    {
+        if (!mNoteHandlers.Remove(note, out var handler))
+            return;
+        note.StartTime.Modified -= handler;
+        note.EndTime.Modified -= handler;
+        note.Pitch.Modified -= handler;
+        note.Lyric.Modified -= handler;
+        note.Phonemes.Modified -= handler;
+        note.Properties.Modified -= handler;
+    }
+
+    void OnNotesStructureChanged(ILiveNote note) => mNeedResegment = true;
+
+    void MarkAllDirtyAndResegment()
+    {
+        foreach (var piece in mPieces) { piece.Dirty = true; piece.Failed = false; }
+        mNeedResegment = true;
+    }
+
+    void OnCommitted()
+    {
+        if (mNeedResegment)
+            Resegment();
+    }
+
+    void OnRangeModified(double startTime, double endTime)
+    {
+        foreach (var piece in mPieces)
+        {
+            if (piece.EndTime < startTime || piece.StartTime > endTime)
+                continue;
+            piece.Dirty = true;
+            piece.Failed = false;
+        }
+        StatusChanged?.Invoke();
+    }
+
+    sealed record RenderResult(float[] Audio, double StartTime, int SampleRate,
+        List<SynthesizedPhoneme> Phonemes, List<Point> PitchReadback);
+
+    sealed class Piece
+    {
+        public required IReadOnlyList<ILiveNote> Notes;
+        public double StartTime;
+        public double EndTime;
+        public bool Dirty;
+        public bool Failed;
+        public bool Synthesizing;
+        public string? Error;
+        public double Progress;
+        public IAudioSegment? Segment;
+        public IReadOnlyList<SynthesizedPhoneme> Phonemes = [];
+        public IReadOnlyList<Point> PitchReadback = [];
+    }
 
     // —— 构建辅助 ——
     bool HasLanguageChoice => mConfig.UseLanguageId && mConfig.Languages.Count > 1;

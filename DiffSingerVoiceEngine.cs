@@ -26,16 +26,34 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
         Rescan();
     }
 
-    public void Destroy() { }
+    public void Destroy()
+    {
+        mModelCache?.Dispose();
+        mModelCache = null;
+    }
 
     public ISynthesisSession CreateSession(string voiceId, ISynthesisContext context)
     {
         if (!mState.Banks.TryGetValue(voiceId, out var bank))
             throw new ArgumentException($"未知声库 voiceId: {voiceId}");
 
-        // 声明面据声库能力集（dsconfig）暴露属性面板与自动化轨；分块调度 + 6 级管线 + 产物后续实现。
+        // 声明面据声库能力集（dsconfig）暴露属性面板与自动化轨；推理走引擎级模型缓存（懒加载、按 voiceId 共享）。
         var config = VoicebankConfig.Load(bank.RootPath, TuneLabContext.Global.GetLogger());
-        return new DiffSingerSynthesisSession(config, context);
+        var samplingSteps = mSettings.GetInt(KeySamplingSteps, 20);
+        return new DiffSingerSynthesisSession(config, context, voiceId, EnsureModelCache(), samplingSteps);
+    }
+
+    // 模型缓存按当前执行设备设置懒建；provider 变更则弃旧建新（旧缓存 Dispose 释放原生会话）。
+    DiffSingerModelCache EnsureModelCache()
+    {
+        var provider = mSettings.GetString(KeyExecutionProvider, "directml");
+        if (mModelCache == null || mProviderInUse != provider)
+        {
+            mModelCache?.Dispose();
+            mModelCache = new DiffSingerModelCache(provider, TuneLabContext.Global.GetLogger());
+            mProviderInUse = provider;
+        }
+        return mModelCache;
     }
 
     // —— 扩展设置（设置 > 扩展 面板，随宿主持久化、跨工程共享）——
@@ -128,4 +146,8 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
         new Dictionary<string, DiscoveredVoicebank>());
 
     PropertyObject mSettings = PropertyObject.Empty;
+
+    // 引擎级模型缓存（跨会话共享、按 voiceId/声码器名缓存）；mProviderInUse 记当前缓存所用执行设备。
+    DiffSingerModelCache? mModelCache;
+    string mProviderInUse = string.Empty;
 }

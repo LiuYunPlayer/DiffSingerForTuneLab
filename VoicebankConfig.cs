@@ -21,6 +21,17 @@ public sealed class VoicebankConfig
 
     public int SampleRate { get; private init; } = 44100;
 
+    // —— 推理所需的资源定位与声学超参（从声学 dsconfig 读出；文件名相对 RootPath）——
+    public string RootPath { get; private init; } = string.Empty;
+    public string AcousticFileName { get; private init; } = string.Empty;   // dsconfig `acoustic`
+    public string VocoderName { get; private init; } = string.Empty;        // dsconfig `vocoder`（→ Vocoders/<名>）
+    public string PhonemesFileName { get; private init; } = string.Empty;   // dsconfig `phonemes`（音素→id 表 JSON）
+    public string LanguagesFileName { get; private init; } = string.Empty;  // dsconfig `languages`（语言→id 表 JSON）
+    public int HiddenSize { get; private init; } = 256;                     // spk_embed 维度
+    public int HopSize { get; private init; } = 512;
+    public int NumMelBins { get; private init; } = 128;
+    public double MaxDepth { get; private init; } = 1.0;                    // 浅扩散最大深度（use_variable_depth）
+
     // 多说话人：>1 时声明 part 级说话人选择（值为 dsconfig 原始条目，如 "260509a.Miku"）。
     public IReadOnlyList<string> Speakers { get; private init; } = [];
     // 多语言：use_lang_id 且 languages>1 时声明 part 默认语言 + per-note 语言。
@@ -61,6 +72,15 @@ public sealed class VoicebankConfig
         return new VoicebankConfig
         {
             SampleRate = GetInt(acoustic, "sample_rate", 44100),
+            RootPath = rootPath,
+            AcousticFileName = GetString(acoustic, "acoustic"),
+            VocoderName = GetString(acoustic, "vocoder"),
+            PhonemesFileName = GetString(acoustic, "phonemes"),
+            LanguagesFileName = GetString(acoustic, "languages"),
+            HiddenSize = GetInt(acoustic, "hidden_size", 256),
+            HopSize = GetInt(acoustic, "hop_size", 512),
+            NumMelBins = GetInt(acoustic, "num_mel_bins", 128),
+            MaxDepth = GetFloat(acoustic, "max_depth", 1.0),
             Speakers = GetStringList(acoustic, "speakers"),
             UseLanguageId = GetBool(acoustic, "use_lang_id", false),
             Languages = ResolveLanguages(acoustic, rootPath, logger),
@@ -131,6 +151,13 @@ public sealed class VoicebankConfig
 
     static int GetInt(IReadOnlyDictionary<string, object?> map, string key, int def)
         => map.TryGetValue(key, out var v) && v is string s && int.TryParse(s, out var i) ? i : def;
+
+    static double GetFloat(IReadOnlyDictionary<string, object?> map, string key, double def)
+        => map.TryGetValue(key, out var v) && v is string s
+            && double.TryParse(s, System.Globalization.CultureInfo.InvariantCulture, out var d) ? d : def;
+
+    static string GetString(IReadOnlyDictionary<string, object?> map, string key)
+        => map.TryGetValue(key, out var v) && v is string s ? s : string.Empty;
 
     static IReadOnlyList<string> GetStringList(IReadOnlyDictionary<string, object?> map, string key)
         => map.TryGetValue(key, out var v) ? ToStringList(v) : [];

@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- dev-only 冒烟测试：对真实声库/声码器模型敲定 ONNX 张量 I/O + 验证 DirectML，再接进插件会话。
+       不属于 .tlx 产物（打包只构建 DiffSingerForTuneLab.csproj）；声库/声码器路径从 args/env 外部化，不硬编码。 -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>DiffSingerForTuneLab.SmokeTest</RootNamespace>
+    <AssemblyName>DiffSingerSmokeTest</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 单包内 onnxruntime.dll 同含 DirectML EP 与 CPU EP；插件正式引用同一包。 -->
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.DirectML" Version="1.20.1" />
+    <PackageReference Include="YamlDotNet" Version="18.0.0" />
+  </ItemGroup>
+
+</Project>
