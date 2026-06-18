@@ -29,8 +29,24 @@ public sealed class VoicebankConfig
     public string LanguagesFileName { get; private init; } = string.Empty;  // dsconfig `languages`（语言→id 表 JSON）
     public int HiddenSize { get; private init; } = 256;                     // spk_embed 维度
     public int HopSize { get; private init; } = 512;
+    public int WinSize { get; private init; } = 2048;
+    public int FftSize { get; private init; } = 2048;
     public int NumMelBins { get; private init; } = 128;
-    public double MaxDepth { get; private init; } = 1.0;                    // 浅扩散最大深度（use_variable_depth）
+    public double MelFmin { get; private init; } = 40;
+    public double MelFmax { get; private init; } = 16000;
+    public string MelBase { get; private init; } = "e";                     // "10" 或 "e"
+    public string MelScale { get; private init; } = "slaney";               // "slaney" 或 "htk"
+
+    // 采样加速形态：连续加速 ⇒ 传 depth+steps；否则 maxDepth 要 /1000、传 speedup（见 OpenUtau DiffSingerRenderer）。
+    public bool UseContinuousAcceleration { get; private init; }
+    public bool UseVariableDepth { get; private init; }   // use_variable_depth || use_shallow_diffusion
+    // 浅扩散最大深度：连续加速取原值，否则 /1000（OpenUtau DsConfig.maxDepth）。
+    public double RawMaxDepth { get; private init; } = 1.0;
+    public double MaxDepth => UseContinuousAcceleration ? RawMaxDepth : RawMaxDepth / 1000.0;
+
+    // pitch 预测器相关（stage 4）。
+    public bool UseExpr { get; private init; }
+    public bool UseNoteRest { get; private init; }
 
     // 多说话人：>1 时声明 part 级说话人选择（值为 dsconfig 原始条目，如 "260509a.Miku"）。
     public IReadOnlyList<string> Speakers { get; private init; } = [];
@@ -79,8 +95,18 @@ public sealed class VoicebankConfig
             LanguagesFileName = GetString(acoustic, "languages"),
             HiddenSize = GetInt(acoustic, "hidden_size", 256),
             HopSize = GetInt(acoustic, "hop_size", 512),
+            WinSize = GetInt(acoustic, "win_size", 2048),
+            FftSize = GetInt(acoustic, "fft_size", 2048),
             NumMelBins = GetInt(acoustic, "num_mel_bins", 128),
-            MaxDepth = GetFloat(acoustic, "max_depth", 1.0),
+            MelFmin = GetFloat(acoustic, "mel_fmin", 40),
+            MelFmax = GetFloat(acoustic, "mel_fmax", 16000),
+            MelBase = GetStringOr(acoustic, "mel_base", "e"),
+            MelScale = GetStringOr(acoustic, "mel_scale", "slaney"),
+            UseContinuousAcceleration = GetBool(acoustic, "use_continuous_acceleration", false),
+            UseVariableDepth = GetBool(acoustic, "use_variable_depth", GetBool(acoustic, "use_shallow_diffusion", false)),
+            RawMaxDepth = GetFloat(acoustic, "max_depth", 1.0),
+            UseExpr = GetBool(acoustic, "use_expr", false),
+            UseNoteRest = GetBool(acoustic, "use_note_rest", false),
             Speakers = GetStringList(acoustic, "speakers"),
             UseLanguageId = GetBool(acoustic, "use_lang_id", false),
             Languages = ResolveLanguages(acoustic, rootPath, logger),
@@ -158,6 +184,9 @@ public sealed class VoicebankConfig
 
     static string GetString(IReadOnlyDictionary<string, object?> map, string key)
         => map.TryGetValue(key, out var v) && v is string s ? s : string.Empty;
+
+    static string GetStringOr(IReadOnlyDictionary<string, object?> map, string key, string def)
+        => map.TryGetValue(key, out var v) && v is string s && s.Length > 0 ? s : def;
 
     static IReadOnlyList<string> GetStringList(IReadOnlyDictionary<string, object?> map, string key)
         => map.TryGetValue(key, out var v) ? ToStringList(v) : [];

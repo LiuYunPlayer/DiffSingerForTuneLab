@@ -177,75 +177,95 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         }
     }
 
-    // 最小推理链（worker，只读冻结快照）：每 note 一个元音、真实音高/时长/说话人，variance/gender/speed 暂中性常量。
-    // 仅按 acoustic.InputMetadata 存在的输入构造张量 → 兼容不同 use_*_embed / use_lang_id / 多说话人配置。
+    // 推理链（worker，只读冻结快照）：忠实移植 OpenUtau phonemizer + renderer（见记忆 openutau-is-authority）。
+    //   phonemizer(dsdur) → 音素时间线；renderer 加 head/tail SP padding、tokens[SP..SP]、durations[8..8]、
+    //   f0(Hz over totalFrames)、variance 预测喂声学（无用户编辑）、spk by frame、depth/steps。
+    //   gender/velocity 暂中性（stage 3）、pitch 走用户曲线（stage 4 接预测器）。
     RenderResult? Render(SynthesisSnapshot snapshot, IReadOnlyList<ILiveNote> origins,
         IProgress<double>? progress, CancellationToken cancellation)
     {
         var notes = snapshot.Notes;
-        if (notes.Count == 0)
-            return null;
-        if (cancellation.IsCancellationRequested)
+        if (notes.Count == 0 || cancellation.IsCancellationRequested)
             return null;
 
         var models = mModelCache.GetOrLoad(mVoiceId, mConfig);
         int hop = models.HopSize, sr = models.SampleRate, hidden = models.HiddenSize;
+        double frameSec = (double)hop / sr;
+        int head = DiffSingerFrames.HeadFrames;
 
         string partLang = snapshot.PartProperties.GetString(KeyLanguage, mConfig.Languages.Count > 0 ? mConfig.Languages[0] : string.Empty);
         string speaker = snapshot.PartProperties.GetString(KeySpeaker, mConfig.Speakers.Count > 0 ? mConfig.Speakers[0] : string.Empty);
+        var noteLang = notes.Select(nt => nt.Properties.GetString(KeyLanguage, partLang)).ToArray();
 
-        // 逐 note：元音 token + 帧时长（和 = nFrames）；同时累积音素产物与逐帧 note 音高（f0 NaN 自由区回退）。
-        double startTime = notes[0].StartTime;
-        var tokens = new List<long>(notes.Count);
-        var langs = new List<long>(notes.Count);
-        var durations = new List<long>(notes.Count);
-        var phonemes = new List<SynthesizedPhoneme>(notes.Count);
-        var frameNotePitch = new List<double>();
-        for (int i = 0; i < notes.Count; i++)
+        // —— Phonemizer：歌词 → 音素时间线（绝对秒、含前置辅音越界）——
+        var durPred = models.GetPredictor("dsdur");
+        var phones = durPred != null
+            ? DiffSingerPhonemizer.Phonemize(durPred, notes, noteLang, speaker, hop, sr)
+            : FallbackPhonemes(models, notes, noteLang);   // 无 dur 预测器：每 note 一元音兜底
+        if (phones.Count == 0)
+            return null;
+        progress?.Report(0.2);
+        if (cancellation.IsCancellationRequested)
+            return null;
+
+        // —— 帧布局：[head SP][...phones...][tail SP]，累积取整 → durations（len=phones+2）——
+        var phoneDurSec = phones.Select(p => Math.Max(0, p.EndTime - p.StartTime)).ToArray();
+        var durations = DiffSingerFrames.PaddedPhoneFrames(phoneDurSec, frameSec);
+        int nTokens = durations.Length;          // phones + 2
+        int nFrames = durations.Sum();
+        double renderStart = phones[0].StartTime - head * frameSec;
+
+        // tokens/languages：声学表，前后加 SP。
+        var tokens = new long[nTokens];
+        var langs = new long[nTokens];
+        tokens[0] = AcousticToken(models, "SP");
+        tokens[nTokens - 1] = AcousticToken(models, "SP");
+        for (int i = 0; i < phones.Count; i++)
         {
-            var note = notes[i];
-            string lang = note.Properties.GetString(KeyLanguage, partLang);
-            (int tokenId, string symbol) = PickVowel(models, lang);
-            int frames = Math.Max(1, (int)Math.Round((note.EndTime - note.StartTime) * sr / hop));
-
-            tokens.Add(tokenId);
-            langs.Add(models.TryGetLanguage(lang, out var langId) ? langId : 0);
-            durations.Add(frames);
-            for (int f = 0; f < frames; f++)
-                frameNotePitch.Add(note.Pitch);
-
-            phonemes.Add(new SynthesizedPhoneme
-            {
-                Symbol = symbol,
-                StartTime = note.StartTime,
-                EndTime = note.EndTime,
-                Note = origins[i],
-                StretchWeight = note.EndTime - note.StartTime,
-            });
+            tokens[i + 1] = AcousticToken(models, phones[i].Symbol);
+            langs[i + 1] = models.TryGetLanguage(PhonemeLang(phones[i].Symbol), out var lid) ? lid : 0;
         }
 
-        int nTokens = tokens.Count;
-        int nFrames = frameNotePitch.Count;
+        // 逐帧 note 音高回退（head→首 note，phone i→其 note，tail→末 note）。
+        var framePitch = new double[nFrames];
+        int fi = 0;
+        for (int seg = 0; seg < nTokens; seg++)
+        {
+            int ni = seg == 0 ? phones[0].NoteIndex
+                : seg == nTokens - 1 ? phones[^1].NoteIndex
+                : phones[seg - 1].NoteIndex;
+            int pitch = notes[ni].Pitch;
+            for (int k = 0; k < durations[seg]; k++) framePitch[fi++] = pitch;
+        }
 
-        // 逐帧 f0：在帧中心时间批量求值双通道音高（NaN 自由区回退 note 音高），半音→Hz。
+        // 逐帧 f0(Hz) + 半音曲线（variance 用）：帧中心采样双通道音高，NaN 自由区回退 note 音高。
         var frameTimes = new double[nFrames];
-        for (int f = 0; f < nFrames; f++)
-            frameTimes[f] = startTime + (f + 0.5) * hop / sr;
+        for (int f = 0; f < nFrames; f++) frameTimes[f] = renderStart + (f + 0.5) * frameSec;
         var pitchCurve = snapshot.Pitch.Evaluator.Evaluate(frameTimes);
         var deviation = snapshot.PitchDeviation.Evaluator.Evaluate(frameTimes);
         var f0 = new float[nFrames];
+        var semis = new float[nFrames];
         var pitchReadback = new List<Point>(nFrames);
         for (int f = 0; f < nFrames; f++)
         {
-            double semitone = (double.IsNaN(pitchCurve[f]) ? frameNotePitch[f] : pitchCurve[f]) + deviation[f];
-            f0[f] = (float)(440.0 * Math.Pow(2, (semitone - 69) / 12.0));
+            double semitone = (double.IsNaN(pitchCurve[f]) ? framePitch[f] : pitchCurve[f]) + deviation[f];
+            semis[f] = (float)semitone;
+            f0[f] = DiffSingerFrames.ToneToFreq(semitone);
             pitchReadback.Add(new Point(frameTimes[f], semitone));
         }
         progress?.Report(0.3);
         if (cancellation.IsCancellationRequested)
             return null;
 
-        // —— 按 InputMetadata 条件构造声学输入 ——
+        // —— variance 预测（喂声学，无用户编辑/回显——stage 2）——
+        var varCurves = DiffSingerVariance.Predict(
+            models.GetPredictor("dsvariance"), phones.Select(p => p.Symbol).ToList(),
+            durations, semis, speaker, mConfig, mSamplingSteps);
+        progress?.Report(0.45);
+        if (cancellation.IsCancellationRequested)
+            return null;
+
+        // —— 声学输入（按 InputMetadata 条件构造）——
         var ac = models.Acoustic;
         var inputs = new List<NamedOnnxValue>();
         void AddL(string name, long[] data, int[] dims)
@@ -253,33 +273,41 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         void AddF(string name, float[] data, int[] dims)
         { if (ac.InputMetadata.ContainsKey(name)) inputs.Add(NamedOnnxValue.CreateFromTensor(name, new DenseTensor<float>(data, dims))); }
 
-        AddL("tokens", tokens.ToArray(), new[] { 1, nTokens });
-        AddL("languages", langs.ToArray(), new[] { 1, nTokens });
-        AddL("durations", durations.ToArray(), new[] { 1, nTokens });
+        AddL("tokens", tokens, new[] { 1, nTokens });
+        AddL("languages", langs, new[] { 1, nTokens });
+        AddL("durations", durations.Select(x => (long)x).ToArray(), new[] { 1, nTokens });
         AddF("f0", f0, new[] { 1, nFrames });
-        AddF("energy", Const(nFrames, 0f), new[] { 1, nFrames });
-        AddF("breathiness", Const(nFrames, 0f), new[] { 1, nFrames });
-        AddF("voicing", Const(nFrames, 0f), new[] { 1, nFrames });
-        AddF("tension", Const(nFrames, 0f), new[] { 1, nFrames });
-        AddF("gender", Const(nFrames, 0f), new[] { 1, nFrames });
-        AddF("velocity", Const(nFrames, 1f), new[] { 1, nFrames });
+        AddF("energy", Clamp(varCurves.Energy, nFrames, -96f, 0f), new[] { 1, nFrames });
+        AddF("breathiness", Clamp(varCurves.Breathiness, nFrames, -96f, 0f), new[] { 1, nFrames });
+        AddF("voicing", Clamp(varCurves.Voicing, nFrames, -96f, 0f), new[] { 1, nFrames });
+        AddF("tension", Clamp(varCurves.Tension, nFrames, -10f, 10f), new[] { 1, nFrames });
+        AddF("gender", new float[nFrames], new[] { 1, nFrames });          // 中性（stage 3）
+        AddF("velocity", Const(nFrames, 1f), new[] { 1, nFrames });        // 常速（stage 3）
 
         if (ac.InputMetadata.ContainsKey("spk_embed"))
         {
             var emb = models.GetSpeakerEmbedding(speaker);
             var spk = new float[nFrames * hidden];
-            for (int f = 0; f < nFrames; f++)
-                Array.Copy(emb, 0, spk, f * hidden, hidden);
+            for (int f = 0; f < nFrames; f++) Array.Copy(emb, 0, spk, f * hidden, hidden);
             inputs.Add(NamedOnnxValue.CreateFromTensor("spk_embed", new DenseTensor<float>(spk, new[] { 1, nFrames, hidden })));
         }
-        if (ac.InputMetadata.ContainsKey("depth"))
-            inputs.Add(NamedOnnxValue.CreateFromTensor("depth", new DenseTensor<float>(new[] { (float)models.MaxDepth }, Array.Empty<int>())));
-        if (ac.InputMetadata.ContainsKey("steps"))
-            inputs.Add(NamedOnnxValue.CreateFromTensor("steps", new DenseTensor<long>(new[] { (long)mSamplingSteps }, Array.Empty<int>())));
+        if (mConfig.UseContinuousAcceleration)
+        {
+            if (ac.InputMetadata.ContainsKey("depth") && mConfig.UseVariableDepth)
+                inputs.Add(NamedOnnxValue.CreateFromTensor("depth", new DenseTensor<float>(new[] { (float)models.MaxDepth }, new[] { 1 })));
+            if (ac.InputMetadata.ContainsKey("steps"))
+                inputs.Add(NamedOnnxValue.CreateFromTensor("steps", new DenseTensor<long>(new[] { (long)mSamplingSteps }, new[] { 1 })));
+        }
+        else if (ac.InputMetadata.ContainsKey("speedup"))
+        {
+            long speedup = Math.Max(1, 1000 / Math.Max(1, mSamplingSteps));
+            while (1000 % speedup != 0 && speedup > 1) speedup--;
+            inputs.Add(NamedOnnxValue.CreateFromTensor("speedup", new DenseTensor<long>(new[] { speedup }, new[] { 1 })));
+        }
 
         using var melOut = ac.Run(inputs);
         var mel = melOut.First(v => v.Name == "mel").AsTensor<float>();
-        progress?.Report(0.7);
+        progress?.Report(0.75);
         if (cancellation.IsCancellationRequested)
             return null;
 
@@ -292,17 +320,57 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         var audio = wavOut.First(v => v.Name == "waveform").AsTensor<float>().ToArray();
         progress?.Report(1.0);
 
-        return new RenderResult(audio, startTime, sr, phonemes, pitchReadback);
+        // —— 音素产物（绝对秒、韵核吸收伸缩）——
+        var phonemes = phones.Select(p => new SynthesizedPhoneme
+        {
+            Symbol = p.Symbol,
+            StartTime = p.StartTime,
+            EndTime = p.EndTime,
+            Note = origins[p.NoteIndex],
+            StretchWeight = p.IsVowel ? 1 : 0,
+        }).ToList();
+
+        return new RenderResult(audio, renderStart, sr, phonemes, pitchReadback);
     }
 
-    // 元音选择（最小链占位，待 G2P）：优先该语言的 /a，回退裸 a，再回退 SP（静音）。
-    (int, string) PickVowel(VoiceModels models, string lang)
+    // 无 dur 预测器兜底：每 note 一元音、占满 note 时长（无对齐/无 head/tail 之外的处理）。
+    static List<PhonemeSpan> FallbackPhonemes(VoiceModels models, IReadOnlyList<SynthesisNoteSnapshot> notes, string[] noteLang)
+    {
+        var result = new List<PhonemeSpan>(notes.Count);
+        for (int i = 0; i < notes.Count; i++)
+        {
+            string sym = PickVowelSymbol(models, noteLang[i]);
+            result.Add(new PhonemeSpan(sym, notes[i].StartTime, notes[i].EndTime, i, true));
+        }
+        return result;
+    }
+
+    static long AcousticToken(VoiceModels models, string symbol)
+        => models.TryGetPhoneme(symbol, out var id) ? id : 0;
+
+    static string PhonemeLang(string phoneme)
+    {
+        int slash = phoneme.IndexOf('/');
+        return slash > 0 ? phoneme[..slash] : string.Empty;
+    }
+
+    // 预测曲线 clamp 到声学输入值域；null（无预测）→ 全 0（降级）。
+    static float[] Clamp(float[]? curve, int n, float lo, float hi)
+    {
+        var result = new float[n];
+        if (curve == null) return result;
+        for (int i = 0; i < n; i++)
+            result[i] = Math.Clamp(i < curve.Length ? curve[i] : curve[^1], lo, hi);
+        return result;
+    }
+
+    // G2P 查无时的单音素兜底：优先该语言的 /a，回退裸 a，再回退 SP（静音）。
+    static string PickVowelSymbol(VoiceModels models, string lang)
     {
         string keyed = string.IsNullOrEmpty(lang) ? "a" : $"{lang}/a";
-        if (models.TryGetPhoneme(keyed, out var id)) return (id, keyed);
-        if (models.TryGetPhoneme("a", out id)) return (id, "a");
-        if (models.TryGetPhoneme("SP", out id)) return (id, "SP");
-        return (0, "SP");
+        if (models.TryGetPhoneme(keyed, out _)) return keyed;
+        if (models.TryGetPhoneme("a", out _)) return "a";
+        return "SP";
     }
 
     static float[] Const(int n, float v)

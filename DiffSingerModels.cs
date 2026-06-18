@@ -42,7 +42,8 @@ public sealed class DiffSingerModelCache : IDisposable
 
             var acoustic = LoadSession(Path.Combine(config.RootPath, config.AcousticFileName));
             var vocoder = GetOrLoadVocoder(config.VocoderName);
-            var models = new VoiceModels(config, acoustic, vocoder, mLogger);
+            // 预测器（dsdur/dspitch/dsvariance）懒加载共用本缓存的会话加载器（含 DML→CPU 回退）。
+            var models = new VoiceModels(config, acoustic, vocoder, LoadSession, mLogger);
             mVoices[voiceId] = models;
             return models;
         }
@@ -95,7 +96,7 @@ public sealed class DiffSingerModelCache : IDisposable
         lock (mLock)
         {
             foreach (var v in mVoices.Values)
-                v.Acoustic.Dispose();
+                v.Dispose();   // 释放声学 + 懒加载的预测器（声码器为缓存共享、单独释放）
             foreach (var s in mVocoders.Values)
                 s.Dispose();
             mVoices.Clear();
@@ -105,14 +106,18 @@ public sealed class DiffSingerModelCache : IDisposable
 }
 
 // 一个声库的已加载模型束（声学私有、声码器为缓存共享引用）+ 推理所需的音素/语言表与说话人嵌入。
-public sealed class VoiceModels
+public sealed class VoiceModels : IDisposable
 {
     readonly VoicebankConfig mConfig;
     readonly ILogger mLogger;
+    readonly Func<string, InferenceSession> mLoad;
     readonly Dictionary<string, int> mPhonemes;
     readonly Dictionary<string, int> mLanguages;
     readonly Dictionary<string, float[]> mEmbCache = new(StringComparer.Ordinal);
     readonly object mEmbLock = new();
+    // 预测器懒加载缓存（键 = 子目录名）；缺失或加载失败记 null（不重试）。
+    readonly Dictionary<string, DiffSingerPredictor?> mPredictors = new(StringComparer.Ordinal);
+    readonly object mPredictorLock = new();
 
     public InferenceSession Acoustic { get; }
     public InferenceSession Vocoder { get; }
@@ -124,10 +129,12 @@ public sealed class VoiceModels
     public double MaxDepth => mConfig.MaxDepth;
     public IReadOnlyList<string> Speakers => mConfig.Speakers;
 
-    public VoiceModels(VoicebankConfig config, InferenceSession acoustic, InferenceSession vocoder, ILogger logger)
+    public VoiceModels(VoicebankConfig config, InferenceSession acoustic, InferenceSession vocoder,
+        Func<string, InferenceSession> load, ILogger logger)
     {
         mConfig = config;
         mLogger = logger;
+        mLoad = load;
         Acoustic = acoustic;
         Vocoder = vocoder;
 
@@ -143,6 +150,27 @@ public sealed class VoiceModels
     public bool TryGetPhoneme(string symbol, out int id) => mPhonemes.TryGetValue(symbol, out id);
     public bool TryGetLanguage(string lang, out int id) => mLanguages.TryGetValue(lang, out id);
 
+    // 预测器懒加载（子目录如 "dsvariance" / "dspitch"）：首用时按声库会话加载器构造；
+    // 子目录无 dsconfig 或加载失败返回 null（记忆化，不重试），调用方据此降级。
+    public DiffSingerPredictor? GetPredictor(string subdir)
+    {
+        lock (mPredictorLock)
+        {
+            if (mPredictors.TryGetValue(subdir, out var cached))
+                return cached;
+
+            DiffSingerPredictor? predictor = null;
+            var dir = Path.Combine(mConfig.RootPath, subdir);
+            if (File.Exists(Path.Combine(dir, "dsconfig.yaml")))
+            {
+                try { predictor = new DiffSingerPredictor(dir, mLoad); }
+                catch (Exception ex) { mLogger.Warning($"DiffSinger：加载预测器 {subdir} 失败：{ex.Message}"); }
+            }
+            mPredictors[subdir] = predictor;
+            return predictor;
+        }
+    }
+
     // 说话人逐帧嵌入向量（.emb = HiddenSize 个 float32 LE）；按说话人缓存。
     public float[] GetSpeakerEmbedding(string speaker)
     {
@@ -157,6 +185,18 @@ public sealed class VoiceModels
                 emb[i] = BitConverter.ToSingle(bytes, i * 4);
             mEmbCache[speaker] = emb;
             return emb;
+        }
+    }
+
+    // 释放声学 + 懒加载的预测器；声码器为缓存共享引用，由缓存单独释放（不在此 Dispose）。
+    public void Dispose()
+    {
+        Acoustic.Dispose();
+        lock (mPredictorLock)
+        {
+            foreach (var p in mPredictors.Values)
+                p?.Dispose();
+            mPredictors.Clear();
         }
     }
 }
