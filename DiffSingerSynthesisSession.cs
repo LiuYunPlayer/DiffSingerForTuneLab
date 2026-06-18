@@ -22,11 +22,12 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
     const string KeySpeaker = "speaker";
     const string KeyLanguage = "language";
 
-    // Gender 连续轨基线 0 = 不移位；量程取声库增广范围（VoicebankConfig.KeyShift*）。
-    const double GenderBaseline = 0;
-    // —— 占位区间：曲线形态（连续 / 分段）已按声学语义定死，Min/Max/基线为占位值，
-    //    待声学阶段按模型实际值域校准（此前无合成、无用户数据，调整无损）——
-    const double SpeedMin = 0.5, SpeedMax = 2.0, SpeedBaseline = 1.0;     // 连续，基线 1.0 = 不变速（语义待声学阶段确认）
+    // Gender(GENC) / Speed(VELC) 连续轨：忠实采 OpenUtau 原生 UI 量程（非半音/倍率），convert 据此逐字移植。
+    //   · GENC ∈ [-100,100]，基线 0 = 不移位，正 = formant 下移；增广范围 KeyShift* 仅入 convert 缩放，不做轨边界。
+    //     与 energy/breath/tension 轨的 [-100,100] 一致。
+    //   · VELC ∈ [0,200]，基线 100 = 原速，对数（每 +100 速度 ×2）；纯帧级声学条件，不改 durations / 帧数。
+    const double GenderBaseline = 0, GenderMin = -100, GenderMax = 100;
+    const double SpeedBaseline = 100, SpeedMin = 0, SpeedMax = 200;
 
     // 四个 variance 量的声明规格 + 合成语义（单一真相源，忠实移植 OpenUtau）：
     //   · 可编辑轨 = 增量 delta（OpenUtau UI 单位 [EditMin,EditMax]）；连续轨、基线=Neutral（处处有值）。
@@ -85,7 +86,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
                 mAutomationConfigs.Add(v.Key, Continuous(v.Display, v.Color, v.Neutral, v.EditMin, v.EditMax));
 
         if (config.UseKeyShiftEmbed)
-            mAutomationConfigs.Add(KeyGender, Continuous("Gender", "#E5A573", GenderBaseline, config.KeyShiftMin, config.KeyShiftMax));
+            mAutomationConfigs.Add(KeyGender, Continuous("Gender", "#E5A573", GenderBaseline, GenderMin, GenderMax));
         if (config.UseSpeedEmbed)
             mAutomationConfigs.Add(KeySpeed, Continuous("Speed", "#73B5E5", SpeedBaseline, SpeedMin, SpeedMax));
 
@@ -217,7 +218,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
     // 推理链（worker，只读冻结快照）：忠实移植 OpenUtau phonemizer + renderer（见记忆 openutau-is-authority）。
     //   phonemizer(dsdur) → 音素时间线；renderer 加 head/tail SP padding、tokens[SP..SP]、durations[8..8]、
     //   f0(Hz over totalFrames)、variance 预测+用户 delta 合成喂声学（纯预测产回显轨）、spk by frame、depth/steps。
-    //   gender/velocity 暂中性（stage 3）、pitch 走用户曲线（stage 4 接预测器）。
+    //   gender/velocity 走用户曲线 + OpenUtau GENC/VELC convert；pitch 走用户曲线（stage 4 接预测器）。
     RenderResult? Render(SynthesisSnapshot snapshot, IReadOnlyList<ILiveNote> origins,
         IProgress<double>? progress, CancellationToken cancellation)
     {
@@ -333,8 +334,10 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
                 varReadback[spec.Key] = BuildReadbackSegment(spec, predicted, frameTimes, nFrames);
         }
 
-        AddF("gender", new float[nFrames], new[] { 1, nFrames });          // 中性（stage 3）
-        AddF("velocity", Const(nFrames, 1f), new[] { 1, nFrames });        // 常速（stage 3）
+        // —— gender / velocity：纯用户曲线（无方差器基线），按帧 convert 喂声学（忠实移植 OpenUtau GENC/VELC）——
+        //   无轨 / NaN 自由区 → 中性 → convert 得中性 embed（gender 0、velocity 1）；OpenUtau 不 clamp（UI 量程已界定）。
+        AddF("gender", BuildCurveInput(snapshot, KeyGender, GenderBaseline, GenderConvert(), frameTimes, nFrames), new[] { 1, nFrames });
+        AddF("velocity", BuildCurveInput(snapshot, KeySpeed, SpeedBaseline, SpeedConvert, frameTimes, nFrames), new[] { 1, nFrames });
 
         if (ac.InputMetadata.ContainsKey("spk_embed"))
         {
@@ -420,6 +423,35 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         return result;
     }
 
+    // 纯用户曲线 → 帧级声学输入：按帧求值用户轨（无轨 / NaN 自由区 → 中性），逐帧 convert。
+    //   不 clamp（OpenUtau 亦不 clamp，连续轨的 UI 量程已界定取值范围）。
+    static float[] BuildCurveInput(SynthesisSnapshot snapshot, string key, double neutral,
+        Func<double, double> convert, double[] frameTimes, int n)
+    {
+        double[]? user = snapshot.TryGetAutomation(key, out var auto)
+            ? auto.Evaluator.Evaluate(frameTimes)
+            : null;
+        var result = new float[n];
+        for (int f = 0; f < n; f++)
+        {
+            double y = user != null && !double.IsNaN(user[f]) ? user[f] : neutral;
+            result[f] = (float)convert(y);
+        }
+        return result;
+    }
+
+    // GENC convert（OpenUtau DiffSingerRenderer）：正 = formant 下移；缩放由声库增广范围 KeyShift*（=range）定。
+    //   range 某端为 0 ⇒ 该方向 scale=0（不移位）。闭包按当前声库现算（每会话固定）。
+    Func<double, double> GenderConvert()
+    {
+        double posScale = mConfig.KeyShiftMax == 0 ? 0 : 12 / mConfig.KeyShiftMax / 100;
+        double negScale = mConfig.KeyShiftMin == 0 ? 0 : -12 / mConfig.KeyShiftMin / 100;
+        return x => x < 0 ? -x * posScale : -x * negScale;
+    }
+
+    // VELC convert（OpenUtau DiffSingerRenderer）：对数标度，100 = 原速，每 +100 速度 ×2。
+    static double SpeedConvert(double x) => Math.Pow(2, (x - 100) / 100);
+
     // 回显段：纯预测值（不含用户编辑），clamp 到声学值域，逐帧 (全局秒, 值)。
     static List<Point> BuildReadbackSegment(VarianceSpec spec, float[] predicted, double[] frameTimes, int n)
     {
@@ -439,13 +471,6 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         if (models.TryGetPhoneme(keyed, out _)) return keyed;
         if (models.TryGetPhoneme("a", out _)) return "a";
         return "SP";
-    }
-
-    static float[] Const(int n, float v)
-    {
-        var a = new float[n];
-        if (v != 0f) Array.Fill(a, v);
-        return a;
     }
 
     // —— 产物（数据线程发布、可跨线程读）——
