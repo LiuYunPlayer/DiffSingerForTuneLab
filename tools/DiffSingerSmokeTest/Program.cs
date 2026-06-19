@@ -40,6 +40,12 @@ foreach (var sub in new[] { "dsdur", "dspitch", "dsvariance" })
         Dump($"{sub}/{Path.GetFileName(onnx)}", onnx);
 }
 
+if (args.Contains("--dur-bench"))
+{
+    PredictDurBench(voiceRoot);
+    return 0;
+}
+
 if (args.Contains("--dur"))
 {
     PredictDurChain(voiceRoot);
@@ -302,6 +308,81 @@ static void PredictDurChain(string voiceRoot)
     string outWav = Path.Combine(Path.GetTempPath(), "diffsinger_durchain.wav");
     WriteWav(outWav, wave, sr);
     Console.WriteLine($"  mel=[{string.Join(",", mel.Dimensions.ToArray())}] waveform={wave.Length} (期望≈{nF * hop}) RMS={rms:F4}  → {outWav}");
+}
+
+// dur 全 part 计时基准：按真实 part 量级合成超长音素序列，量 linguistic+dur 一次前向耗时。
+//   内容对耗时无关紧要（计算量随序列长），故用合法 token 凑长度；标识全运行时解析、不硬编码敏感名。
+static void PredictDurBench(string voiceRoot)
+{
+    Console.WriteLine("\n======== DUR BENCH (全 part 一次 dsdur 前向耗时) ========");
+    var yaml = new DeserializerBuilder().Build();
+    string durDir = Path.Combine(voiceRoot, "dsdur");
+    var cfg = yaml.Deserialize<Dictionary<string, object?>>(File.ReadAllText(Path.Combine(durDir, "dsconfig.yaml")));
+    var phonemes = yaml.Deserialize<Dictionary<string, int>>(File.ReadAllText(Path.Combine(durDir, cfg["phonemes"]!.ToString()!)));
+    int hidden = int.Parse(cfg["hidden_size"]!.ToString()!);
+    int hop = int.Parse(cfg["hop_size"]!.ToString()!);
+    int sr = int.Parse(cfg["sample_rate"]!.ToString()!);
+
+    // 首个 .emb 作 spk（运行时解析、不写死角色名）。
+    string embPath = Directory.GetFiles(durDir, "*.emb").OrderBy(p => p).First();
+    float[] emb = ReadEmb(embPath, hidden);
+
+    using var ling = Open(Path.Combine(durDir, cfg["linguistic"]!.ToString()!));
+    using var dur = Open(Path.Combine(durDir, cfg["dur"]!.ToString()!));
+    bool useLang = ling.InputMetadata.ContainsKey("languages");
+
+    // 取两个合法 token 循环填充（凑长度即可）；每词 3 音素、每词 ~0.3s。
+    int tokA = phonemes.GetValueOrDefault("SP", phonemes.Values.First());
+    int tokB = phonemes.Values.Where(v => v != tokA).DefaultIfEmpty(tokA).First();
+    int perWord = 3, wordFrames = (int)Math.Round(0.3 * sr / hop);
+
+    foreach (int nPhonemes in new[] { 100, 250, 500, 1000, 2000, 4000 })
+    {
+        int nWords = nPhonemes / perWord;
+        int nTokens = nWords * perWord;
+        var tokens = new long[nTokens];
+        var langs = new long[nTokens];
+        var phMidi = new long[nTokens];
+        for (int i = 0; i < nTokens; i++) { tokens[i] = i % 2 == 0 ? tokA : tokB; langs[i] = 0; phMidi[i] = 60; }
+        var wordDiv = new long[nWords];
+        var wordDur = new long[nWords];
+        for (int w = 0; w < nWords; w++) { wordDiv[w] = perWord; wordDur[w] = wordFrames; }
+        var spk = new float[nTokens * hidden];
+        for (int i = 0; i < nTokens; i++) Array.Copy(emb, 0, spk, i * hidden, hidden);
+
+        Func<double> runOnce = () =>
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var lingIn = new List<NamedOnnxValue>
+            {
+                NvL("tokens", tokens, 1, nTokens),
+                NvL("word_div", wordDiv, 1, nWords),
+                NvL("word_dur", wordDur, 1, nWords),
+            };
+            if (useLang) lingIn.Add(NvL("languages", langs, 1, nTokens));
+            using var lingOut = ling.Run(lingIn);
+            var enc = lingOut.First(v => v.Name == "encoder_out").AsTensor<float>();
+            var msk = lingOut.First(v => v.Name == "x_masks").AsTensor<bool>();
+            var encDense = new DenseTensor<float>(enc.ToArray(), enc.Dimensions.ToArray());
+            var mskDense = new DenseTensor<bool>(msk.ToArray(), msk.Dimensions.ToArray());
+            using var durOut = dur.Run(new List<NamedOnnxValue>
+            {
+                NamedOnnxValue.CreateFromTensor("encoder_out", encDense),
+                NamedOnnxValue.CreateFromTensor("x_masks", mskDense),
+                NvL("ph_midi", phMidi, 1, nTokens),
+                NamedOnnxValue.CreateFromTensor("spk_embed", new DenseTensor<float>(spk, new[] { 1, nTokens, hidden })),
+            });
+            _ = durOut.First(v => v.Name == "ph_dur_pred").AsTensor<float>().ToArray();
+            sw.Stop();
+            return sw.Elapsed.TotalMilliseconds;
+        };
+
+        double cold = runOnce();          // 冷跑（含图优化/分配）
+        var warm = new List<double>();
+        for (int r = 0; r < 5; r++) warm.Add(runOnce());
+        warm.Sort();
+        Console.WriteLine($"  {nPhonemes,5} 音素 ({nWords,4} 词): 冷 {cold,7:F1}ms | 暖 min {warm[0],6:F1}ms / 中位 {warm[2],6:F1}ms");
+    }
 }
 
 // 按词整流（与插件 RectifyToFrames 同算法）：缩放到 target、累积取整保总和、各≥1。

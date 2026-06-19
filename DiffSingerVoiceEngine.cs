@@ -50,14 +50,14 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
 
     // —— 声明（引擎层、纯函数 of (voiceId, part 值)；宿主在每次 part 参数 commit 时按当前值重算 diff 到 UI）——
     //   据 context.VoiceId 取声库能力集，委托 DiffSingerDeclarations 建轨/面板。未知声库 → 空声明（不抛，见接口契约）。
-    public IReadOnlyOrderedMap<string, AutomationConfig> GetAutomationConfigs(IPartPropertyContext context)
-        => ConfigFor(context.VoiceId) is { } c ? DiffSingerDeclarations.BuildAutomationConfigs(c) : EmptyAutomations;
+    public IReadOnlyOrderedMap<PropertyKey, AutomationConfig> GetAutomationConfigs(IPartPropertyContext context)
+        => ConfigFor(context.VoiceId) is { } c ? DiffSingerDeclarations.BuildAutomationConfigs(c, context.PartProperties) : EmptyAutomations;
 
-    public IReadOnlyOrderedMap<string, AutomationConfig> GetSynthesizedParameterConfigs(IPartPropertyContext context)
+    public IReadOnlyOrderedMap<PropertyKey, AutomationConfig> GetSynthesizedParameterConfigs(IPartPropertyContext context)
         => ConfigFor(context.VoiceId) is { } c ? DiffSingerDeclarations.BuildReadbackConfigs(c) : EmptyAutomations;
 
     public ObjectConfig GetPartPropertyConfig(IPartPropertyContext context)
-        => ConfigFor(context.VoiceId) is { } c ? DiffSingerDeclarations.BuildPartConfig(c) : EmptyConfig;
+        => ConfigFor(context.VoiceId) is { } c ? DiffSingerDeclarations.BuildPartConfig(c, context) : EmptyConfig;
 
     public ObjectConfig GetNotePropertyConfig(INotePropertyContext context)
         => ConfigFor(context.VoiceId) is { } c ? DiffSingerDeclarations.BuildNoteConfig(c, context) : EmptyConfig;
@@ -90,17 +90,17 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
     // —— 扩展设置（设置 > 扩展 面板，随宿主持久化、跨工程共享）——
     public ObjectConfig GetSettingsConfig(IExtensionSettingsContext context)
     {
-        var properties = new OrderedMap<string, IControllerConfig>
+        // 标签随键走（SDK 改动）：DisplayText 移到 PropertyKey、config 仅承载值/量程/选项。
+        var properties = new OrderedMap<PropertyKey, IControllerConfig>
         {
             {
-                KeyVoicebankDirs,
-                new TextBoxConfig { DisplayText = L.Tr("Voicebank directories (separate with ;)"), DefaultValue = "" }
+                (KeyVoicebankDirs, L.Tr("Voicebank directories (separate with ;)")),
+                new TextBoxConfig { DefaultValue = "" }
             },
             {
-                KeyExecutionProvider,
+                (KeyExecutionProvider, L.Tr("Execution device")),
                 new ComboBoxConfig
                 {
-                    DisplayText = L.Tr("Execution device"),
                     // 首项即默认值：DirectML（任意 DX12 GPU 可用），运行期初始化失败由合成层回退 CPU。
                     Options = new List<ComboBoxOption>
                     {
@@ -111,24 +111,22 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
             },
             {
                 // 浅扩散采样步数（质量↔速度旋钮）：全局、跨工程共享；由声学合成阶段消费，量程待该阶段校准。
-                KeySamplingSteps,
+                (KeySamplingSteps, L.Tr("Sampling steps")),
                 new SliderConfig
                 {
-                    DisplayText = L.Tr("Sampling steps"),
                     DefaultValue = 20, MinValue = 1, MaxValue = 1000, IsInteger = true,
                 }
             },
             {
                 // 张量缓存总开关：缓存各 ONNX 模型输出，反复合成（撤销重做/重开工程/改动不涉及某块）时复用、免重算。
-                KeyTensorCache,
-                new CheckBoxConfig { DisplayText = L.Tr("Tensor cache"), DefaultValue = true }
+                (KeyTensorCache, L.Tr("Tensor cache")),
+                new CheckBoxConfig { DefaultValue = true }
             },
             {
                 // 缓存体积上限（MB）：超限按最近访问时间逐出最旧缓存；0 = 不限制（持久累积、手动清理）。
-                KeyCacheMaxSizeMb,
+                (KeyCacheMaxSizeMb, L.Tr("Cache size limit (MB, 0 = unlimited)")),
                 new SliderConfig
                 {
-                    DisplayText = L.Tr("Cache size limit (MB, 0 = unlimited)"),
                     DefaultValue = 4096, MinValue = 0, MaxValue = 102400, IsInteger = true,
                 }
             },
@@ -193,8 +191,8 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
 
     // 声明缓存（声库能力集按 voiceId）与空声明兜底（未知声库 / 引擎未就绪时返回）。
     readonly Dictionary<string, VoicebankConfig> mConfigCache = new(StringComparer.Ordinal);
-    static readonly OrderedMap<string, AutomationConfig> EmptyAutomations = new();
-    static readonly ObjectConfig EmptyConfig = new() { Properties = new OrderedMap<string, IControllerConfig>() };
+    static readonly OrderedMap<PropertyKey, AutomationConfig> EmptyAutomations = new();
+    static readonly ObjectConfig EmptyConfig = new() { Properties = new OrderedMap<PropertyKey, IControllerConfig>() };
 
     // 引擎级模型缓存（跨会话共享、按 voiceId/声码器名缓存）；mProviderInUse 记当前缓存所用执行设备。
     DiffSingerModelCache? mModelCache;

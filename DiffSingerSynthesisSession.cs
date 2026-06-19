@@ -29,12 +29,12 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
 
     // 运行时复用的声明派生物（每会话固定，构造期据声库能力集算一次）：
     //   可编辑轨集合（构造期订阅其区间编辑）+ 回显轨集合（产物 SynthesizedParameters 按其 key 聚合）。
-    readonly OrderedMap<string, AutomationConfig> mAutomationConfigs;
-    readonly OrderedMap<string, AutomationConfig> mReadbackConfigs;
+    readonly OrderedMap<PropertyKey, AutomationConfig> mReadbackConfigs;
 
     // —— 调度状态（数据线程；按 note 间隙分块，账本式托管失效与产物）——
     readonly IDisposable mNotesSubscription;
-    readonly List<ILiveAutomation> mSubscribedAutomations = new();   // 已订阅 RangeModified 的可编辑轨（Dispose 退订）
+    readonly List<ILiveAutomation> mSubscribedAutomations = new();   // 已订阅 RangeModified 的固定轨（variance/gender/speed，恒定，Dispose 退订）
+    readonly Dictionary<string, ILiveAutomation> mMixSubscriptions = new();   // 已订阅的说话人混合轨（动态，key=mix:suffix，随 part 属性增减）
     readonly Dictionary<ILiveNote, Action> mNoteHandlers = new();
     readonly List<Piece> mPieces = new();
     bool mNeedResegment;
@@ -51,7 +51,6 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         mCacheMaxSizeMb = cacheMaxSizeMb;
 
         // 声明派生物据声库能力集算一次（与引擎声明同一套 DiffSingerDeclarations，单一真相源）。
-        mAutomationConfigs = BuildAutomationConfigs(config);
         mReadbackConfigs = BuildReadbackConfigs(config);
 
         // 变更接线（handler 只做廉价标脏；重活延迟到 Committed 重分块）——见 §5.9。
@@ -63,14 +62,19 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         context.PitchDeviation.RangeModified += OnRangeModified;
         context.Committed += OnCommitted;
 
-        // 可编辑轨（variance / gender / speed）区间编辑订阅：SDK 把声明上移到引擎后，宿主在「建会话之前」即
+        // 固定轨（variance / gender / speed）区间编辑订阅：SDK 把声明上移到引擎后，宿主在「建会话之前」即
         //   RefreshDeclarations 填好 Voice.AutomationConfigs（见 MidiPart 时序），故构造期 TryGetAutomation 即命中、直接订阅。
-        foreach (var key in mAutomationConfigs.Keys)
-            if (context.TryGetAutomation(key, out var automation))
+        //   这些轨与 part 属性无关、恒定，构造期订一次即可。
+        foreach (var key in BuildFixedAutomationConfigs(config).Keys)
+            if (context.TryGetAutomation(key.Id, out var automation))
             {
                 automation.RangeModified += OnRangeModified;
                 mSubscribedAutomations.Add(automation);
             }
+
+        // 说话人混合轨是动态集（随 part 属性 speaker_mix 容器增减）：构造期同步一次（覆盖重开工程时已选的），
+        //   之后由 part 属性变更（MarkAllDirtyAndResegment）补/退订——见 SyncMixSubscriptions。
+        SyncMixSubscriptions();
 
         mNeedResegment = true;
     }
@@ -79,8 +83,8 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
     public string DefaultLyric => "a";
 
     // —— 调度：窗内第一个脏块的纯值边界（peek 廉价、确定性）——
-    public SynthesisSegment? GetNextSegment(double startTime, double endTime)
-        => FindNextDirtyPiece(startTime, endTime) is { } p ? new SynthesisSegment(p.StartTime, p.EndTime) : null;
+    public SynthesisRange? GetNextSegment(double startTime, double endTime)
+        => FindNextDirtyPiece(startTime, endTime) is { } p ? new SynthesisRange(p.StartTime, p.EndTime) : null;
 
     // peek 与 commit 共用同一查找（确定性 + 同调度 tick 无编辑 ⇒ commit 重算得到 peek 报出的同一块）。
     Piece? FindNextDirtyPiece(double startTime, double endTime)
@@ -99,9 +103,9 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         return null;
     }
 
-    public async Task SynthesizeNext(SynthesisSegment segment, CancellationToken cancellation = default)
+    public async Task SynthesizeNext(double startTime, double endTime, CancellationToken cancellation = default)
     {
-        if (FindNextDirtyPiece(segment.StartTime, segment.EndTime) is not { } piece)
+        if (FindNextDirtyPiece(startTime, endTime) is not { } piece)
             return;
 
         // 同步前缀（数据线程）：物化不可变快照（本块 note 全集 + 按 note 范围开窗）。
@@ -186,7 +190,9 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         int nFrames = durations.Sum();
         double renderStart = phones[0].StartTime - head * frameSec;
 
-        // 逐帧时刻 + 说话人逐帧混合（mix:<suffix> 曲线，acoustic/pitch/variance 三域共享；不画时退化为默认 speaker 恒权重）。
+        // 逐帧时刻 + 说话人逐帧混合（acoustic/pitch/variance 三域共享；未启用任何混合时退化为默认 speaker 恒权重）。
+        //   遍历全量 mix:<suffix> 候选，snapshot.TryGetAutomation 只命中已声明轨——即用户在 part 面板已 + 的 speaker
+        //   （speaker_mix 容器已选键），未选的 speaker 此处自然跳过、不参与混合。
         var frameTimes = new double[nFrames];
         for (int f = 0; f < nFrames; f++) frameTimes[f] = renderStart + (f + 0.5) * frameSec;
         var mixTracks = new List<(string Suffix, double[] Sampled)>();
@@ -437,10 +443,10 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
             {
                 var segments = new List<IReadOnlyList<Point>>();
                 foreach (var piece in mPieces)
-                    if (piece.VarianceReadback.TryGetValue(kvp.Key, out var segment) && segment.Count > 0)
+                    if (piece.VarianceReadback.TryGetValue(kvp.Key.Id, out var segment) && segment.Count > 0)
                         segments.Add(segment);
                 if (segments.Count > 0)
-                    map.Add(kvp.Key, new SynthesizedParameter { Segments = segments });
+                    map.Add(kvp.Key.Id, new SynthesizedParameter { Segments = segments });
             }
             return map;
         }
@@ -481,6 +487,8 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         mContext.Pitch.RangeModified -= OnRangeModified;
         mContext.PitchDeviation.RangeModified -= OnRangeModified;
         foreach (var automation in mSubscribedAutomations)
+            automation.RangeModified -= OnRangeModified;
+        foreach (var automation in mMixSubscriptions.Values)
             automation.RangeModified -= OnRangeModified;
         mContext.Committed -= OnCommitted;
         foreach (var piece in mPieces)
@@ -578,6 +586,31 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
     {
         foreach (var piece in mPieces) { piece.Dirty = true; piece.Failed = false; }
         mNeedResegment = true;
+        // part 属性变更可能增删了说话人混合轨：补订新出现的、退订已消失的，使后续画曲线（RangeModified）能标脏。
+        //   时序安全：宿主 OnPartPropertiesModified（part 构造期订阅）先于本会话 handler（会话构造期订阅）执行，
+        //   它已 RebuildAutomationConfigs 填好 Voice.AutomationConfigs，故此刻 TryGetAutomation 对已选轨即命中。
+        SyncMixSubscriptions();
+    }
+
+    // 同步说话人混合轨订阅到当前 part 属性已选集：遍历全量去重 speaker 表（无需枚举 part 属性，live 视图也不支持），
+    //   逐个 TryGetAutomation——命中（= 已声明 = 已选）且未订则订、不命中且已订则退。幂等，可反复调。
+    void SyncMixSubscriptions()
+    {
+        foreach (var (key, _) in SpeakerMixTracks(mConfig))   // key = mix:<suffix>
+        {
+            bool live = mContext.TryGetAutomation(key, out var automation);
+            bool subscribed = mMixSubscriptions.ContainsKey(key);
+            if (live && !subscribed)
+            {
+                automation!.RangeModified += OnRangeModified;
+                mMixSubscriptions[key] = automation;
+            }
+            else if (!live && subscribed)
+            {
+                mMixSubscriptions[key].RangeModified -= OnRangeModified;
+                mMixSubscriptions.Remove(key);
+            }
+        }
     }
 
     void OnCommitted()
