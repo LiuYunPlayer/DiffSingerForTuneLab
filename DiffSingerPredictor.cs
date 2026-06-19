@@ -89,13 +89,13 @@ public sealed class DiffSingerPredictor : IDisposable
     // 无同后缀回退首个。按后缀缓存。
     public float[] GetEmbedding(string acousticSpeaker)
     {
-        string suffix = Suffix(acousticSpeaker);
+        string suffix = DiffSingerDeclarations.Suffix(acousticSpeaker);
         lock (mLock)
         {
             if (mEmbCache.TryGetValue(suffix, out var cached))
                 return cached;
 
-            string? match = mSpeakers.FirstOrDefault(s => Suffix(s) == suffix) ?? mSpeakers.FirstOrDefault();
+            string? match = mSpeakers.FirstOrDefault(s => DiffSingerDeclarations.Suffix(s) == suffix) ?? mSpeakers.FirstOrDefault();
             var emb = new float[mHidden];
             if (match != null)
             {
@@ -149,12 +149,6 @@ public sealed class DiffSingerPredictor : IDisposable
     static Dictionary<string, int> LoadIntMap(string path)
         => new DeserializerBuilder().Build().Deserialize<Dictionary<string, int>>(File.ReadAllText(path))
            ?? new Dictionary<string, int>();
-
-    static string Suffix(string s)
-    {
-        int dot = s.LastIndexOf('.');
-        return dot >= 0 && dot < s.Length - 1 ? s[(dot + 1)..] : s;
-    }
 
     public void Dispose()
     {

@@ -17,6 +17,7 @@ public static class DiffSingerDeclarations
     public const string KeySpeed = "speed";
     public const string KeySpeaker = "speaker";
     public const string KeyLanguage = "language";
+    public const string KeyMixPrefix = "mix:";   // 说话人混合轨 key 前缀：mix:<suffix>
 
     // Gender(GENC) / Speed(VELC) 连续轨：忠实采 OpenUtau 原生 UI 量程（非半音/倍率），convert 据此逐字移植。
     //   · GENC ∈ [-100,100]，基线 0 = 不移位，正 = formant 下移；增广范围 KeyShift* 仅入 convert 缩放，不做轨边界。
@@ -58,6 +59,12 @@ public static class DiffSingerDeclarations
             map.Add(KeyGender, Continuous("Gender", "#E5A573", GenderBaseline, GenderMin, GenderMax));
         if (config.UseSpeedEmbed)
             map.Add(KeySpeed, Continuous("Speed", "#73B5E5", SpeedBaseline, SpeedMin, SpeedMax));
+
+        // 说话人混合：多说话人时每 speaker 一条逐帧权重轨（连续、[0,100]、基线 0），mix:<suffix>。
+        //   不画时全权重落到 part 级 KeySpeaker（默认 suffix）⇒ 等价单说话人广播；画上即逐帧混入该 speaker。
+        int mixColorIndex = 0;
+        foreach (var (key, suffix) in SpeakerMixTracks(config))
+            map.Add(key, Continuous(suffix, MixColors[mixColorIndex++ % MixColors.Length], 0, 0, 100));
         return map;
     }
 
@@ -123,13 +130,37 @@ public static class DiffSingerDeclarations
     {
         var options = new List<ComboBoxOption>(speakers.Count);
         foreach (var speaker in speakers)
-        {
-            int dot = speaker.LastIndexOf('.');
-            var display = dot >= 0 && dot < speaker.Length - 1 ? speaker[(dot + 1)..] : speaker;
-            options.Add(new ComboBoxOption(PropertyValue.Create(speaker), display));
-        }
+            options.Add(new ComboBoxOption(PropertyValue.Create(speaker), Suffix(speaker)));
         return options;
     }
+
+    // 说话人混合轨 (key=mix:<suffix>, suffix)：多说话人时每 speaker 一条；同 suffix 去重（取首个，对齐 OpenUtau 按 suffix 解析）。
+    public static IEnumerable<(string Key, string Suffix)> SpeakerMixTracks(VoicebankConfig config)
+    {
+        if (config.Speakers.Count <= 1)
+            yield break;
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var speaker in config.Speakers)
+        {
+            var suffix = Suffix(speaker);
+            if (seen.Add(suffix))
+                yield return (KeyMixPrefix + suffix, suffix);
+        }
+    }
+
+    // dsconfig 说话人条目 → 显示/匹配用 suffix（"260509a.Miku" → "Miku"；无点则原样）。
+    public static string Suffix(string speaker)
+    {
+        int dot = speaker.LastIndexOf('.');
+        return dot >= 0 && dot < speaker.Length - 1 ? speaker[(dot + 1)..] : speaker;
+    }
+
+    // 说话人混合轨配色（按声明顺序轮转）。
+    static readonly string[] MixColors =
+    {
+        "#E57373", "#F06292", "#BA68C8", "#9575CD", "#7986CB", "#64B5F6",
+        "#4DD0E1", "#4DB6AC", "#81C784", "#DCE775", "#FFD54F", "#FFB74D",
+    };
 
     static AutomationConfig Piecewise(string display, string color, double min, double max) => new()
     {

@@ -175,6 +175,15 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         int nFrames = durations.Sum();
         double renderStart = phones[0].StartTime - head * frameSec;
 
+        // 逐帧时刻 + 说话人逐帧混合（mix:<suffix> 曲线，acoustic/pitch/variance 三域共享；不画时退化为默认 speaker 恒权重）。
+        var frameTimes = new double[nFrames];
+        for (int f = 0; f < nFrames; f++) frameTimes[f] = renderStart + (f + 0.5) * frameSec;
+        var mixTracks = new List<(string Suffix, double[] Sampled)>();
+        foreach (var (key, suffix) in SpeakerMixTracks(mConfig))
+            if (snapshot.TryGetAutomation(key, out var mixAuto))
+                mixTracks.Add((suffix, mixAuto.Evaluator.Evaluate(frameTimes)));
+        var speakerMix = DiffSingerSpeakerMix.Create(Suffix(speaker), mixTracks, nFrames);
+
         // tokens/languages：声学表，前后加 SP。
         var tokens = new long[nTokens];
         var langs = new long[nTokens];
@@ -202,14 +211,12 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         //   用户已画处（Pitch 非 NaN）用户值覆盖；NaN 自由区用预测轮廓（无 dspitch ⇒ 仍用矩形 framePitch）；PITD/vibrato 叠加在上。
         var predictedPitch = DiffSingerPitch.Predict(
             models.GetPredictor("dspitch"), phones, notes, durations,
-            renderStart, frameSec, speaker, mConfig, mSamplingSteps);
+            renderStart, frameSec, speakerMix, mConfig, mSamplingSteps);
         progress?.Report(0.28);
         if (cancellation.IsCancellationRequested)
             return null;
 
         // 逐帧 f0(Hz) + 半音曲线（variance 用）：帧中心采样双通道音高，NaN 自由区回退预测轮廓（无则 note 音高）。
-        var frameTimes = new double[nFrames];
-        for (int f = 0; f < nFrames; f++) frameTimes[f] = renderStart + (f + 0.5) * frameSec;
         var pitchCurve = snapshot.Pitch.Evaluator.Evaluate(frameTimes);
         var deviation = snapshot.PitchDeviation.Evaluator.Evaluate(frameTimes);
         var f0 = new float[nFrames];
@@ -232,7 +239,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         // —— variance 预测（基线；下方与用户 delta 合成喂声学、纯预测产回显）——
         var varCurves = DiffSingerVariance.Predict(
             models.GetPredictor("dsvariance"), phones.Select(p => p.Symbol).ToList(),
-            durations, semis, speaker, mConfig, mSamplingSteps);
+            durations, semis, speakerMix, mConfig, mSamplingSteps);
         progress?.Report(0.45);
         if (cancellation.IsCancellationRequested)
             return null;
@@ -275,9 +282,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
 
         if (ac.InputMetadata.ContainsKey("spk_embed"))
         {
-            var emb = models.GetSpeakerEmbedding(speaker);
-            var spk = new float[nFrames * hidden];
-            for (int f = 0; f < nFrames; f++) Array.Copy(emb, 0, spk, f * hidden, hidden);
+            var spk = speakerMix.ToEmbedding(models.GetSpeakerEmbeddingBySuffix, hidden);
             inputs.Add(NamedOnnxValue.CreateFromTensor("spk_embed", new DenseTensor<float>(spk, new[] { 1, nFrames, hidden })));
         }
         if (mConfig.UseContinuousAcceleration)

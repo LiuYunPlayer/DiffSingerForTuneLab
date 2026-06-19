@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using Microsoft.ML.OnnxRuntime;
 using TuneLab.Foundation;
 using TuneLab.SDK;
@@ -171,19 +172,25 @@ public sealed class VoiceModels : IDisposable
         }
     }
 
-    // 说话人逐帧嵌入向量（.emb = HiddenSize 个 float32 LE）；按说话人缓存。
-    public float[] GetSpeakerEmbedding(string speaker)
+    // 说话人嵌入向量（.emb = HiddenSize 个 float32 LE）：按 suffix 关联同后缀声学条目、无则回退首个；按 suffix 缓存。
+    //   忠实对齐 OpenUtau getSpeakerIndexBySuffix 的「按 suffix 解析、回退首个」；供 DiffSingerSpeakerMix 逐帧混合解析声学域 emb。
+    public float[] GetSpeakerEmbeddingBySuffix(string suffix)
     {
         lock (mEmbLock)
         {
-            if (mEmbCache.TryGetValue(speaker, out var cached))
+            if (mEmbCache.TryGetValue(suffix, out var cached))
                 return cached;
 
-            var bytes = File.ReadAllBytes(Path.Combine(mConfig.RootPath, speaker + ".emb"));
+            string? match = mConfig.Speakers.FirstOrDefault(s => DiffSingerDeclarations.Suffix(s) == suffix)
+                ?? (mConfig.Speakers.Count > 0 ? mConfig.Speakers[0] : null);
             var emb = new float[mConfig.HiddenSize];
-            for (int i = 0; i < emb.Length; i++)
-                emb[i] = BitConverter.ToSingle(bytes, i * 4);
-            mEmbCache[speaker] = emb;
+            if (match != null)
+            {
+                var bytes = File.ReadAllBytes(Path.Combine(mConfig.RootPath, match + ".emb"));
+                for (int i = 0; i < emb.Length; i++)
+                    emb[i] = BitConverter.ToSingle(bytes, i * 4);
+            }
+            mEmbCache[suffix] = emb;
             return emb;
         }
     }
