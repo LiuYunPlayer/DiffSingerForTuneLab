@@ -109,6 +109,7 @@ public sealed class DiffSingerPredictor : IDisposable
     }
 
     // —— 词典加载 ——
+    // 策略：先加载 dsdict.yaml 作为默认底库，再叠加载入语种特定文件（后面覆盖前面）。
     Dictionary<string, string[]> GetEntries(string lang)
     {
         lock (mLock)
@@ -117,7 +118,19 @@ public sealed class DiffSingerPredictor : IDisposable
                 return cached;
 
             var map = new Dictionary<string, string[]>(StringComparer.Ordinal);
-            foreach (var file in new[] { $"dsdict-{lang}.yaml", $"dsdict-zh-{lang}.yaml", "dsdict.yaml" })
+
+            // 1. 加载默认底库 dsdict.yaml（总是存在）
+            var defaultPath = Path.Combine(mDir, "dsdict.yaml");
+            if (File.Exists(defaultPath))
+            {
+                var root = DeserializeDsDict(defaultPath);
+                foreach (var e in root.entries)
+                    if (!string.IsNullOrEmpty(e.grapheme))
+                        map[e.grapheme] = e.phonemes.ToArray();
+            }
+
+            // 2. 叠加载入语种特定文件（若存在则覆盖/补充）
+            foreach (var file in new[] { $"dsdict-{lang}.yaml", $"dsdict-zh-{lang}.yaml" })
             {
                 var path = Path.Combine(mDir, file);
                 if (!File.Exists(path)) continue;
@@ -125,8 +138,8 @@ public sealed class DiffSingerPredictor : IDisposable
                 foreach (var e in root.entries)
                     if (!string.IsNullOrEmpty(e.grapheme))
                         map[e.grapheme] = e.phonemes.ToArray();
-                break;
             }
+
             mEntryCache[lang] = map;
             return map;
         }

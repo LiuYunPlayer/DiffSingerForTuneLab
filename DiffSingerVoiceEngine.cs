@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using TuneLab.Foundation;
 using TuneLab.SDK;
 
@@ -32,6 +33,44 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
         mModelCache = null;
     }
 
+    // —— 会话注册表（引擎级，跨会话共享）——
+    readonly List<WeakReference<DiffSingerSynthesisSession>> mSessions = new();
+
+    internal void RegisterSession(DiffSingerSynthesisSession session)
+    {
+        lock (mSessions)
+        {
+            // 清理已回收的弱引用
+            mSessions.RemoveAll(wr => !wr.TryGetTarget(out _));
+            mSessions.Add(new WeakReference<DiffSingerSynthesisSession>(session));
+        }
+    }
+
+    internal void UnregisterSession(DiffSingerSynthesisSession session)
+    {
+        lock (mSessions)
+        {
+            mSessions.RemoveAll(wr => !wr.TryGetTarget(out var s) || s == session);
+        }
+    }
+
+    internal DiffSingerSynthesisSession? FindSessionByVoiceId(string voiceId)
+    {
+        lock (mSessions)
+        {
+            // 清理已回收
+            mSessions.RemoveAll(wr => !wr.TryGetTarget(out _));
+            // 取最后一个匹配 voiceId 的会话（通常只有一个）
+            DiffSingerSynthesisSession? found = null;
+            foreach (var wr in mSessions)
+            {
+                if (wr.TryGetTarget(out var s) && s.VoiceId == voiceId)
+                    found = s;
+            }
+            return found;
+        }
+    }
+
     public ISynthesisSession CreateSession(string voiceId, ISynthesisContext context)
     {
         if (!mState.Banks.ContainsKey(voiceId))
@@ -40,7 +79,9 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
         // 推理走引擎级模型缓存（懒加载、按 voiceId 共享）；声明面（轨/面板）已上移到引擎方法、建会话前即填好。
         var config = ConfigFor(voiceId)!;
         var samplingSteps = mSettings.GetInt(KeySamplingSteps, 20);
-        return new DiffSingerSynthesisSession(config, context, voiceId, EnsureModelCache(), samplingSteps);
+        var session = new DiffSingerSynthesisSession(config, context, voiceId, EnsureModelCache(), samplingSteps);
+        RegisterSession(session);
+        return session;
     }
 
     // —— 声明（引擎层、纯函数 of (voiceId, part 值)；宿主在每次 part 参数 commit 时按当前值重算 diff 到 UI）——
@@ -52,10 +93,82 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
         => ConfigFor(context.VoiceId) is { } c ? DiffSingerDeclarations.BuildReadbackConfigs(c) : EmptyAutomations;
 
     public ObjectConfig GetPartPropertyConfig(IPartPropertyContext context)
-        => ConfigFor(context.VoiceId) is { } c ? DiffSingerDeclarations.BuildPartConfig(c) : EmptyConfig;
+    {
+        if (ConfigFor(context.VoiceId) is not { } c)
+            return EmptyConfig;
+
+        var baseConfig = DiffSingerDeclarations.BuildPartConfig(c);
+        var voiceId = context.VoiceId;
+
+        // Properties 是 IReadOnlyOrderedMap，需要新建可写集合
+        var props = new OrderedMap<string, IControllerConfig>();
+        foreach (var kvp in baseConfig.Properties)
+            props.Add(kvp.Key, kvp.Value);
+
+        // 追加 Retake 和 Redraw Pitch 按钮
+        props.Add("_retake", new ButtonConfig
+        {
+            DisplayText = L.Tr("Retake"),
+            Action = () => FindSessionByVoiceId(voiceId)?.RequestRetake(),
+        });
+        props.Add("_redraw_pitch", new ButtonConfig
+        {
+            DisplayText = L.Tr("Redraw Pitch"),
+            Action = () => FindSessionByVoiceId(voiceId)?.RequestRedrawPitch(),
+        });
+
+        return new ObjectConfig { Properties = props };
+    }
 
     public ObjectConfig GetNotePropertyConfig(INotePropertyContext context)
-        => ConfigFor(context.VoiceId) is { } c ? DiffSingerDeclarations.BuildNoteConfig(c, context) : EmptyConfig;
+    {
+        if (ConfigFor(context.VoiceId) is not { } c)
+            return EmptyConfig;
+
+        var baseConfig = DiffSingerDeclarations.BuildNoteConfig(c, context);
+        var voiceId = context.VoiceId;
+        double selStart = context.SelectionStartTime;
+        double selEnd = context.SelectionEndTime;
+        bool hasSelection = !double.IsNaN(selStart) && !double.IsNaN(selEnd);
+
+        var props = new OrderedMap<string, IControllerConfig>();
+        foreach (var kvp in baseConfig.Properties)
+            props.Add(kvp.Key, kvp.Value);
+
+        // 追加 Retake 和 Redraw Pitch 按钮（使用选中音符的区间而非全曲）
+        props.Add("_retake", new ButtonConfig
+        {
+            DisplayText = L.Tr("Retake"),
+            Action = () =>
+            {
+                var session = FindSessionByVoiceId(voiceId);
+                if (session != null)
+                {
+                    if (hasSelection)
+                        session.RequestRetakeScoped(selStart, selEnd);
+                    else
+                        session.RequestRetake();
+                }
+            },
+        });
+        props.Add("_redraw_pitch", new ButtonConfig
+        {
+            DisplayText = L.Tr("Redraw Pitch"),
+            Action = () =>
+            {
+                var session = FindSessionByVoiceId(voiceId);
+                if (session != null)
+                {
+                    if (hasSelection)
+                        session.RequestRedrawPitchScoped(selStart, selEnd);
+                    else
+                        session.RequestRedrawPitch();
+                }
+            },
+        });
+
+        return new ObjectConfig { Properties = props };
+    }
 
     // 声库能力集按 voiceId 缓存（声明每次 commit 都调，避免重复解析 dsconfig）；config 随声库不可变，扫描重建时清空。
     VoicebankConfig? ConfigFor(string voiceId)

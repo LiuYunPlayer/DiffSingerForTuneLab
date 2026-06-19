@@ -91,7 +91,7 @@ public static class DiffSingerDeclarations
             });
 
         if (HasLanguageChoice(config))
-            properties.Add(KeyLanguage, LanguageCombo(config, config.Languages[0]));
+            properties.Add(KeyLanguage, LanguageCombo(config, string.Empty));
 
         return new ObjectConfig { Properties = properties };
     }
@@ -102,7 +102,7 @@ public static class DiffSingerDeclarations
         var properties = new OrderedMap<string, IControllerConfig>();
         if (HasLanguageChoice(config))
         {
-            var partDefault = context.PartProperties.GetString(KeyLanguage, config.Languages[0]);
+            var partDefault = context.PartProperties.GetString(KeyLanguage, string.Empty);
             properties.Add(KeyLanguage, LanguageCombo(config, partDefault));
         }
         return new ObjectConfig { Properties = properties };
@@ -113,15 +113,15 @@ public static class DiffSingerDeclarations
     static ComboBoxConfig LanguageCombo(VoicebankConfig config, string defaultValue) => new()
     {
         DisplayText = L.Tr("Language"),
-        Options = ToOptions(config.Languages),
+        Options = LanguageOptions(config.Languages),
         DefaultOption = PropertyValue.Create(defaultValue),
     };
 
-    static List<ComboBoxOption> ToOptions(IReadOnlyList<string> values)
+    static List<ComboBoxOption> LanguageOptions(IReadOnlyList<string> languages)
     {
-        var options = new List<ComboBoxOption>(values.Count);
-        foreach (var value in values)
-            options.Add(value);   // 隐式转换：string → ComboBoxOption（值即显示文本）
+        var options = new List<ComboBoxOption> { new(PropertyValue.Create(string.Empty), "default") };
+        foreach (var lang in languages)
+            options.Add(lang);
         return options;
     }
 

@@ -42,14 +42,21 @@ public static class DiffSingerVariance
         var langs = symbols.Select(s => v.LangId(PhonemeLanguage(s))).Prepend(0L).Append(0L).ToArray();
         var isVowel = symbols.Select(v.IsVowel).ToArray();
 
-        // —— linguistic（词模式）——
-        var (wordDiv, wordDur) = DiffSingerFrames.PaddedWordDivAndDur(isVowel, phDur);
+        // —— linguistic（据编码器实际输入选择词模式或音素模式）——
         var lingInputs = new List<NamedOnnxValue>
         {
             NvL("tokens", tokens, nTokens),
-            NvL("word_div", wordDiv, wordDiv.Length),
-            NvL("word_dur", wordDur, wordDur.Length),
         };
+        if (v.LinguisticUsesWordBoundary)
+        {
+            var (wordDiv, wordDur) = DiffSingerFrames.PaddedWordDivAndDur(isVowel, phDur);
+            lingInputs.Add(NvL("word_div", wordDiv, wordDiv.Length));
+            lingInputs.Add(NvL("word_dur", wordDur, wordDur.Length));
+        }
+        else
+        {
+            lingInputs.Add(NvL("ph_dur", phDur.Select(x => (long)x).ToArray(), nTokens));
+        }
         if (v.Linguistic.InputMetadata.ContainsKey("languages"))
             lingInputs.Add(NvL("languages", langs, nTokens));
         using var lingOut = v.Linguistic.Run(lingInputs);
