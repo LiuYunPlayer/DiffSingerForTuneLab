@@ -22,6 +22,12 @@ public static class DiffSingerPhonemizer
     const string Pause = "SP";
     const double PaddingSec = 0.5;   // 短语首辅音前导空间（OpenUtau padding=500ms）
 
+    // 延音符（tenuto/slur）：TuneLab 原生延音符歌词为 "-"；兼容 OpenUtau 导入工程的 "+"/"+~"/"+*" 前缀。
+    //   延音符不带自身音素——沿用前一发声 note 的元音、令其延展过来；其音高仅在 pitch 时间线（note_midi）上承载，
+    //   故声学/音素侧把它「跳过」即可让前元音自然伸到下一发声 note 起点。见 DiffSingerPitch.BuildNotes 对称处理。
+    public static bool IsSlur(string? lyric)
+        => lyric == "-" || (lyric != null && lyric.StartsWith("+"));
+
     sealed class Group
     {
         public double Pos;            // 组起点（秒）；元音组=note 起点，首组=首 note 起点-padding，哨兵=末 note 终点
@@ -48,6 +54,17 @@ public static class DiffSingerPhonemizer
         for (int i = 0; i < notes.Count; i++)
         {
             var note = notes[i];
+
+            // 延音符：不产音素、不建组——前一组（前元音）会自然伸展到下一发声 note 起点（对齐终点跨过本 note）。
+            //   notePhIndex 记空区间（本 note 无音素，NoteOf 不会落到它）。首 note 即延音符则无前可沿，退化为常规 G2P。
+            if (i > 0 && IsSlur(note.Lyric))
+            {
+                pinned[i] = false;
+                noteSymbolCount[i] = 0;
+                notePhIndex.Add(notePhIndex[^1]);
+                continue;
+            }
+
             string[] symbols = GetSymbols(dur, note, noteLang[i], out pinned[i]);
             noteSymbolCount[i] = symbols.Length;
 
