@@ -32,7 +32,7 @@ public static class DiffSingerPhonemizer
 
     public static List<PhonemeSpan> Phonemize(
         DiffSingerPredictor dur, IReadOnlyList<SynthesisNoteSnapshot> notes,
-        IReadOnlyList<string> noteLang, string speaker, int hop, int sampleRate)
+        IReadOnlyList<string> noteLang, string speaker, int hop, int sampleRate, bool tensorCache)
     {
         if (notes.Count == 0)
             return new List<PhonemeSpan>();
@@ -71,7 +71,7 @@ public static class DiffSingerPhonemizer
         var wordDiv = groups.Take(groups.Count - 1).Select(g => (long)g.Phonemes.Count).ToArray();
         var wordDur = groups.Zip(groups.Skip(1), (a, b) => (long)FramesBetween(a.Pos, b.Pos, frameSec)).ToArray();
 
-        var durationFrames = RunDur(dur, tokens, langs, wordDiv, wordDur, flatTone, speaker);
+        var durationFrames = RunDur(dur, tokens, langs, wordDiv, wordDur, flatTone, speaker, tensorCache);
 
         // —— 对齐：首辅音自然，其余每组按比例缩放，终点对齐到下一组(note)起点 ——
         // phAlignPoints[k] = (展平下标=第 k+1 组首音素, 第 k+1 组起点秒)
@@ -196,7 +196,7 @@ public static class DiffSingerPhonemizer
 
     // linguistic(词模式) + dur → 每音素预测帧（float）。
     static double[] RunDur(DiffSingerPredictor dur, long[] tokens, long[] langs,
-        long[] wordDiv, long[] wordDur, int[] phMidi, string speaker)
+        long[] wordDiv, long[] wordDur, int[] phMidi, string speaker, bool tensorCache)
     {
         int nTokens = tokens.Length, nWords = wordDiv.Length, hidden = dur.HiddenSize;
         var lingInputs = new List<NamedOnnxValue>
@@ -208,7 +208,7 @@ public static class DiffSingerPhonemizer
         if (dur.Linguistic.InputMetadata.ContainsKey("languages"))
             lingInputs.Add(Nv("languages", langs, nTokens));
 
-        using var lingOut = dur.Linguistic.Run(lingInputs);
+        var lingOut = DiffSingerTensorCache.Run(dur.Linguistic, dur.LinguisticHash, lingInputs, tensorCache);
         var enc = lingOut.First(v => v.Name == "encoder_out").AsTensor<float>();
         var mask = lingOut.First(v => v.Name == "x_masks").AsTensor<bool>();
         var encDense = new DenseTensor<float>(enc.ToArray(), enc.Dimensions.ToArray());
@@ -226,7 +226,7 @@ public static class DiffSingerPhonemizer
             Nv("ph_midi", phMidi.Select(x => (long)x).ToArray(), nTokens),
             NamedOnnxValue.CreateFromTensor("spk_embed", new DenseTensor<float>(spk, new[] { 1, nTokens, hidden })),
         };
-        using var durOut = durModel.Run(durInputs);
+        var durOut = DiffSingerTensorCache.Run(durModel, dur.ModelHash("dur"), durInputs, tensorCache);
         return durOut.First(v => v.Name == "ph_dur_pred").AsTensor<float>().Select(x => (double)x).ToArray();
     }
 

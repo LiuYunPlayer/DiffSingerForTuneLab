@@ -40,6 +40,8 @@
   <ItemGroup>
     <PackageReference Include="YamlDotNet" Version="18.0.0" />
     <PackageReference Include="Microsoft.ML.OnnxRuntime.DirectML" Version="1.20.1" />
+    <!-- 张量缓存键哈希：XxHash64（模型文件内容哈希 + 序列化输入）。 -->
+    <PackageReference Include="System.IO.Hashing" Version="8.0.0" />
   </ItemGroup>
 
 </Project>

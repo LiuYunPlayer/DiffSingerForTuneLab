@@ -28,7 +28,7 @@ public static class DiffSingerVariance
     // symbols = body 音素（不含 head/tail）；phDur = padded 帧（len=symbols+2）；pitchSemis = totalFrames 半音曲线。
     public static VarianceCurves Predict(
         DiffSingerPredictor? v, IReadOnlyList<string> symbols, int[] phDur,
-        float[] pitchSemis, DiffSingerSpeakerMix mix, VoicebankConfig cfg, int steps)
+        float[] pitchSemis, DiffSingerSpeakerMix mix, VoicebankConfig cfg, int steps, bool tensorCache)
     {
         if (v is null || !v.HasModel("variance") || symbols.Count == 0)
             return default;
@@ -52,7 +52,7 @@ public static class DiffSingerVariance
         };
         if (v.Linguistic.InputMetadata.ContainsKey("languages"))
             lingInputs.Add(NvL("languages", langs, nTokens));
-        using var lingOut = v.Linguistic.Run(lingInputs);
+        var lingOut = DiffSingerTensorCache.Run(v.Linguistic, v.LinguisticHash, lingInputs, tensorCache);
         var enc = lingOut.First(o => o.Name == "encoder_out").AsTensor<float>();
         var encDense = new DenseTensor<float>(enc.ToArray(), enc.Dimensions.ToArray());
 
@@ -94,7 +94,7 @@ public static class DiffSingerVariance
                 new DenseTensor<float>(spk, new[] { 1, totalFrames, hidden })));
         }
 
-        using var outputs = model.Run(inputs);
+        var outputs = DiffSingerTensorCache.Run(model, v.ModelHash("variance"), inputs, tensorCache);
         float[]? Out(bool predict, string name)
             => predict ? outputs.First(o => o.Name == name).AsTensor<float>().ToArray() : null;
         return new VarianceCurves(

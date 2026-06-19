@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using TuneLab.Foundation;
 using TuneLab.SDK;
 
@@ -12,6 +13,11 @@ namespace DiffSingerForTuneLab;
 //   （故规格集中在此、单一真相源）。见 IVoiceEngine 注释与 MidiPart 的 RefreshDeclarations→CreateSession 时序。
 public static class DiffSingerDeclarations
 {
+    // 插件独立用户数据根：在 TuneLab 宿主目录之外（宿主目录只存宿主自己的数据，外来插件应有独立用户目录）。
+    //   Voices（默认声库扫描根）/ Vocoders（声码器）/ Cache（张量缓存）三处目录单一来源、均由此派生。
+    public static string UserDataRoot => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "DiffSingerForTuneLab");
+
     // —— 暴露给用户的参数键（避开宿主保留名 Volume / VibratoEnvelope）——
     public const string KeyGender = "gender";
     public const string KeySpeed = "speed";

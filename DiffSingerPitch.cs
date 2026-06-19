@@ -21,7 +21,7 @@ public static class DiffSingerPitch
     public static float[]? Predict(
         DiffSingerPredictor? v, IReadOnlyList<PhonemeSpan> phones,
         IReadOnlyList<SynthesisNoteSnapshot> notes, int[] phDur,
-        double renderStart, double frameSec, DiffSingerSpeakerMix mix, VoicebankConfig cfg, int steps)
+        double renderStart, double frameSec, DiffSingerSpeakerMix mix, VoicebankConfig cfg, int steps, bool tensorCache)
     {
         if (v is null || !v.HasModel("pitch") || phones.Count == 0 || notes.Count == 0)
             return null;
@@ -52,7 +52,7 @@ public static class DiffSingerPitch
             var langs = phones.Select(p => v.LangId(PhonemeLanguage(p.Symbol))).Prepend(0L).Append(0L).ToArray();
             lingInputs.Add(NvL("languages", langs, nTokens));
         }
-        using var lingOut = v.Linguistic.Run(lingInputs);
+        var lingOut = DiffSingerTensorCache.Run(v.Linguistic, v.LinguisticHash, lingInputs, tensorCache);
         var enc = lingOut.First(o => o.Name == "encoder_out").AsTensor<float>();
         var encDense = new DenseTensor<float>(enc.ToArray(), enc.Dimensions.ToArray());
 
@@ -95,7 +95,7 @@ public static class DiffSingerPitch
             inputs.Add(NamedOnnxValue.CreateFromTensor("note_rest",
                 new DenseTensor<bool>(noteRest, new[] { 1, noteRest.Length })));
 
-        using var outputs = model.Run(inputs);
+        var outputs = DiffSingerTensorCache.Run(model, v.ModelHash("pitch"), inputs, tensorCache);
         return outputs.First().AsTensor<float>().ToArray();
     }
 

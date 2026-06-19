@@ -17,6 +17,8 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
     const string KeyVoicebankDirs = "voicebank_dirs";
     const string KeyExecutionProvider = "execution_provider";
     const string KeySamplingSteps = "sampling_steps";
+    const string KeyTensorCache = "tensor_cache";
+    const string KeyCacheMaxSizeMb = "cache_max_size_mb";
 
     public IReadOnlyOrderedMap<string, VoiceSourceInfo> VoiceSourceInfos => mState.Infos;
 
@@ -40,7 +42,10 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
         // 推理走引擎级模型缓存（懒加载、按 voiceId 共享）；声明面（轨/面板）已上移到引擎方法、建会话前即填好。
         var config = ConfigFor(voiceId)!;
         var samplingSteps = mSettings.GetInt(KeySamplingSteps, 20);
-        return new DiffSingerSynthesisSession(config, context, voiceId, EnsureModelCache(), samplingSteps);
+        var tensorCache = mSettings.GetBool(KeyTensorCache, true);
+        var cacheMaxSizeMb = mSettings.GetInt(KeyCacheMaxSizeMb, 4096);
+        return new DiffSingerSynthesisSession(config, context, voiceId, EnsureModelCache(),
+            samplingSteps, tensorCache, cacheMaxSizeMb);
     }
 
     // —— 声明（引擎层、纯函数 of (voiceId, part 值)；宿主在每次 part 参数 commit 时按当前值重算 diff 到 UI）——
@@ -113,6 +118,20 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
                     DefaultValue = 20, MinValue = 1, MaxValue = 1000, IsInteger = true,
                 }
             },
+            {
+                // 张量缓存总开关：缓存各 ONNX 模型输出，反复合成（撤销重做/重开工程/改动不涉及某块）时复用、免重算。
+                KeyTensorCache,
+                new CheckBoxConfig { DisplayText = L.Tr("Tensor cache"), DefaultValue = true }
+            },
+            {
+                // 缓存体积上限（MB）：超限按最近访问时间逐出最旧缓存；0 = 不限制（持久累积、手动清理）。
+                KeyCacheMaxSizeMb,
+                new SliderConfig
+                {
+                    DisplayText = L.Tr("Cache size limit (MB, 0 = unlimited)"),
+                    DefaultValue = 4096, MinValue = 0, MaxValue = 102400, IsInteger = true,
+                }
+            },
         };
         return new ObjectConfig { Properties = properties };
     }
@@ -152,9 +171,7 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
         return roots;
     }
 
-    static string DefaultVoicebankDirectory => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-        "TuneLab", "DiffSinger", "Voices");
+    static string DefaultVoicebankDirectory => Path.Combine(DiffSingerDeclarations.UserDataRoot, "Voices");
 
     // 内置默认目录尽力创建一次，给用户一个放声库的落点；失败不影响其余根目录的扫描。
     static void EnsureDefaultDirectory()

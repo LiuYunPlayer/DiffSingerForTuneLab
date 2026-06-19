@@ -24,6 +24,8 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
     readonly string mVoiceId;
     readonly DiffSingerModelCache mModelCache;
     readonly int mSamplingSteps;
+    readonly bool mTensorCache;        // 张量缓存总开关（引擎设置 tensor_cache）
+    readonly int mCacheMaxSizeMb;      // 缓存体积上限（MB）；0 = 不限制（引擎设置 cache_max_size_mb）
 
     // 运行时复用的声明派生物（每会话固定，构造期据声库能力集算一次）：
     //   可编辑轨集合（构造期订阅其区间编辑）+ 回显轨集合（产物 SynthesizedParameters 按其 key 聚合）。
@@ -38,13 +40,15 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
     bool mNeedResegment;
 
     public DiffSingerSynthesisSession(VoicebankConfig config, ISynthesisContext context,
-        string voiceId, DiffSingerModelCache modelCache, int samplingSteps)
+        string voiceId, DiffSingerModelCache modelCache, int samplingSteps, bool tensorCache, int cacheMaxSizeMb)
     {
         mConfig = config;
         mContext = context;
         mVoiceId = voiceId;
         mModelCache = modelCache;
         mSamplingSteps = samplingSteps;
+        mTensorCache = tensorCache;
+        mCacheMaxSizeMb = cacheMaxSizeMb;
 
         // 声明派生物据声库能力集算一次（与引擎声明同一套 DiffSingerDeclarations，单一真相源）。
         mAutomationConfigs = BuildAutomationConfigs(config);
@@ -111,7 +115,14 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         try
         {
             // offload：worker 只读冻结快照跑 ONNX（绝不碰活视图）；模型懒加载经引擎级缓存（首载触发原生加载）。
-            var rendered = await Task.Run(() => Render(snapshot, piece.Notes, report, cancellation), CancellationToken.None);
+            //   合成毕在 worker 线程顺手做一次缓存体积上限逐出（仅开缓存且设了上限时；off 数据线程、尽力而为）。
+            var rendered = await Task.Run(() =>
+            {
+                var result = Render(snapshot, piece.Notes, report, cancellation);
+                if (mTensorCache && mCacheMaxSizeMb > 0)
+                    DiffSingerTensorCache.EnforceSizeLimit(mCacheMaxSizeMb);
+                return result;
+            }, CancellationToken.None);
             if (rendered != null && mPieces.Contains(piece))
             {
                 int rate = rendered.SampleRate;
@@ -160,7 +171,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         // —— Phonemizer：歌词 → 音素时间线（绝对秒、含前置辅音越界）——
         var durPred = models.GetPredictor("dsdur");
         var phones = durPred != null
-            ? DiffSingerPhonemizer.Phonemize(durPred, notes, noteLang, speaker, hop, sr)
+            ? DiffSingerPhonemizer.Phonemize(durPred, notes, noteLang, speaker, hop, sr, mTensorCache)
             : FallbackPhonemes(models, notes, noteLang);   // 无 dur 预测器：每 note 一元音兜底
         if (phones.Count == 0)
             return null;
@@ -211,7 +222,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         //   用户已画处（Pitch 非 NaN）用户值覆盖；NaN 自由区用预测轮廓（无 dspitch ⇒ 仍用矩形 framePitch）；PITD/vibrato 叠加在上。
         var predictedPitch = DiffSingerPitch.Predict(
             models.GetPredictor("dspitch"), phones, notes, durations,
-            renderStart, frameSec, speakerMix, mConfig, mSamplingSteps);
+            renderStart, frameSec, speakerMix, mConfig, mSamplingSteps, mTensorCache);
         progress?.Report(0.28);
         if (cancellation.IsCancellationRequested)
             return null;
@@ -239,7 +250,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         // —— variance 预测（基线；下方与用户 delta 合成喂声学、纯预测产回显）——
         var varCurves = DiffSingerVariance.Predict(
             models.GetPredictor("dsvariance"), phones.Select(p => p.Symbol).ToList(),
-            durations, semis, speakerMix, mConfig, mSamplingSteps);
+            durations, semis, speakerMix, mConfig, mSamplingSteps, mTensorCache);
         progress?.Report(0.45);
         if (cancellation.IsCancellationRequested)
             return null;
@@ -299,7 +310,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
             inputs.Add(NamedOnnxValue.CreateFromTensor("speedup", new DenseTensor<long>(new[] { speedup }, new[] { 1 })));
         }
 
-        using var melOut = ac.Run(inputs);
+        var melOut = DiffSingerTensorCache.Run(ac, models.AcousticHash, inputs, mTensorCache);
         var mel = melOut.First(v => v.Name == "mel").AsTensor<float>();
         progress?.Report(0.75);
         if (cancellation.IsCancellationRequested)
@@ -310,7 +321,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         var vInputs = new List<NamedOnnxValue> { NamedOnnxValue.CreateFromTensor("mel", mel) };
         if (voc.InputMetadata.ContainsKey("f0"))
             vInputs.Add(NamedOnnxValue.CreateFromTensor("f0", new DenseTensor<float>(f0, new[] { 1, nFrames })));
-        using var wavOut = voc.Run(vInputs);
+        var wavOut = DiffSingerTensorCache.Run(voc, models.VocoderHash, vInputs, mTensorCache);
         var audio = wavOut.First(v => v.Name == "waveform").AsTensor<float>().ToArray();
         progress?.Report(1.0);
 

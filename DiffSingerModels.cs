@@ -21,7 +21,7 @@ public sealed class DiffSingerModelCache : IDisposable
     readonly ILogger mLogger;
     readonly object mLock = new();
     readonly Dictionary<string, VoiceModels> mVoices = new(StringComparer.Ordinal);
-    readonly Dictionary<string, InferenceSession> mVocoders = new(StringComparer.Ordinal);
+    readonly Dictionary<string, (InferenceSession Session, ulong Hash)> mVocoders = new(StringComparer.Ordinal);
 
     public DiffSingerModelCache(string provider, ILogger logger)
     {
@@ -29,10 +29,8 @@ public sealed class DiffSingerModelCache : IDisposable
         mLogger = logger;
     }
 
-    // 声码器根目录约定（本阶段定稿）：与声库 Voices 目录并列的 Vocoders 目录；声学 dsconfig 的 vocoder 字段即子目录名。
-    public static string VocodersDirectory => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-        "TuneLab", "DiffSinger", "Vocoders");
+    // 声码器根目录约定：插件用户数据根下、与声库 Voices 目录并列的 Vocoders 目录；声学 dsconfig 的 vocoder 字段即子目录名。
+    public static string VocodersDirectory => Path.Combine(DiffSingerDeclarations.UserDataRoot, "Vocoders");
 
     public VoiceModels GetOrLoad(string voiceId, VoicebankConfig config)
     {
@@ -41,16 +39,18 @@ public sealed class DiffSingerModelCache : IDisposable
             if (mVoices.TryGetValue(voiceId, out var cached))
                 return cached;
 
-            var acoustic = LoadSession(Path.Combine(config.RootPath, config.AcousticFileName));
-            var vocoder = GetOrLoadVocoder(config.VocoderName);
+            var acousticPath = Path.Combine(config.RootPath, config.AcousticFileName);
+            var acoustic = LoadSession(acousticPath);
+            var acousticHash = DiffSingerTensorCache.HashFile(acousticPath);
+            var (vocoder, vocoderHash) = GetOrLoadVocoder(config.VocoderName);
             // 预测器（dsdur/dspitch/dsvariance）懒加载共用本缓存的会话加载器（含 DML→CPU 回退）。
-            var models = new VoiceModels(config, acoustic, vocoder, LoadSession, mLogger);
+            var models = new VoiceModels(config, acoustic, acousticHash, vocoder, vocoderHash, LoadSession, mLogger);
             mVoices[voiceId] = models;
             return models;
         }
     }
 
-    InferenceSession GetOrLoadVocoder(string vocoderName)
+    (InferenceSession Session, ulong Hash) GetOrLoadVocoder(string vocoderName)
     {
         if (mVocoders.TryGetValue(vocoderName, out var cached))
             return cached;
@@ -62,9 +62,10 @@ public sealed class DiffSingerModelCache : IDisposable
         if (string.IsNullOrEmpty(modelFile))
             throw new InvalidOperationException($"声码器 {vocoderName} 的 vocoder.yaml 缺少 model 字段");
 
-        var session = LoadSession(Path.Combine(dir, modelFile));
-        mVocoders[vocoderName] = session;
-        return session;
+        var modelPath = Path.Combine(dir, modelFile);
+        var entry = (LoadSession(modelPath), DiffSingerTensorCache.HashFile(modelPath));
+        mVocoders[vocoderName] = entry;
+        return entry;
     }
 
     // directml 优先、建会话失败回退 CPU（cpu 设置直接走 CPU）。
@@ -98,8 +99,8 @@ public sealed class DiffSingerModelCache : IDisposable
         {
             foreach (var v in mVoices.Values)
                 v.Dispose();   // 释放声学 + 懒加载的预测器（声码器为缓存共享、单独释放）
-            foreach (var s in mVocoders.Values)
-                s.Dispose();
+            foreach (var entry in mVocoders.Values)
+                entry.Session.Dispose();
             mVoices.Clear();
             mVocoders.Clear();
         }
@@ -123,6 +124,10 @@ public sealed class VoiceModels : IDisposable
     public InferenceSession Acoustic { get; }
     public InferenceSession Vocoder { get; }
 
+    // 张量缓存 identifier（模型 .onnx 文件内容哈希，加载时算一次）。
+    public ulong AcousticHash { get; }
+    public ulong VocoderHash { get; }
+
     public int HiddenSize => mConfig.HiddenSize;
     public int HopSize => mConfig.HopSize;
     public int SampleRate => mConfig.SampleRate;
@@ -130,14 +135,16 @@ public sealed class VoiceModels : IDisposable
     public double MaxDepth => mConfig.MaxDepth;
     public IReadOnlyList<string> Speakers => mConfig.Speakers;
 
-    public VoiceModels(VoicebankConfig config, InferenceSession acoustic, InferenceSession vocoder,
-        Func<string, InferenceSession> load, ILogger logger)
+    public VoiceModels(VoicebankConfig config, InferenceSession acoustic, ulong acousticHash,
+        InferenceSession vocoder, ulong vocoderHash, Func<string, InferenceSession> load, ILogger logger)
     {
         mConfig = config;
         mLogger = logger;
         mLoad = load;
         Acoustic = acoustic;
         Vocoder = vocoder;
+        AcousticHash = acousticHash;
+        VocoderHash = vocoderHash;
 
         var yaml = new DeserializerBuilder().Build();   // JSON ⊂ YAML：音素/语言表（值为 int id）
         mPhonemes = yaml.Deserialize<Dictionary<string, int>>(

@@ -33,6 +33,11 @@ public sealed class DiffSingerPredictor : IDisposable
     // linguistic 是否吃 word_div/word_dur（dsdur/dsvariance 词边界；dspitch 用已知 ph_dur）。
     public bool LinguisticUsesWordBoundary { get; }
 
+    // 张量缓存 identifier（模型 .onnx 文件内容哈希，加载时算一次）：linguistic 与各 role 模型。
+    public ulong LinguisticHash { get; }
+    readonly Dictionary<string, ulong> mModelHashes = new(StringComparer.Ordinal);
+    public ulong ModelHash(string role) => mModelHashes.TryGetValue(role, out var h) ? h : 0;
+
     public DiffSingerPredictor(string dir, Func<string, InferenceSession> load)
     {
         mDir = dir;
@@ -53,11 +58,17 @@ public sealed class DiffSingerPredictor : IDisposable
         // 类型表（IsVowel/IsGlide）：从合并 dsdict.yaml 的 symbols 段读全语言符号类型。
         LoadSymbolTypes(Path.Combine(dir, "dsdict.yaml"));
 
-        Linguistic = load(Path.Combine(dir, Get("linguistic")));
+        var lingPath = Path.Combine(dir, Get("linguistic"));
+        Linguistic = load(lingPath);
+        LinguisticHash = DiffSingerTensorCache.HashFile(lingPath);
         LinguisticUsesWordBoundary = Linguistic.InputMetadata.ContainsKey("word_div");
         foreach (var role in new[] { "dur", "variance", "pitch" })
             if (!string.IsNullOrEmpty(Get(role)))
-                mModels[role] = load(Path.Combine(dir, Get(role)));
+            {
+                var rolePath = Path.Combine(dir, Get(role));
+                mModels[role] = load(rolePath);
+                mModelHashes[role] = DiffSingerTensorCache.HashFile(rolePath);
+            }
     }
 
     public bool HasModel(string role) => mModels.ContainsKey(role);
