@@ -99,9 +99,12 @@ public static class DiffSingerPitch
         return outputs.First().AsTensor<float>().ToArray();
     }
 
-    // note 序列构造（忠实移植 OpenUtau）：head padding(rest) + 各 note（间隙插 rest note）+ tail padding(rest)。
+    // note 序列构造（移植 OpenUtau，叠加重叠扩展）：head padding(rest) + 各 note（间隙插 rest note）+ tail padding(rest)。
     //   note_rest：slur（歌词 +）继承前一个；否则该 note 的音素全为辅音/AP/SP（无真元音）⇒ rest。
     //   note_midi：rest 组的 tone 由最近的非 rest note 填充（全 rest ⇒ 全填 60）。
+    //   头盖尾（OpenUtau 无、本插件扩展）：note 与后一 note 重叠时，有效终点截到后一 note 起点，使 note_dur 与
+    //   phonemizer/声学侧的截断时间线同口径——否则 pitch 模型按 note 全长走、轮廓越过后一 note 起点（不让位）。
+    //   同起点和弦退化为 dur=0 塌缩（排序长者在前先塌，短者存活）。
     static (float[] midi, int[] durFrames, bool[] rest) BuildNotes(
         DiffSingerPredictor v, IReadOnlyList<PhonemeSpan> phones,
         IReadOnlyList<SynthesisNoteSnapshot> notes,
@@ -120,6 +123,10 @@ public static class DiffSingerPitch
         for (int i = 0; i < notes.Count; i++)
         {
             var note = notes[i];
+            // 头盖尾：与后一 note 重叠时，本 note 有效终点截到后一 note 起点（同起点 ⇒ 截到自身起点 ⇒ dur=0 塌缩）。
+            double effectiveEnd = i + 1 < notes.Count
+                ? Math.Min(note.EndTime, notes[i + 1].StartTime)
+                : note.EndTime;
             double gap = note.StartTime - prevEnd;
             if (gap > 0)
             {
@@ -127,7 +134,7 @@ public static class DiffSingerPitch
                 midiList.Add(note.Pitch);
                 restList.Add(true);
             }
-            durSec.Add(Math.Max(0, note.EndTime - note.StartTime));
+            durSec.Add(Math.Max(0, effectiveEnd - note.StartTime));
             midiList.Add(note.Pitch);
             if ((note.Lyric ?? string.Empty).StartsWith("+"))
             {
@@ -143,7 +150,7 @@ public static class DiffSingerPitch
                 }
                 restList.Add(isRest);
             }
-            prevEnd = note.EndTime;
+            prevEnd = effectiveEnd;
         }
 
         // tail padding。
