@@ -135,6 +135,46 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
         foreach (var kvp in baseConfig.Properties)
             props.Add(kvp.Key, kvp.Value);
 
+        // —— 音素编辑器 ——
+        var phonemesJson = context.NoteProperties.GetString("_phonemes", "[]");
+        var phonemeEntries = ParsePhonemeJson(phonemesJson);
+        if (phonemeEntries.Count == 0 && c.Languages.Count > 0 && !double.IsNaN(selStart))
+        {
+            // 未自定义音素时，尝试从会话获取默认 G2P 音素
+            double midTime = (selStart + selEnd) / 2;
+            var session = FindSessionByVoiceId(voiceId);
+            if (session != null)
+            {
+                // 从上下文快照取段落语言（保证段落语言变更后能传新值给 G2P）
+                string snapPartLang = context.PartProperties.GetString(DiffSingerDeclarations.KeyLanguage, string.Empty);
+                phonemeEntries = session.GetDefaultPhonemesForNote(midTime, snapPartLang);
+            }
+        }
+        if (c.Languages.Count > 0)
+        {
+            props.Add("_phoneme_editor", new PhonemeEditorConfig
+            {
+                DisplayText = L.Tr("Phonemes"),
+                Phonemes = phonemeEntries,
+                AvailableLanguages = c.Languages,
+                LanguageDataKey = DiffSingerDeclarations.KeyLanguage,
+                CanDeleteConsonant = phonemeEntries.Count(e => !e.IsVowel) > 1,
+                CanDeleteVowel = phonemeEntries.Count(e => e.IsVowel) > 1,
+                OnChanged = _ =>
+                {
+                    // 音素被编辑 → 触发区间重渲染
+                    var s = FindSessionByVoiceId(voiceId);
+                    if (s != null)
+                    {
+                        if (hasSelection)
+                            s.RequestRetakeScoped(selStart, selEnd);
+                        else
+                            s.RequestRetake();
+                    }
+                },
+            });
+        }
+
         // 追加 Retake 和 Redraw Pitch 按钮（使用选中音符的区间而非全曲）
         props.Add("_retake", new ButtonConfig
         {
@@ -274,6 +314,38 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
     {
         try { Directory.CreateDirectory(DefaultVoicebankDirectory); }
         catch { }
+    }
+
+    // 解析音素 JSON：[{"s":"ja/b","v":false},...]
+    static List<PhonemeEntry> ParsePhonemeJson(string json)
+    {
+        var result = new List<PhonemeEntry>();
+        if (string.IsNullOrEmpty(json) || json.Length < 2) return result;
+        try
+        {
+            // 简单的手动 JSON 解析（避免加依赖）
+            int i = json.IndexOf('[');
+            if (i < 0) return result;
+            while (true)
+            {
+                i = json.IndexOf('{', i);
+                if (i < 0) break;
+                string entry = json.Substring(i, Math.Min(json.Length - i, json.IndexOf('}', i) - i + 1));
+                var phoneme = new PhonemeEntry();
+                int sIdx = entry.IndexOf("\"s\":\"");
+                if (sIdx >= 0)
+                {
+                    sIdx += 5;
+                    int eIdx = entry.IndexOf('"', sIdx);
+                    if (eIdx > sIdx) phoneme.Symbol = entry.Substring(sIdx, eIdx - sIdx);
+                }
+                phoneme.IsVowel = entry.Contains("\"v\":true") || entry.Contains("\"v\": true");
+                result.Add(phoneme);
+                i = json.IndexOf('}', i) + 1;
+            }
+        }
+        catch { }
+        return result;
     }
 
     // 不可变扫描结果，整体替换发布：get 侧读引用、扫描侧建好新实例后一次性换上，无需锁。

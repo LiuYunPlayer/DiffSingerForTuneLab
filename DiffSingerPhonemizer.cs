@@ -48,8 +48,23 @@ public static class DiffSingerPhonemizer
         for (int i = 0; i < notes.Count; i++)
         {
             var note = notes[i];
+            string lyric = note.Lyric ?? string.Empty;
             string[] symbols = GetSymbols(dur, note, noteLang[i], out pinned[i]);
             noteSymbolCount[i] = symbols.Length;
+
+            // 连音符：不产生新音素，只延展前音的时长（通过 group 自然吸收）
+            // (+) 额外在起始点插入一个空 vowel 边界组，强制对齐
+            if (symbols.Length == 0 && (lyric == "-" || lyric == "+"))
+            {
+                if (lyric == "+")
+                {
+                    // 插入一个空韵核组作为强制对齐边界
+                    groups.Add(new Group(note.StartTime, note.Pitch));
+                }
+                // - 则完全不做任何事，前组自然吸收时长
+                notePhIndex.Add(notePhIndex[^1]);
+                continue;
+            }
 
             var wordGroups = ProcessWord(dur, note, symbols);
             groups[^1].Phonemes.AddRange(wordGroups[0].Phonemes);   // 前置辅音并入前一组（侵入前一 note 尾）
@@ -152,15 +167,54 @@ public static class DiffSingerPhonemizer
         return wordGroups;
     }
 
-    // 取音素符号串：钉死=用 note.Phonemes 符号；否则 G2P。过滤到「类型已定义 且 dur 表可 tokenize」；空则 [SP]。
+    // 取音素符号串：钉死/编辑器→用已有 phonemes 或 _phonemes 属性；连音符→空（slur 延展前音素）；否则 G2P。
+    // 空结果且非连音符→ [SP] 兜底。
     static string[] GetSymbols(DiffSingerPredictor dur, SynthesisNoteSnapshot note, string lang, out bool pinned)
     {
+        string lyric = note.Lyric ?? string.Empty;
+        if (lyric == "-" || lyric == "+")
+        {
+            pinned = false;
+            return Array.Empty<string>();
+        }
+
+        // 优先使用 _phonemes 属性（音素编辑器写入）
+        var phonemesProp = note.Properties.GetString("_phonemes", "");
+        if (!string.IsNullOrEmpty(phonemesProp) && phonemesProp != "[]")
+        {
+            pinned = true;
+            return ParsePhonemesProperty(phonemesProp).Where(s => !string.IsNullOrEmpty(s) && dur.TryPhoneme(s, out _)).ToArray();
+        }
+
+        // 其次使用钉死音素
         pinned = note.Phonemes.Count > 0;
         IEnumerable<string> raw = pinned
             ? note.Phonemes.Select(p => p.Symbol)
-            : dur.G2P(note.Lyric ?? string.Empty, lang);
+            : dur.G2P(lyric, lang);
         var symbols = raw.Where(s => dur.IsKnownSymbol(s) && dur.TryPhoneme(s, out _)).ToArray();
         return symbols.Length > 0 ? symbols : new[] { Pause };
+    }
+
+    // 从 JSON 字符串解析音素符号列表：[{"s":"ja/b","v":false},...]
+    static string[] ParsePhonemesProperty(string json)
+    {
+        var result = new List<string>();
+        if (string.IsNullOrEmpty(json) || json.Length < 2) return result.ToArray();
+        try
+        {
+            int i = 0;
+            while (true)
+            {
+                int sIdx = json.IndexOf("\"s\":\"", i);
+                if (sIdx < 0) break;
+                sIdx += 5;
+                int eIdx = json.IndexOf('"', sIdx);
+                if (eIdx > sIdx) result.Add(json.Substring(sIdx, eIdx - sIdx));
+                i = eIdx + 1;
+            }
+        }
+        catch { }
+        return result.ToArray();
     }
 
     // OpenUtau stretch：source[from..from+count) 的帧时长按 ratio 缩放、终点对齐 endPos，返回各音素起点秒。

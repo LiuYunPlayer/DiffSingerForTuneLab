@@ -80,6 +80,53 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
 
     public string DefaultLyric => "a";
 
+    // 获取默认 G2P 音素（供音素编辑器填充）
+    internal List<PhonemeEntry> GetDefaultPhonemesForNote(double time, string partLang = "")
+    {
+        ILiveNote? targetNote = null;
+        foreach (var note in mContext.Notes)
+        {
+            if (note.StartTime.Value <= time && note.EndTime.Value >= time)
+            { targetNote = note; break; }
+        }
+        if (targetNote == null) return new List<PhonemeEntry>();
+
+        try
+        {
+            var models = mModelCache.GetOrLoad(mVoiceId, mConfig);
+            var durPred = models.GetPredictor("dsdur");
+            if (durPred == null) return new List<PhonemeEntry>();
+
+            string lyric = targetNote.Lyric.Value ?? string.Empty;
+            // partLang 由调用方从快照传入（不依赖 live mContext.PartProperties），确保段落语言变更后能取到新值
+            if (string.IsNullOrEmpty(partLang))
+            {
+                var partLangVal = mContext.PartProperties.GetValue(KeyLanguage, PropertyValue.Create(string.Empty));
+                partLang = partLangVal.ToString(out var pl) ? pl : string.Empty;
+            }
+            var noteLangVal = targetNote.Properties.GetValue(KeyLanguage, PropertyValue.Create(string.Empty));
+            // 注意：ToString 对空字符串也返回 true，故需排除空串，才能正确回退到 partLang
+            string noteLang = noteLangVal.ToString(out var nl) && !string.IsNullOrEmpty(nl) ? nl : partLang;
+
+            var result = new List<PhonemeEntry>();
+            string[] symbols = durPred.G2P(lyric, noteLang);
+            if (symbols.Length == 0) return result;
+
+            foreach (var sym in symbols)
+            {
+                if (string.IsNullOrEmpty(sym)) continue;
+                result.Add(new PhonemeEntry
+                {
+                    Symbol = sym,
+                    IsVowel = durPred.IsVowel(sym),
+                    IsGlide = durPred.IsGlide(sym),
+                });
+            }
+            return result;
+        }
+        catch { return new List<PhonemeEntry>(); }
+    }
+
     // 根据区间找出应处理的 piece 集合（NaN 表示全曲）
     IEnumerable<Piece> PiecesInRange(double start, double end)
     {
@@ -178,9 +225,15 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
             {
                 int rate = rendered.SampleRate;
 
+                // 用渲染后的音素边界精化过渡区间：使过渡在追溯音素内部进行
+                double stitchStart = mAffectedStartTime;
+                double stitchEnd = mAffectedEndTime;
+                RefineStitchRange(rendered.Phonemes,
+                    ref stitchStart, ref stitchEnd, piece.FrameSec);
+
                 // 区段式音频拼贴：仅替换受影响的 time range，其余保持旧音频不变
                 var stitchedAudio = StitchAudio(rendered.Audio, piece.CachedAudio,
-                    rendered.StartTime, rate, mAffectedStartTime, mAffectedEndTime);
+                    rendered.StartTime, rate, stitchStart, stitchEnd);
 
                 // 缓存旧音频供下次拼贴
                 piece.CachedAudio = stitchedAudio;
@@ -295,6 +348,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         double frameSec = (double)hop / sr;
         int head = DiffSingerFrames.HeadFrames;
         int numMelBins = models.NumMelBins;
+        piece.FrameSec = frameSec;
 
         string partLang = snapshot.PartProperties.GetString(KeyLanguage, string.Empty);
         string speaker = snapshot.PartProperties.GetString(KeySpeaker, mConfig.Speakers.Count > 0 ? mConfig.Speakers[0] : string.Empty);
@@ -366,16 +420,18 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
             langs[i + 1] = models.TryGetLanguage(PhonemeLang(phones[i].Symbol), out var lid) ? lid : 0;
         }
 
-        // 逐帧 note 音高回退
+        // 逐帧 note 音高回退（直接按 note 时间区间查找，不受 -/+ 延音符无音素的影响）
         var framePitch = new double[nFrames];
-        int fi = 0;
-        for (int seg = 0; seg < nTokens; seg++)
         {
-            int ni = seg == 0 ? phones[0].NoteIndex
-                : seg == nTokens - 1 ? phones[^1].NoteIndex
-                : phones[seg - 1].NoteIndex;
-            int pitch = notes[ni].Pitch;
-            for (int k = 0; k < durations[seg]; k++) framePitch[fi++] = pitch;
+            int ni = 0;
+            for (int f = 0; f < nFrames; f++)
+            {
+                double t = frameTimes[f];
+                // 找出包含当前帧的 note（延音符未产生音素，但 pitch 仍需跟随它的音高）
+                while (ni < notes.Count - 1 && t >= notes[ni + 1].StartTime)
+                    ni++;
+                framePitch[f] = notes[ni].Pitch;
+            }
         }
 
         // —— 自动音高预测（仅在 needPitchPredict 时跑；否则复用缓存）——
@@ -459,6 +515,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         AddF("f0", f0, new[] { 1, nFrames });
 
         // —— variance：使用（缓存的）预测 + 用户 delta 合成喂声学 ——
+        // 回显显示最终喂声学的值（预测+包络加权），包络修改时实参同步跟随
         var varReadback = new Dictionary<string, IReadOnlyList<Point>>();
         foreach (var spec in Variances)
         {
@@ -467,11 +524,12 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
                 ? auto.Evaluator.Evaluate(frameTimes)
                 : null;
 
+            float[] combined = CombineVariance(spec, predicted, user, nFrames);
             if (ac.InputMetadata.ContainsKey(spec.Key))
-                AddF(spec.Key, CombineVariance(spec, predicted, user, nFrames), new[] { 1, nFrames });
+                AddF(spec.Key, combined, new[] { 1, nFrames });
 
             if (spec.Use(mConfig) && spec.Predict(mConfig) && predicted != null)
-                varReadback[spec.Key] = BuildReadbackSegment(spec, predicted, frameTimes, nFrames);
+                varReadback[spec.Key] = BuildReadbackSegment(spec, combined, frameTimes, nFrames, spHeadFrames, spTailFrames);
         }
 
         // —— gender / velocity ——
@@ -552,6 +610,61 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
 
         return new RenderResultEx(audio, renderStart, sr, phonemes, pitchReadback, varReadback,
             melDims, finalMel);
+    }
+
+    // —— 用音素边界精化过渡区间 ——
+    // 修改【A B C D】中的【C】→ 重渲染【B C D】，过渡在 B 和 D 的内部进行。
+    // 前过渡：边界音素起始 + 3 帧；后过渡：边界音素结束 - 3 帧。
+    static void RefineStitchRange(IReadOnlyList<SynthesizedPhoneme> newPhonemes,
+        ref double stitchStart, ref double stitchEnd, double frameSec)
+    {
+        if (double.IsNaN(stitchStart) || double.IsNaN(stitchEnd))
+            return;
+        double margin = 3 * frameSec;
+
+        // 前边界：找 stitchStart 所在音素的「前一个」音素（即追溯音素），取其起始 + 3 帧
+        int startIdx = -1;
+        for (int i = 0; i < newPhonemes.Count; i++)
+        {
+            if (newPhonemes[i].StartTime <= stitchStart && newPhonemes[i].EndTime >= stitchStart)
+            { startIdx = i; break; }
+        }
+        // 如果找到的音素就是第一个（无前一个），则用它本身
+        if (startIdx >= 0)
+        {
+            int boundaryIdx = startIdx > 0 ? startIdx - 1 : startIdx;
+            // 但如果起始音素已经是被修改区域内的（stitchStart > 它的起始），则前一个才是边界
+            // 如果起始音素的起始 > stitchStart，说明我们定位到了边界音素之后的第一个，那它的前一个是边界
+            if (newPhonemes[startIdx].StartTime > stitchStart && startIdx > 0)
+                boundaryIdx = startIdx - 1;
+            stitchStart = newPhonemes[boundaryIdx].StartTime + margin;
+            // 确保不超出该音素范围
+            if (stitchStart > newPhonemes[boundaryIdx].EndTime - margin)
+                stitchStart = newPhonemes[boundaryIdx].StartTime + margin * 0.5;
+        }
+
+        // 后边界：找 stitchEnd 所在音素的「后一个」音素（追溯音素），取其结束 - 3 帧
+        int endIdx = -1;
+        for (int i = newPhonemes.Count - 1; i >= 0; i--)
+        {
+            if (newPhonemes[i].StartTime <= stitchEnd && newPhonemes[i].EndTime >= stitchEnd)
+            { endIdx = i; break; }
+        }
+        if (endIdx >= 0)
+        {
+            int boundaryIdx = endIdx < newPhonemes.Count - 1 ? endIdx + 1 : endIdx;
+            if (newPhonemes[endIdx].EndTime < stitchEnd && endIdx < newPhonemes.Count - 1)
+                boundaryIdx = endIdx + 1;
+            stitchEnd = newPhonemes[boundaryIdx].EndTime - margin;
+            if (stitchEnd < newPhonemes[boundaryIdx].StartTime + margin)
+                stitchEnd = newPhonemes[boundaryIdx].EndTime - margin * 0.5;
+        }
+
+        if (stitchStart >= stitchEnd)
+        {
+            stitchStart = double.NaN;
+            stitchEnd = double.NaN;
+        }
     }
 
     // —— 区段式 mel 拼贴 ——
@@ -755,13 +868,29 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
     // VELC convert（OpenUtau DiffSingerRenderer）：对数标度，100 = 原速，每 +100 速度 ×2。
     static double SpeedConvert(double x) => Math.Pow(2, (x - 100) / 100);
 
-    // 回显段：纯预测值（不含用户编辑），clamp 到声学值域，逐帧 (全局秒, 值)。
-    static List<Point> BuildReadbackSegment(VarianceSpec spec, float[] predicted, double[] frameTimes, int n)
+    // 回显段：最终值（含用户包络），clamp 到声学值域，逐帧 (全局秒, 值)。
+    // 整个 SP 段做透明度过渡：外边界 → 声学最小值（背景=不可见），内边界 → 100%（实际值）。
+    // 注意：pitch 回显直接排除 SP 帧（不画），此处用渐变使曲线从背景平滑浮现/消失。
+    static List<Point> BuildReadbackSegment(VarianceSpec spec, float[] finalValues, double[] frameTimes, int n,
+        int headSpFrames = 0, int tailSpFrames = 0)
     {
+        float fadeTarget = (float)spec.AcousticMin; // 声学最小值 = 曲线不可见的背景值
         var points = new List<Point>(n);
         for (int f = 0; f < n; f++)
         {
-            float x = f < predicted.Length ? predicted[f] : predicted[^1];
+            float x = f < finalValues.Length ? finalValues[f] : finalValues[^1];
+            // 前 SP：整个 SP 段从外边界（f=0）到内边界线性渐入（0% → 100%）
+            if (f < headSpFrames)
+            {
+                float t = (float)(f + 1) / headSpFrames;
+                x = x * t + fadeTarget * (1 - t);
+            }
+            // 后 SP：整个 SP 段从内边界到外边界线性渐出（100% → 0%）
+            if (f >= n - tailSpFrames)
+            {
+                float t = (float)(n - f) / tailSpFrames;
+                x = x * t + fadeTarget * (1 - t);
+            }
             points.Add(new Point(frameTimes[f], Math.Clamp(x, spec.AcousticMin, spec.AcousticMax)));
         }
         return points;
@@ -780,7 +909,9 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
     public IReadOnlyList<IReadOnlyList<Point>> SynthesizedPitch
         => mPieces.Where(p => p.PitchReadback.Count > 0).Select(p => p.PitchReadback).ToList();
 
-    // 回显产物（数据线程发布、可跨线程读）：按声明的回显轨 key 聚合各 piece 的纯预测段（每 piece 一段、段间断开）。
+    // 回显产物（数据线程发布、可跨线程读）：按声明的回显轨 key 聚合各 piece 的预测段。
+    // 每 piece 整段作为一个 segment，用多 GradientStop 的 LinearGradientBrush 实现像素级平滑透明度。
+    // 透明度轮廓：head SP 0%→25%, body 25%, tail SP 25%→0%，无段间边界。
     public IReadOnlyMap<string, SynthesizedParameter> SynthesizedParameters
     {
         get
@@ -789,11 +920,68 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
             foreach (var kvp in mReadbackConfigs)
             {
                 var segments = new List<IReadOnlyList<Point>>();
+                var stopSets = new List<IReadOnlyList<Point>>();
                 foreach (var piece in mPieces)
-                    if (piece.VarianceReadback.TryGetValue(kvp.Key, out var segment) && segment.Count > 0)
-                        segments.Add(segment);
+                {
+                    if (!piece.VarianceReadback.TryGetValue(kvp.Key, out var allPoints) || allPoints.Count == 0)
+                        continue;
+
+                    var phones = piece.CachedPhones;
+                    if (phones == null || phones.Count == 0 || allPoints.Count < 2)
+                    {
+                        segments.Add(allPoints);
+                        stopSets.Add([new(0, 0.25), new(1, 0.25)]);
+                        continue;
+                    }
+
+                    double bodyStart = phones[0].StartTime;
+                    double bodyEnd = phones[^1].EndTime;
+                    int headEnd = 0, bodyEndIdx = allPoints.Count;
+                    while (headEnd < allPoints.Count && allPoints[headEnd].X < bodyStart) headEnd++;
+                    int bodyStartIdx = headEnd;
+                    while (bodyEndIdx > 0 && allPoints[bodyEndIdx - 1].X > bodyEnd) bodyEndIdx--;
+                    int total = allPoints.Count;
+                    bool hasHead = headEnd > 0;
+                    bool hasTail = bodyEndIdx < total;
+
+                    // 整段作为一个 segment
+                    segments.Add(allPoints);
+
+                    // 构造 GradientStop，按有无 head/tail 调整
+                    var stops = new List<Point>(4);
+                    if (hasHead)
+                    {
+                        stops.Add(new(0.0, 0.0));
+                        double headRatio = (double)headEnd / total;
+                        stops.Add(new(Math.Clamp(headRatio, 0, 1), 0.25));
+                    }
+                    else
+                    {
+                        stops.Add(new(0.0, 0.25));
+                    }
+
+                    double bodyEndRatio = (double)bodyEndIdx / total;
+                    if (hasTail)
+                    {
+                        stops.Add(new(Math.Clamp(bodyEndRatio, 0, 1), 0.25));
+                        stops.Add(new(1.0, 0.0));
+                    }
+                    else
+                    {
+                        stops.Add(new(1.0, 0.25));
+                    }
+
+                    // 移除相邻等偏移的退化 stop
+                    var dedup = new List<Point>(stops.Count);
+                    for (int i = 0; i < stops.Count; i++)
+                        if (i == stops.Count - 1 || Math.Abs(stops[i].X - stops[i + 1].X) > 0.0001)
+                            dedup.Add(stops[i]);
+                    while (dedup.Count < 2) dedup.Add(new(1, 0.25));
+
+                    stopSets.Add(dedup);
+                }
                 if (segments.Count > 0)
-                    map.Add(kvp.Key, new SynthesizedParameter { Segments = segments });
+                    map.Add(kvp.Key, new SynthesizedParameter { Segments = segments, SegmentOpacityStops = stopSets });
             }
             return map;
         }
@@ -971,7 +1159,14 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
 
     void MarkAllDirtyAndResegment()
     {
-        foreach (var piece in mPieces) { piece.Dirty = true; piece.Failed = false; }
+        foreach (var piece in mPieces)
+        {
+            piece.Dirty = true; piece.Failed = false;
+            // 段落属性（语言等）变更 → 清除音素/variance 缓存，强制使用新的 G2P
+            piece.CachedPhones = null;
+            piece.CachedVarianceCurves = default;
+            // 保留 pitch 缓存
+        }
         mNeedResegment = true;
     }
 
@@ -1023,7 +1218,8 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         public float[]? CachedMel;
         public int[]? CachedMelDims;
         public float[]? CachedAudio;
-        // piece 级 RedrawPitch 请求标记
         public bool RedrawPitchRequested;
+        // 帧时长（秒），用于过渡区间计算
+        public double FrameSec;
     }
 }

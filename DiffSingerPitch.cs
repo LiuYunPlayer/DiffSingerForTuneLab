@@ -129,8 +129,10 @@ public static class DiffSingerPitch
             }
             durSec.Add(Math.Max(0, note.EndTime - note.StartTime));
             midiList.Add(note.Pitch);
-            if ((note.Lyric ?? string.Empty).StartsWith("+"))
+            string lyric = note.Lyric ?? string.Empty;
+            if (lyric.StartsWith("+") || lyric == "-")
             {
+                // slur 延音符继承前音 rest 状态，确保 pitch 模型为其生成正确过渡音高
                 restList.Add(restList[^1]);
             }
             else
