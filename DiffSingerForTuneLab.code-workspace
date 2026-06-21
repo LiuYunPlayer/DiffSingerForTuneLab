@@ -7,6 +7,10 @@
     {
       "name": "TuneLab (参考：SDK/docs/范例)",
       "path": "../TuneLab"
+    },
+    {
+      "name": "OpenUtau-lunai (参考：OpenUtau.Core)",
+      "path": "../OpenUtau-lunai"
     }
   ],
   "settings": {

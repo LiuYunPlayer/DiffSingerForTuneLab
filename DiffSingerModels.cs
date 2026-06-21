@@ -121,6 +121,9 @@ public sealed class VoiceModels : IDisposable
     readonly Dictionary<string, DiffSingerPredictor?> mPredictors = new(StringComparer.Ordinal);
     readonly object mPredictorLock = new();
 
+    readonly object mAcousticLock = new();
+    readonly object mVocoderLock = new();
+
     public InferenceSession Acoustic { get; }
     public InferenceSession Vocoder { get; }
 

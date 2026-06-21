@@ -139,6 +139,7 @@ public static class DiffSingerPitch
             // 延音符（"-"/"+"）：无自身音素，沿用前一个 note 的 rest 状态（前为发声 ⇒ 本帧也发声、携自身 MIDI 滑过去）。
             if (DiffSingerPhonemizer.IsSlur(note.Lyric))
             {
+                // slur 延音符继承前音 rest 状态，确保 pitch 模型为其生成正确过渡音高
                 restList.Add(restList[^1]);
             }
             else

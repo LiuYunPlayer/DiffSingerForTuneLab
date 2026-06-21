@@ -68,6 +68,35 @@ public static class DiffSingerPhonemizer
             string[] symbols = GetSymbols(dur, note, noteLang[i], out pinned[i]);
             noteSymbolCount[i] = symbols.Length;
 
+            // 连音符：不产生新音素，只延展前音的时长（通过 group 自然吸收）
+            // 连音符：- 不产生边界（前组自然吸收），+ 拆前组末音素到独立组强制 dur 边界
+            if (symbols.Length == 0 && (lyric == "-" || lyric == "+"))
+            {
+                if (lyric == "+")
+                {
+                    // 把前一个非空组的最后一个音素拆分到 + 组（仅当 >1 音素，否则退化为空组边界）
+                    string moved = "AP";
+                    bool splitted = false;
+                    for (int gi = groups.Count - 1; gi >= 0; gi--)
+                    {
+                        if (groups[gi].Phonemes.Count > 1)
+                        {
+                            int lastIdx = groups[gi].Phonemes.Count - 1;
+                            moved = groups[gi].Phonemes[lastIdx];
+                            groups[gi].Phonemes.RemoveAt(lastIdx);
+                            splitted = true;
+                            break;
+                        }
+                    }
+                    var g = new Group(note.StartTime, note.Pitch);
+                    if (splitted) g.Phonemes.Add(moved);
+                    groups.Add(g);
+                }
+                // - 则完全不做任何事，前组自然吸收时长，不影响 dur
+                notePhIndex.Add(notePhIndex[^1]);
+                continue;
+            }
+
             var wordGroups = ProcessWord(dur, note, symbols);
             groups[^1].Phonemes.AddRange(wordGroups[0].Phonemes);   // 前置辅音并入前一组（侵入前一 note 尾）
             groups.AddRange(wordGroups.Skip(1));                    // 韵核组（起点=note 起点）
@@ -169,15 +198,54 @@ public static class DiffSingerPhonemizer
         return wordGroups;
     }
 
-    // 取音素符号串：钉死=用 note.Phonemes 符号；否则 G2P。过滤到「类型已定义 且 dur 表可 tokenize」；空则 [SP]。
+    // 取音素符号串：钉死/编辑器→用已有 phonemes 或 _phonemes 属性；连音符→空（slur 延展前音素）；否则 G2P。
+    // 空结果且非连音符→ [SP] 兜底。
     static string[] GetSymbols(DiffSingerPredictor dur, SynthesisNoteSnapshot note, string lang, out bool pinned)
     {
+        string lyric = note.Lyric ?? string.Empty;
+        if (lyric == "-" || lyric == "+")
+        {
+            pinned = false;
+            return Array.Empty<string>();
+        }
+
+        // 优先使用 _phonemes 属性（音素编辑器写入）
+        var phonemesProp = note.Properties.GetString("_phonemes", "");
+        if (!string.IsNullOrEmpty(phonemesProp) && phonemesProp != "[]")
+        {
+            pinned = true;
+            return ParsePhonemesProperty(phonemesProp).Where(s => !string.IsNullOrEmpty(s) && dur.TryPhoneme(s, out _)).ToArray();
+        }
+
+        // 其次使用钉死音素
         pinned = note.Phonemes.Count > 0;
         IEnumerable<string> raw = pinned
             ? note.Phonemes.Select(p => p.Symbol)
-            : dur.G2P(note.Lyric ?? string.Empty, lang);
+            : dur.G2P(lyric, lang);
         var symbols = raw.Where(s => dur.IsKnownSymbol(s) && dur.TryPhoneme(s, out _)).ToArray();
         return symbols.Length > 0 ? symbols : new[] { Pause };
+    }
+
+    // 从 JSON 字符串解析音素符号列表：[{"s":"ja/b","v":false},...]
+    static string[] ParsePhonemesProperty(string json)
+    {
+        var result = new List<string>();
+        if (string.IsNullOrEmpty(json) || json.Length < 2) return result.ToArray();
+        try
+        {
+            int i = 0;
+            while (true)
+            {
+                int sIdx = json.IndexOf("\"s\":\"", i);
+                if (sIdx < 0) break;
+                sIdx += 5;
+                int eIdx = json.IndexOf('"', sIdx);
+                if (eIdx > sIdx) result.Add(json.Substring(sIdx, eIdx - sIdx));
+                i = eIdx + 1;
+            }
+        }
+        catch { }
+        return result.ToArray();
     }
 
     // OpenUtau stretch：source[from..from+count) 的帧时长按 ratio 缩放、终点对齐 endPos，返回各音素起点秒。
@@ -235,8 +303,7 @@ public static class DiffSingerPhonemizer
         var spk = new float[nTokens * hidden];
         for (int i = 0; i < nTokens; i++) Array.Copy(emb, 0, spk, i * hidden, hidden);
 
-        var durModel = dur.Model("dur");
-        var durInputs = new List<NamedOnnxValue>
+        using var durOut = dur.RunModel("dur", new List<NamedOnnxValue>
         {
             NamedOnnxValue.CreateFromTensor("encoder_out", encDense),
             NamedOnnxValue.CreateFromTensor("x_masks", maskDense),

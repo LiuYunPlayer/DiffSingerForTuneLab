@@ -176,11 +176,11 @@ public static class DiffSingerDeclarations
         DefaultOption = PropertyValue.Create(defaultValue),
     };
 
-    static List<ComboBoxOption> ToOptions(IReadOnlyList<string> values)
+    static List<ComboBoxOption> LanguageOptions(IReadOnlyList<string> languages)
     {
-        var options = new List<ComboBoxOption>(values.Count);
-        foreach (var value in values)
-            options.Add(value);   // 隐式转换：string → ComboBoxOption（值即显示文本）
+        var options = new List<ComboBoxOption> { new(PropertyValue.Create(string.Empty), "default") };
+        foreach (var lang in languages)
+            options.Add(lang);
         return options;
     }
 

@@ -27,6 +27,8 @@ public sealed class DiffSingerPredictor : IDisposable
     readonly Dictionary<string, Dictionary<string, string[]>> mEntryCache = new(StringComparer.Ordinal);
     readonly Dictionary<string, string> mSymbolTypes = new(StringComparer.Ordinal);  // symbol → type（合并 dsdict）
     readonly object mLock = new();
+    // 推理锁：DirectML EP 的 InferenceSession.Run() 非线程安全，串行化所有 Run 调用。
+    readonly object mRunLock = new();
 
     public InferenceSession Linguistic { get; }
     public int HiddenSize => mHidden;
@@ -86,13 +88,21 @@ public sealed class DiffSingerPredictor : IDisposable
             : throw new InvalidOperationException($"音素 \"{symbol}\" 不在 {Path.GetFileName(mDir)} 的音素表中");
     public long LangId(string lang) => mLanguages.TryGetValue(lang, out var id) ? id : 0;
 
-    // —— G2P：按语言查 dsdict-{lang}.yaml 词条（grapheme→带前缀音素），exact 后小写回退 ——
+    // —— G2P：优先查语言特定词典（dsdict-{lang}.yaml），避免默认底库（dsdict.yaml 以 zh 为主）污染；再试 replacements；最后才兜底查合并词典。 ——
     public string[] G2P(string lyric, string lang)
     {
-        var entries = GetEntries(lang);
         var key = lyric.Trim();
-        if (entries.TryGetValue(key, out var phs)) return phs;
-        if (entries.TryGetValue(key.ToLowerInvariant(), out phs)) return phs;
+        // 1. 语言特定词典（不含默认底库）
+        var langEntries = GetLanguageSpecificEntries(lang);
+        if (langEntries.TryGetValue(key, out var phs)) return phs;
+        if (langEntries.TryGetValue(key.ToLowerInvariant(), out phs)) return phs;
+        // 2. 替换规则（en/ko 等无 entries 的语种）
+        var replaced = ApplyReplacements(lyric, lang);
+        if (replaced.Length > 0) return replaced;
+        // 3. 最后才查合并词典（含默认底库 dsdict.yaml，作为未知字素的最终兜底）
+        var allEntries = GetEntries(lang);
+        if (allEntries.TryGetValue(key, out phs)) return phs;
+        if (allEntries.TryGetValue(key.ToLowerInvariant(), out phs)) return phs;
         return Array.Empty<string>();
     }
 
@@ -119,7 +129,78 @@ public sealed class DiffSingerPredictor : IDisposable
         }
     }
 
+    // —— 替换规则（用于 EN/KO 等无 entries 仅 replacements 的语种）——
+    readonly Dictionary<string, List<(string from, string to)>> mReplacements = new(StringComparer.Ordinal);
+
+    void LoadReplacements(string lang)
+    {
+        if (mReplacements.ContainsKey(lang)) return;
+        var list = new List<(string from, string to)>();
+        foreach (var file in new[] { $"dsdict-{lang}.yaml", $"dsdict-zh-{lang}.yaml", "dsdict.yaml" })
+        {
+            var path = Path.Combine(mDir, file);
+            if (!File.Exists(path)) continue;
+            try
+            {
+                var yaml = new DeserializerBuilder().Build();
+                var doc = yaml.Deserialize<Dictionary<string, object?>>(File.ReadAllText(path));
+                if (doc != null && doc.TryGetValue("replacements", out var reps) && reps is List<object?> repList)
+                {
+                    foreach (var r in repList)
+                    {
+                        if (r is Dictionary<object, object?> repDict)
+                        {
+                            string? from = repDict.TryGetValue("from", out var fv) ? fv?.ToString() : null;
+                            string? to = repDict.TryGetValue("to", out var tv) ? tv?.ToString() : null;
+                            if (!string.IsNullOrEmpty(from) && !string.IsNullOrEmpty(to))
+                                list.Add((from, to));
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+        mReplacements[lang] = list;
+    }
+
+    // 用替换规则将歌词转为音素（按最长匹配优先）
+    public string[] ApplyReplacements(string lyric, string lang)
+    {
+        LoadReplacements(lang);
+        if (!mReplacements.TryGetValue(lang, out var reps) || reps.Count == 0)
+            return Array.Empty<string>();
+
+        var repsSorted = reps.OrderByDescending(r => r.from.Length).ToList();
+        var result = new List<string>();
+        string text = lyric.ToLowerInvariant();
+        int pos = 0;
+        while (pos < text.Length)
+        {
+            bool matched = false;
+            foreach (var (from, to) in repsSorted)
+            {
+                if (pos + from.Length <= text.Length && text.Substring(pos, from.Length) == from)
+                {
+                    result.Add(to);
+                    pos += from.Length;
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched)
+            {
+                // 单个字符作为独立音素
+                string ch = text[pos].ToString();
+                result.Add(ch);
+                pos++;
+            }
+        }
+        return result.ToArray();
+    }
+
     // —— 词典加载 ——
+    // 策略：先加载 dsdict.yaml 作为默认底库，再叠加载入语种特定文件（后面覆盖前面）。
+    // 若 entries 为空且 replacements 存在，留空返回（上层调用 ApplyReplacements）。
     Dictionary<string, string[]> GetEntries(string lang)
     {
         lock (mLock)
@@ -128,7 +209,19 @@ public sealed class DiffSingerPredictor : IDisposable
                 return cached;
 
             var map = new Dictionary<string, string[]>(StringComparer.Ordinal);
-            foreach (var file in new[] { $"dsdict-{lang}.yaml", $"dsdict-zh-{lang}.yaml", "dsdict.yaml" })
+
+            // 1. 加载默认底库 dsdict.yaml（总是存在）
+            var defaultPath = Path.Combine(mDir, "dsdict.yaml");
+            if (File.Exists(defaultPath))
+            {
+                var root = DeserializeDsDict(defaultPath);
+                foreach (var e in root.entries)
+                    if (!string.IsNullOrEmpty(e.grapheme))
+                        map[e.grapheme] = e.phonemes.ToArray();
+            }
+
+            // 2. 叠加载入语种特定文件（若存在则覆盖/补充）
+            foreach (var file in new[] { $"dsdict-{lang}.yaml", $"dsdict-zh-{lang}.yaml" })
             {
                 var path = Path.Combine(mDir, file);
                 if (!File.Exists(path)) continue;
@@ -136,11 +229,27 @@ public sealed class DiffSingerPredictor : IDisposable
                 foreach (var e in root.entries)
                     if (!string.IsNullOrEmpty(e.grapheme))
                         map[e.grapheme] = e.phonemes.ToArray();
-                break;
             }
+
             mEntryCache[lang] = map;
             return map;
         }
+    }
+
+    // 仅加载语言特定词典（不含默认底库 dsdict.yaml），用于 G2P 的优先查表——避免 zh 底库污染其他语言的译音。
+    Dictionary<string, string[]> GetLanguageSpecificEntries(string lang)
+    {
+        var map = new Dictionary<string, string[]>(StringComparer.Ordinal);
+        foreach (var file in new[] { $"dsdict-{lang}.yaml", $"dsdict-zh-{lang}.yaml" })
+        {
+            var path = Path.Combine(mDir, file);
+            if (!File.Exists(path)) continue;
+            var root = DeserializeDsDict(path);
+            foreach (var e in root.entries)
+                if (!string.IsNullOrEmpty(e.grapheme))
+                    map[e.grapheme] = e.phonemes.ToArray();
+        }
+        return map;
     }
 
     void LoadSymbolTypes(string dsdictPath)
