@@ -17,3 +17,4 @@ obj/
 # 打包产物
 *.tlx
 /build/
+/tools/CheckModel

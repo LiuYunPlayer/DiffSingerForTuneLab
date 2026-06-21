@@ -59,7 +59,7 @@ public static class DiffSingerVariance
         }
         if (v.Linguistic.InputMetadata.ContainsKey("languages"))
             lingInputs.Add(NvL("languages", langs, nTokens));
-        using var lingOut = v.Linguistic.Run(lingInputs);
+        using var lingOut = v.RunLinguistic(lingInputs);
         var enc = lingOut.First(o => o.Name == "encoder_out").AsTensor<float>();
         var encDense = new DenseTensor<float>(enc.ToArray(), enc.Dimensions.ToArray());
 
@@ -101,7 +101,7 @@ public static class DiffSingerVariance
                 new DenseTensor<float>(spk, new[] { 1, totalFrames, hidden })));
         }
 
-        using var outputs = model.Run(inputs);
+        using var outputs = v.RunModel("variance", inputs);
         float[]? Out(bool predict, string name)
             => predict ? outputs.First(o => o.Name == name).AsTensor<float>().ToArray() : null;
         return new VarianceCurves(

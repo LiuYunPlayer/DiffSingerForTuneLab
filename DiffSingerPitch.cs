@@ -52,7 +52,7 @@ public static class DiffSingerPitch
             var langs = phones.Select(p => v.LangId(PhonemeLanguage(p.Symbol))).Prepend(0L).Append(0L).ToArray();
             lingInputs.Add(NvL("languages", langs, nTokens));
         }
-        using var lingOut = v.Linguistic.Run(lingInputs);
+        using var lingOut = v.RunLinguistic(lingInputs);
         var enc = lingOut.First(o => o.Name == "encoder_out").AsTensor<float>();
         var encDense = new DenseTensor<float>(enc.ToArray(), enc.Dimensions.ToArray());
 
@@ -95,7 +95,7 @@ public static class DiffSingerPitch
             inputs.Add(NamedOnnxValue.CreateFromTensor("note_rest",
                 new DenseTensor<bool>(noteRest, new[] { 1, noteRest.Length })));
 
-        using var outputs = model.Run(inputs);
+        using var outputs = v.RunModel("pitch", inputs);
         return outputs.First().AsTensor<float>().ToArray();
     }
 

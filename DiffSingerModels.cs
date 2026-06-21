@@ -120,8 +120,22 @@ public sealed class VoiceModels : IDisposable
     readonly Dictionary<string, DiffSingerPredictor?> mPredictors = new(StringComparer.Ordinal);
     readonly object mPredictorLock = new();
 
+    readonly object mAcousticLock = new();
+    readonly object mVocoderLock = new();
+
     public InferenceSession Acoustic { get; }
     public InferenceSession Vocoder { get; }
+
+    // 线程安全的声学推理包装（DirectML EP 需要串行化 Run 调用）
+    public IDisposableReadOnlyCollection<DisposableNamedOnnxValue> RunAcoustic(List<NamedOnnxValue> inputs)
+    {
+        lock (mAcousticLock) return Acoustic.Run(inputs);
+    }
+
+    public IDisposableReadOnlyCollection<DisposableNamedOnnxValue> RunVocoder(List<NamedOnnxValue> inputs)
+    {
+        lock (mVocoderLock) return Vocoder.Run(inputs);
+    }
 
     public int HiddenSize => mConfig.HiddenSize;
     public int HopSize => mConfig.HopSize;

@@ -18,6 +18,7 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
     const string KeyVoicebankDirs = "voicebank_dirs";
     const string KeyExecutionProvider = "execution_provider";
     const string KeySamplingSteps = "sampling_steps";
+    const string KeyMaxConcurrentRenderings = "max_concurrent_renderings";
 
     public IReadOnlyOrderedMap<string, VoiceSourceInfo> VoiceSourceInfos => mState.Infos;
 
@@ -32,6 +33,18 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
         mModelCache?.Dispose();
         mModelCache = null;
     }
+
+    // —— 并发渲染限流（DirectML 多轨并发需要限制同时渲染的轨数）——
+    SemaphoreSlim mRenderSemaphore = new(1, 1);
+
+    internal void UpdateRenderSemaphore(int maxConcurrent)
+    {
+        maxConcurrent = Math.Max(1, maxConcurrent);
+        var old = Interlocked.Exchange(ref mRenderSemaphore, new SemaphoreSlim(maxConcurrent, maxConcurrent));
+        old.Dispose();
+    }
+
+    internal SemaphoreSlim RenderSemaphore => mRenderSemaphore;
 
     // —— 会话注册表（引擎级，跨会话共享）——
     readonly List<WeakReference<DiffSingerSynthesisSession>> mSessions = new();
@@ -79,7 +92,7 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
         // 推理走引擎级模型缓存（懒加载、按 voiceId 共享）；声明面（轨/面板）已上移到引擎方法、建会话前即填好。
         var config = ConfigFor(voiceId)!;
         var samplingSteps = mSettings.GetInt(KeySamplingSteps, 20);
-        var session = new DiffSingerSynthesisSession(config, context, voiceId, EnsureModelCache(), samplingSteps);
+        var session = new DiffSingerSynthesisSession(config, context, voiceId, EnsureModelCache(), samplingSteps, mRenderSemaphore);
         RegisterSession(session);
         return session;
     }
@@ -266,6 +279,15 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
                     DefaultValue = 20, MinValue = 1, MaxValue = 1000, IsInteger = true,
                 }
             },
+            {
+                // DirectML 最大同时渲染轨数：默认 1（串行安全），提高可让 CPU 端并行加速。
+                KeyMaxConcurrentRenderings,
+                new SliderConfig
+                {
+                    DisplayText = L.Tr("Max concurrent renderings"),
+                    DefaultValue = 1, MinValue = 1, MaxValue = 8, IsInteger = true,
+                }
+            },
         };
         return new ObjectConfig { Properties = properties };
     }
@@ -273,6 +295,8 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
     public void ApplySettings(PropertyObject settings)
     {
         mSettings = settings;
+        var maxConcurrent = mSettings.GetInt(KeyMaxConcurrentRenderings, 1);
+        UpdateRenderSemaphore(maxConcurrent);
         Rescan();
     }
 

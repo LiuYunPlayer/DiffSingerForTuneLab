@@ -27,11 +27,24 @@ public sealed class DiffSingerPredictor : IDisposable
     readonly Dictionary<string, Dictionary<string, string[]>> mEntryCache = new(StringComparer.Ordinal);
     readonly Dictionary<string, string> mSymbolTypes = new(StringComparer.Ordinal);  // symbol → type（合并 dsdict）
     readonly object mLock = new();
+    // 推理锁：DirectML EP 的 InferenceSession.Run() 非线程安全，串行化所有 Run 调用。
+    readonly object mRunLock = new();
 
     public InferenceSession Linguistic { get; }
     public int HiddenSize => mHidden;
     // linguistic 是否吃 word_div/word_dur（dsdur/dsvariance 词边界；dspitch 用已知 ph_dur）。
     public bool LinguisticUsesWordBoundary { get; }
+
+    // 线程安全的推理包装（DirectML EP 需要串行化 Run 调用）
+    public IDisposableReadOnlyCollection<DisposableNamedOnnxValue> RunLinguistic(List<NamedOnnxValue> inputs)
+    {
+        lock (mRunLock) return Linguistic.Run(inputs);
+    }
+
+    public IDisposableReadOnlyCollection<DisposableNamedOnnxValue> RunModel(string role, List<NamedOnnxValue> inputs)
+    {
+        lock (mRunLock) return mModels[role].Run(inputs);
+    }
 
     public DiffSingerPredictor(string dir, Func<string, InferenceSession> load)
     {

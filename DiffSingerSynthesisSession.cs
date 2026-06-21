@@ -48,14 +48,17 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
     double mAffectedStartTime = double.NaN;
     double mAffectedEndTime = double.NaN;
 
+    readonly SemaphoreSlim mRenderSemaphore;
+
     public DiffSingerSynthesisSession(VoicebankConfig config, ISynthesisContext context,
-        string voiceId, DiffSingerModelCache modelCache, int samplingSteps)
+        string voiceId, DiffSingerModelCache modelCache, int samplingSteps, SemaphoreSlim renderSemaphore)
     {
         mConfig = config;
         mContext = context;
         mVoiceId = voiceId;
         mModelCache = modelCache;
         mSamplingSteps = samplingSteps;
+        mRenderSemaphore = renderSemaphore;
 
         mAutomationConfigs = BuildAutomationConfigs(config);
         mReadbackConfigs = BuildReadbackConfigs(config);
@@ -218,6 +221,8 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         StatusChanged?.Invoke();
 
         var report = new Progress<double>(p => { piece.Progress = p; StatusChanged?.Invoke(); });
+
+        await mRenderSemaphore.WaitAsync(cancellation);
         try
         {
             var rendered = await Task.Run(() => Render(snapshot, piece.Notes, piece, report, cancellation), CancellationToken.None);
@@ -271,6 +276,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         }
         finally
         {
+            mRenderSemaphore.Release();
             piece.Synthesizing = false;
             StatusChanged?.Invoke();
         }
@@ -556,7 +562,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         }
 
         // —— 声学模型：产 mel ——
-        using var melOut = ac.Run(inputs);
+        using var melOut = models.RunAcoustic(inputs);
         var melTensor = melOut.First(v => v.Name == "mel").AsTensor<float>();
         var melDims = melTensor.Dimensions.ToArray();
         var newMel = melTensor.ToArray();
@@ -591,7 +597,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         };
         if (voc.InputMetadata.ContainsKey("f0"))
             vInputs.Add(NamedOnnxValue.CreateFromTensor("f0", new DenseTensor<float>(f0, new[] { 1, nFrames })));
-        using var wavOut = voc.Run(vInputs);
+        using var wavOut = models.RunVocoder(vInputs);
         var audio = wavOut.First(v => v.Name == "waveform").AsTensor<float>().ToArray();
         progress?.Report(1.0);
 

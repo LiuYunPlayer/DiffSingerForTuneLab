@@ -53,15 +53,30 @@ public static class DiffSingerPhonemizer
             noteSymbolCount[i] = symbols.Length;
 
             // 连音符：不产生新音素，只延展前音的时长（通过 group 自然吸收）
-            // (+) 额外在起始点插入一个空 vowel 边界组，强制对齐
+            // 连音符：- 不产生边界（前组自然吸收），+ 拆前组末音素到独立组强制 dur 边界
             if (symbols.Length == 0 && (lyric == "-" || lyric == "+"))
             {
                 if (lyric == "+")
                 {
-                    // 插入一个空韵核组作为强制对齐边界
-                    groups.Add(new Group(note.StartTime, note.Pitch));
+                    // 把前一个非空组的最后一个音素拆分到 + 组（仅当 >1 音素，否则退化为空组边界）
+                    string moved = "AP";
+                    bool splitted = false;
+                    for (int gi = groups.Count - 1; gi >= 0; gi--)
+                    {
+                        if (groups[gi].Phonemes.Count > 1)
+                        {
+                            int lastIdx = groups[gi].Phonemes.Count - 1;
+                            moved = groups[gi].Phonemes[lastIdx];
+                            groups[gi].Phonemes.RemoveAt(lastIdx);
+                            splitted = true;
+                            break;
+                        }
+                    }
+                    var g = new Group(note.StartTime, note.Pitch);
+                    if (splitted) g.Phonemes.Add(moved);
+                    groups.Add(g);
                 }
-                // - 则完全不做任何事，前组自然吸收时长
+                // - 则完全不做任何事，前组自然吸收时长，不影响 dur
                 notePhIndex.Add(notePhIndex[^1]);
                 continue;
             }
@@ -262,7 +277,7 @@ public static class DiffSingerPhonemizer
         if (dur.Linguistic.InputMetadata.ContainsKey("languages"))
             lingInputs.Add(Nv("languages", langs, nTokens));
 
-        using var lingOut = dur.Linguistic.Run(lingInputs);
+        using var lingOut = dur.RunLinguistic(lingInputs);
         var enc = lingOut.First(v => v.Name == "encoder_out").AsTensor<float>();
         var mask = lingOut.First(v => v.Name == "x_masks").AsTensor<bool>();
         var encDense = new DenseTensor<float>(enc.ToArray(), enc.Dimensions.ToArray());
@@ -272,15 +287,13 @@ public static class DiffSingerPhonemizer
         var spk = new float[nTokens * hidden];
         for (int i = 0; i < nTokens; i++) Array.Copy(emb, 0, spk, i * hidden, hidden);
 
-        var durModel = dur.Model("dur");
-        var durInputs = new List<NamedOnnxValue>
+        using var durOut = dur.RunModel("dur", new List<NamedOnnxValue>
         {
             NamedOnnxValue.CreateFromTensor("encoder_out", encDense),
             NamedOnnxValue.CreateFromTensor("x_masks", maskDense),
             Nv("ph_midi", phMidi.Select(x => (long)x).ToArray(), nTokens),
             NamedOnnxValue.CreateFromTensor("spk_embed", new DenseTensor<float>(spk, new[] { 1, nTokens, hidden })),
-        };
-        using var durOut = durModel.Run(durInputs);
+        });
         return durOut.First(v => v.Name == "ph_dur_pred").AsTensor<float>().Select(x => (double)x).ToArray();
     }
 
