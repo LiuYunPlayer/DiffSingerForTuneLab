@@ -22,6 +22,12 @@ public static class DiffSingerPhonemizer
     const string Pause = "SP";
     const double PaddingSec = 0.5;   // 短语首辅音前导空间（OpenUtau padding=500ms）
 
+    // 延音符（tenuto/slur）：TuneLab 原生延音符歌词为 "-"；兼容 OpenUtau 导入工程的 "+"/"+~"/"+*" 前缀。
+    //   延音符不带自身音素——沿用前一发声 note 的元音、令其延展过来；其音高仅在 pitch 时间线（note_midi）上承载，
+    //   故声学/音素侧把它「跳过」即可让前元音自然伸到下一发声 note 起点。见 DiffSingerPitch.BuildNotes 对称处理。
+    public static bool IsSlur(string? lyric)
+        => lyric == "-" || (lyric != null && lyric.StartsWith("+"));
+
     sealed class Group
     {
         public double Pos;            // 组起点（秒）；元音组=note 起点，首组=首 note 起点-padding，哨兵=末 note 终点
@@ -32,7 +38,7 @@ public static class DiffSingerPhonemizer
 
     public static List<PhonemeSpan> Phonemize(
         DiffSingerPredictor dur, IReadOnlyList<SynthesisNoteSnapshot> notes,
-        IReadOnlyList<string> noteLang, string speaker, int hop, int sampleRate)
+        IReadOnlyList<string> noteLang, string speaker, int hop, int sampleRate, bool tensorCache)
     {
         if (notes.Count == 0)
             return new List<PhonemeSpan>();
@@ -48,7 +54,17 @@ public static class DiffSingerPhonemizer
         for (int i = 0; i < notes.Count; i++)
         {
             var note = notes[i];
-            string lyric = note.Lyric ?? string.Empty;
+
+            // 延音符：不产音素、不建组——前一组（前元音）会自然伸展到下一发声 note 起点（对齐终点跨过本 note）。
+            //   notePhIndex 记空区间（本 note 无音素，NoteOf 不会落到它）。首 note 即延音符则无前可沿，退化为常规 G2P。
+            if (i > 0 && IsSlur(note.Lyric))
+            {
+                pinned[i] = false;
+                noteSymbolCount[i] = 0;
+                notePhIndex.Add(notePhIndex[^1]);
+                continue;
+            }
+
             string[] symbols = GetSymbols(dur, note, noteLang[i], out pinned[i]);
             noteSymbolCount[i] = symbols.Length;
 
@@ -101,7 +117,7 @@ public static class DiffSingerPhonemizer
         var wordDiv = groups.Take(groups.Count - 1).Select(g => (long)g.Phonemes.Count).ToArray();
         var wordDur = groups.Zip(groups.Skip(1), (a, b) => (long)FramesBetween(a.Pos, b.Pos, frameSec)).ToArray();
 
-        var durationFrames = RunDur(dur, tokens, langs, wordDiv, wordDur, flatTone, speaker);
+        var durationFrames = RunDur(dur, tokens, langs, wordDiv, wordDur, flatTone, speaker, tensorCache);
 
         // —— 对齐：首辅音自然，其余每组按比例缩放，终点对齐到下一组(note)起点 ——
         // phAlignPoints[k] = (展平下标=第 k+1 组首音素, 第 k+1 组起点秒)
@@ -265,7 +281,7 @@ public static class DiffSingerPhonemizer
 
     // linguistic(词模式) + dur → 每音素预测帧（float）。
     static double[] RunDur(DiffSingerPredictor dur, long[] tokens, long[] langs,
-        long[] wordDiv, long[] wordDur, int[] phMidi, string speaker)
+        long[] wordDiv, long[] wordDur, int[] phMidi, string speaker, bool tensorCache)
     {
         int nTokens = tokens.Length, nWords = wordDiv.Length, hidden = dur.HiddenSize;
         var lingInputs = new List<NamedOnnxValue>
@@ -277,7 +293,7 @@ public static class DiffSingerPhonemizer
         if (dur.Linguistic.InputMetadata.ContainsKey("languages"))
             lingInputs.Add(Nv("languages", langs, nTokens));
 
-        using var lingOut = dur.RunLinguistic(lingInputs);
+        var lingOut = DiffSingerTensorCache.Run(dur.Linguistic, dur.LinguisticHash, lingInputs, tensorCache);
         var enc = lingOut.First(v => v.Name == "encoder_out").AsTensor<float>();
         var mask = lingOut.First(v => v.Name == "x_masks").AsTensor<bool>();
         var encDense = new DenseTensor<float>(enc.ToArray(), enc.Dimensions.ToArray());
@@ -293,7 +309,8 @@ public static class DiffSingerPhonemizer
             NamedOnnxValue.CreateFromTensor("x_masks", maskDense),
             Nv("ph_midi", phMidi.Select(x => (long)x).ToArray(), nTokens),
             NamedOnnxValue.CreateFromTensor("spk_embed", new DenseTensor<float>(spk, new[] { 1, nTokens, hidden })),
-        });
+        };
+        var durOut = DiffSingerTensorCache.Run(durModel, dur.ModelHash("dur"), durInputs, tensorCache);
         return durOut.First(v => v.Name == "ph_dur_pred").AsTensor<float>().Select(x => (double)x).ToArray();
     }
 

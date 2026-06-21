@@ -21,7 +21,7 @@ public static class DiffSingerPitch
     public static float[]? Predict(
         DiffSingerPredictor? v, IReadOnlyList<PhonemeSpan> phones,
         IReadOnlyList<SynthesisNoteSnapshot> notes, int[] phDur,
-        double renderStart, double frameSec, DiffSingerSpeakerMix mix, VoicebankConfig cfg, int steps)
+        double renderStart, double frameSec, DiffSingerSpeakerMix mix, VoicebankConfig cfg, int steps, bool tensorCache)
     {
         if (v is null || !v.HasModel("pitch") || phones.Count == 0 || notes.Count == 0)
             return null;
@@ -52,7 +52,7 @@ public static class DiffSingerPitch
             var langs = phones.Select(p => v.LangId(PhonemeLanguage(p.Symbol))).Prepend(0L).Append(0L).ToArray();
             lingInputs.Add(NvL("languages", langs, nTokens));
         }
-        using var lingOut = v.RunLinguistic(lingInputs);
+        var lingOut = DiffSingerTensorCache.Run(v.Linguistic, v.LinguisticHash, lingInputs, tensorCache);
         var enc = lingOut.First(o => o.Name == "encoder_out").AsTensor<float>();
         var encDense = new DenseTensor<float>(enc.ToArray(), enc.Dimensions.ToArray());
 
@@ -95,13 +95,16 @@ public static class DiffSingerPitch
             inputs.Add(NamedOnnxValue.CreateFromTensor("note_rest",
                 new DenseTensor<bool>(noteRest, new[] { 1, noteRest.Length })));
 
-        using var outputs = v.RunModel("pitch", inputs);
+        var outputs = DiffSingerTensorCache.Run(model, v.ModelHash("pitch"), inputs, tensorCache);
         return outputs.First().AsTensor<float>().ToArray();
     }
 
-    // note 序列构造（忠实移植 OpenUtau）：head padding(rest) + 各 note（间隙插 rest note）+ tail padding(rest)。
+    // note 序列构造（移植 OpenUtau，叠加重叠扩展）：head padding(rest) + 各 note（间隙插 rest note）+ tail padding(rest)。
     //   note_rest：slur（歌词 +）继承前一个；否则该 note 的音素全为辅音/AP/SP（无真元音）⇒ rest。
     //   note_midi：rest 组的 tone 由最近的非 rest note 填充（全 rest ⇒ 全填 60）。
+    //   头盖尾（OpenUtau 无、本插件扩展）：note 与后一 note 重叠时，有效终点截到后一 note 起点，使 note_dur 与
+    //   phonemizer/声学侧的截断时间线同口径——否则 pitch 模型按 note 全长走、轮廓越过后一 note 起点（不让位）。
+    //   同起点和弦退化为 dur=0 塌缩（排序长者在前先塌，短者存活）。
     static (float[] midi, int[] durFrames, bool[] rest) BuildNotes(
         DiffSingerPredictor v, IReadOnlyList<PhonemeSpan> phones,
         IReadOnlyList<SynthesisNoteSnapshot> notes,
@@ -120,6 +123,10 @@ public static class DiffSingerPitch
         for (int i = 0; i < notes.Count; i++)
         {
             var note = notes[i];
+            // 头盖尾：与后一 note 重叠时，本 note 有效终点截到后一 note 起点（同起点 ⇒ 截到自身起点 ⇒ dur=0 塌缩）。
+            double effectiveEnd = i + 1 < notes.Count
+                ? Math.Min(note.EndTime, notes[i + 1].StartTime)
+                : note.EndTime;
             double gap = note.StartTime - prevEnd;
             if (gap > 0)
             {
@@ -127,10 +134,10 @@ public static class DiffSingerPitch
                 midiList.Add(note.Pitch);
                 restList.Add(true);
             }
-            durSec.Add(Math.Max(0, note.EndTime - note.StartTime));
+            durSec.Add(Math.Max(0, effectiveEnd - note.StartTime));
             midiList.Add(note.Pitch);
-            string lyric = note.Lyric ?? string.Empty;
-            if (lyric.StartsWith("+") || lyric == "-")
+            // 延音符（"-"/"+"）：无自身音素，沿用前一个 note 的 rest 状态（前为发声 ⇒ 本帧也发声、携自身 MIDI 滑过去）。
+            if (DiffSingerPhonemizer.IsSlur(note.Lyric))
             {
                 // slur 延音符继承前音 rest 状态，确保 pitch 模型为其生成正确过渡音高
                 restList.Add(restList[^1]);
@@ -145,7 +152,7 @@ public static class DiffSingerPitch
                 }
                 restList.Add(isRest);
             }
-            prevEnd = note.EndTime;
+            prevEnd = effectiveEnd;
         }
 
         // tail padding。

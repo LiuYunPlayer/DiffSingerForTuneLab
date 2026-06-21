@@ -25,19 +25,17 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
     readonly string mVoiceId;
     readonly DiffSingerModelCache mModelCache;
     readonly int mSamplingSteps;
+    readonly bool mTensorCache;        // 张量缓存总开关（引擎设置 tensor_cache）
+    readonly int mCacheMaxSizeMb;      // 缓存体积上限（MB）；0 = 不限制（引擎设置 cache_max_size_mb）
 
-    internal string VoiceId => mVoiceId;
-
-    enum RenderMode { Normal, Retake }
-    volatile RenderMode mRenderMode;
-    volatile bool mRenderModeConsumed;
-
-    readonly OrderedMap<string, AutomationConfig> mAutomationConfigs;
-    readonly OrderedMap<string, AutomationConfig> mReadbackConfigs;
+    // 运行时复用的声明派生物（每会话固定，构造期据声库能力集算一次）：
+    //   可编辑轨集合（构造期订阅其区间编辑）+ 回显轨集合（产物 SynthesizedParameters 按其 key 聚合）。
+    readonly OrderedMap<PropertyKey, AutomationConfig> mReadbackConfigs;
 
     readonly IDisposable mNotesSubscription;
-    readonly List<ILiveAutomation> mSubscribedAutomations = new();
-    readonly Dictionary<ILiveNote, NoteHandlers> mNoteHandlers = new();
+    readonly List<ILiveAutomation> mSubscribedAutomations = new();   // 已订阅 RangeModified 的固定轨（variance/gender/speed，恒定，Dispose 退订）
+    readonly Dictionary<string, ILiveAutomation> mMixSubscriptions = new();   // 已订阅的说话人混合轨（动态，key=mix:suffix，随 part 属性增减）
+    readonly Dictionary<ILiveNote, Action> mNoteHandlers = new();
     readonly List<Piece> mPieces = new();
     bool mNeedResegment;
 
@@ -51,16 +49,17 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
     readonly SemaphoreSlim mRenderSemaphore;
 
     public DiffSingerSynthesisSession(VoicebankConfig config, ISynthesisContext context,
-        string voiceId, DiffSingerModelCache modelCache, int samplingSteps, SemaphoreSlim renderSemaphore)
+        string voiceId, DiffSingerModelCache modelCache, int samplingSteps, bool tensorCache, int cacheMaxSizeMb)
     {
         mConfig = config;
         mContext = context;
         mVoiceId = voiceId;
         mModelCache = modelCache;
         mSamplingSteps = samplingSteps;
-        mRenderSemaphore = renderSemaphore;
+        mTensorCache = tensorCache;
+        mCacheMaxSizeMb = cacheMaxSizeMb;
 
-        mAutomationConfigs = BuildAutomationConfigs(config);
+        // 声明派生物据声库能力集算一次（与引擎声明同一套 DiffSingerDeclarations，单一真相源）。
         mReadbackConfigs = BuildReadbackConfigs(config);
 
         mNotesSubscription = NotifiableExtensions.WhenAny(context.Notes, SubscribeNote, UnsubscribeNote);
@@ -71,131 +70,28 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         context.PitchDeviation.RangeModified += OnRangeModified;
         context.Committed += OnCommitted;
 
-        foreach (var key in mAutomationConfigs.Keys)
-            if (context.TryGetAutomation(key, out var automation))
+        // 固定轨（variance / gender / speed）区间编辑订阅：SDK 把声明上移到引擎后，宿主在「建会话之前」即
+        //   RefreshDeclarations 填好 Voice.AutomationConfigs（见 MidiPart 时序），故构造期 TryGetAutomation 即命中、直接订阅。
+        //   这些轨与 part 属性无关、恒定，构造期订一次即可。
+        foreach (var key in BuildFixedAutomationConfigs(config).Keys)
+            if (context.TryGetAutomation(key.Id, out var automation))
             {
                 automation.RangeModified += OnRangeModified;
                 mSubscribedAutomations.Add(automation);
             }
+
+        // 说话人混合轨是动态集（随 part 属性 speaker_mix 容器增减）：构造期同步一次（覆盖重开工程时已选的），
+        //   之后由 part 属性变更（MarkAllDirtyAndResegment）补/退订——见 SyncMixSubscriptions。
+        SyncMixSubscriptions();
 
         mNeedResegment = true;
     }
 
     public string DefaultLyric => "a";
 
-    // 获取默认 G2P 音素（供音素编辑器填充）
-    internal List<PhonemeEntry> GetDefaultPhonemesForNote(double time, string partLang = "")
-    {
-        ILiveNote? targetNote = null;
-        foreach (var note in mContext.Notes)
-        {
-            if (note.StartTime.Value <= time && note.EndTime.Value >= time)
-            { targetNote = note; break; }
-        }
-        if (targetNote == null) return new List<PhonemeEntry>();
-
-        try
-        {
-            var models = mModelCache.GetOrLoad(mVoiceId, mConfig);
-            var durPred = models.GetPredictor("dsdur");
-            if (durPred == null) return new List<PhonemeEntry>();
-
-            string lyric = targetNote.Lyric.Value ?? string.Empty;
-            // partLang 由调用方从快照传入（不依赖 live mContext.PartProperties），确保段落语言变更后能取到新值
-            if (string.IsNullOrEmpty(partLang))
-            {
-                var partLangVal = mContext.PartProperties.GetValue(KeyLanguage, PropertyValue.Create(string.Empty));
-                partLang = partLangVal.ToString(out var pl) ? pl : string.Empty;
-            }
-            var noteLangVal = targetNote.Properties.GetValue(KeyLanguage, PropertyValue.Create(string.Empty));
-            // 注意：ToString 对空字符串也返回 true，故需排除空串，才能正确回退到 partLang
-            string noteLang = noteLangVal.ToString(out var nl) && !string.IsNullOrEmpty(nl) ? nl : partLang;
-
-            var result = new List<PhonemeEntry>();
-            string[] symbols = durPred.G2P(lyric, noteLang);
-            if (symbols.Length == 0) return result;
-
-            foreach (var sym in symbols)
-            {
-                if (string.IsNullOrEmpty(sym)) continue;
-                result.Add(new PhonemeEntry
-                {
-                    Symbol = sym,
-                    IsVowel = durPred.IsVowel(sym),
-                    IsGlide = durPred.IsGlide(sym),
-                });
-            }
-            return result;
-        }
-        catch { return new List<PhonemeEntry>(); }
-    }
-
-    // 根据区间找出应处理的 piece 集合（NaN 表示全曲）
-    IEnumerable<Piece> PiecesInRange(double start, double end)
-    {
-        if (double.IsNaN(start) || double.IsNaN(end))
-            return mPieces;
-        return mPieces.Where(p => p.StartTime < end && p.EndTime > start);
-    }
-
-    internal void RequestRetake()
-    {
-        mHasValidCache = false;
-        ClearPieceCaches(PiecesInRange(mAffectedStartTime, mAffectedEndTime));
-        StatusChanged?.Invoke();
-    }
-
-    internal void RequestRetakeScoped(double scopeStart, double scopeEnd)
-    {
-        mHasValidCache = false;
-        SetAffectedRange(scopeStart, scopeEnd);
-        ClearPieceCaches(PiecesInRange(scopeStart, scopeEnd));
-        StatusChanged?.Invoke();
-    }
-
-    internal void RequestRedrawPitch()
-    {
-        foreach (var piece in PiecesInRange(mAffectedStartTime, mAffectedEndTime))
-        {
-            if (piece.CachedPhones == null) continue;
-            piece.Dirty = true; piece.Failed = false;
-            piece.CachedPitchPrediction = null;
-            piece.RedrawPitchRequested = true;
-        }
-        StatusChanged?.Invoke();
-    }
-
-    internal void RequestRedrawPitchScoped(double scopeStart, double scopeEnd)
-    {
-        SetAffectedRange(scopeStart, scopeEnd);
-        foreach (var piece in PiecesInRange(scopeStart, scopeEnd))
-        {
-            if (piece.CachedPhones == null) continue;
-            piece.Dirty = true; piece.Failed = false;
-            piece.CachedPitchPrediction = null;
-            piece.RedrawPitchRequested = true;
-        }
-        StatusChanged?.Invoke();
-    }
-
-    void ClearPieceCaches(IEnumerable<Piece> pieces)
-    {
-        foreach (var piece in pieces)
-        {
-            piece.Dirty = true; piece.Failed = false;
-            piece.CachedPitchPrediction = null;
-            piece.CachedVarianceCurves = default;
-            piece.CachedPhones = null;
-            piece.CachedMel = null; piece.CachedMelDims = null;
-            piece.CachedAudio = null;
-            piece.CachedPitchReadback = null;
-            piece.CachedVarianceReadback = new Dictionary<string, IReadOnlyList<Point>>();
-            piece.RedrawPitchRequested = false;
-        }
-    }
-
-    public SynthesisSegment? GetNextSegment(double startTime, double endTime)
-        => FindNextDirtyPiece(startTime, endTime) is { } p ? new SynthesisSegment(p.StartTime, p.EndTime) : null;
+    // —— 调度：窗内第一个脏块的纯值边界（peek 廉价、确定性）——
+    public SynthesisRange? GetNextSegment(double startTime, double endTime)
+        => FindNextDirtyPiece(startTime, endTime) is { } p ? new SynthesisRange(p.StartTime, p.EndTime) : null;
 
     Piece? FindNextDirtyPiece(double startTime, double endTime)
     {
@@ -209,9 +105,9 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         return null;
     }
 
-    public async Task SynthesizeNext(SynthesisSegment segment, CancellationToken cancellation = default)
+    public async Task SynthesizeNext(double startTime, double endTime, CancellationToken cancellation = default)
     {
-        if (FindNextDirtyPiece(segment.StartTime, segment.EndTime) is not { } piece)
+        if (FindNextDirtyPiece(startTime, endTime) is not { } piece)
             return;
 
         var snapshot = mContext.GetSnapshot(piece.Notes, piece.Notes[0].StartTime.Value, piece.Notes.Max(n => n.EndTime.Value));
@@ -225,7 +121,15 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         await mRenderSemaphore.WaitAsync(cancellation);
         try
         {
-            var rendered = await Task.Run(() => Render(snapshot, piece.Notes, piece, report, cancellation), CancellationToken.None);
+            // offload：worker 只读冻结快照跑 ONNX（绝不碰活视图）；模型懒加载经引擎级缓存（首载触发原生加载）。
+            //   合成毕在 worker 线程顺手做一次缓存体积上限逐出（仅开缓存且设了上限时；off 数据线程、尽力而为）。
+            var rendered = await Task.Run(() =>
+            {
+                var result = Render(snapshot, piece.Notes, report, cancellation);
+                if (mTensorCache && mCacheMaxSizeMb > 0)
+                    DiffSingerTensorCache.EnforceSizeLimit(mCacheMaxSizeMb);
+                return result;
+            }, CancellationToken.None);
             if (rendered != null && mPieces.Contains(piece))
             {
                 int rate = rendered.SampleRate;
@@ -377,22 +281,9 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
 
         // —— 模型优先级：dsdur/dspitch 提级模型 ——
         var durPred = models.GetPredictor("dsdur");
-        var pitchPred = models.GetPredictor("dspitch");
-        var varPred = models.GetPredictor("dsvariance");
-
-        // —— Phonemizer（needFullPredict 时才重新运行，否则复用缓存）——
-        List<PhonemeSpan> phones;
-        if (needFullPredict)
-        {
-            phones = durPred != null
-                ? DiffSingerPhonemizer.Phonemize(durPred, notes, noteLang, speaker, hop, sr)
-                : FallbackPhonemes(models, notes, noteLang);
-            piece.CachedPhones = phones;
-        }
-        else
-        {
-            phones = piece.CachedPhones ?? new List<PhonemeSpan>();
-        }
+        var phones = durPred != null
+            ? DiffSingerPhonemizer.Phonemize(durPred, notes, noteLang, speaker, hop, sr, mTensorCache)
+            : FallbackPhonemes(models, notes, noteLang);   // 无 dur 预测器：每 note 一元音兜底
         if (phones.Count == 0)
             return null;
         progress?.Report(0.2);
@@ -406,7 +297,9 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         int nFrames = durations.Sum();
         double renderStart = phones[0].StartTime - head * frameSec;
 
-        // 逐帧时刻 + 说话人逐帧混合
+        // 逐帧时刻 + 说话人逐帧混合（acoustic/pitch/variance 三域共享；未启用任何混合时退化为默认 speaker 恒权重）。
+        //   遍历全量 mix:<suffix> 候选，snapshot.TryGetAutomation 只命中已声明轨——即用户在 part 面板已 + 的 speaker
+        //   （speaker_mix 容器已选键），未选的 speaker 此处自然跳过、不参与混合。
         var frameTimes = new double[nFrames];
         for (int f = 0; f < nFrames; f++) frameTimes[f] = renderStart + (f + 0.5) * frameSec;
         var mixTracks = new List<(string Suffix, double[] Sampled)>();
@@ -440,18 +333,11 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
             }
         }
 
-        // —— 自动音高预测（仅在 needPitchPredict 时跑；否则复用缓存）——
-        float[]? predictedPitch;
-        if (needPitchPredict)
-        {
-            predictedPitch = DiffSingerPitch.Predict(pitchPred, phones, notes, durations,
-                renderStart, frameSec, speakerMix, mConfig, mSamplingSteps);
-            piece.CachedPitchPrediction = predictedPitch;
-        }
-        else
-        {
-            predictedPitch = piece.CachedPitchPrediction;
-        }
+        // —— dspitch 自然音高预测（纯从音符、retake 全 true、不吃用户音高）：替代自由区的矩形 note-step 兜底 ——
+        //   用户已画处（Pitch 非 NaN）用户值覆盖；NaN 自由区用预测轮廓（无 dspitch ⇒ 仍用矩形 framePitch）；PITD/vibrato 叠加在上。
+        var predictedPitch = DiffSingerPitch.Predict(
+            models.GetPredictor("dspitch"), phones, notes, durations,
+            renderStart, frameSec, speakerMix, mConfig, mSamplingSteps, mTensorCache);
         progress?.Report(0.28);
         if (cancellation.IsCancellationRequested)
             return null;
@@ -491,18 +377,10 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         if (cancellation.IsCancellationRequested)
             return null;
 
-        // —— variance 预测（needFullPredict 时重新预测；否则复用缓存）——
-        VarianceCurves varCurves;
-        if (needFullPredict)
-        {
-            varCurves = DiffSingerVariance.Predict(varPred, phones.Select(p => p.Symbol).ToList(),
-                durations, semis, speakerMix, mConfig, mSamplingSteps);
-            piece.CachedVarianceCurves = varCurves;
-        }
-        else
-        {
-            varCurves = piece.CachedVarianceCurves;
-        }
+        // —— variance 预测（基线；下方与用户 delta 合成喂声学、纯预测产回显）——
+        var varCurves = DiffSingerVariance.Predict(
+            models.GetPredictor("dsvariance"), phones.Select(p => p.Symbol).ToList(),
+            durations, semis, speakerMix, mConfig, mSamplingSteps, mTensorCache);
         progress?.Report(0.45);
         if (cancellation.IsCancellationRequested)
             return null;
@@ -561,28 +439,8 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
             inputs.Add(NamedOnnxValue.CreateFromTensor("speedup", new DenseTensor<long>(new[] { speedup }, new[] { 1 })));
         }
 
-        // —— 声学模型：产 mel ——
-        using var melOut = models.RunAcoustic(inputs);
-        var melTensor = melOut.First(v => v.Name == "mel").AsTensor<float>();
-        var melDims = melTensor.Dimensions.ToArray();
-        var newMel = melTensor.ToArray();
-
-        // —— 区段式 mel 拼贴：仅替换受影响的 time range，其余保持旧 mel ——
-        float[] finalMel;
-        if (piece.CachedMel != null && piece.CachedMelDims != null
-            && melDims.SequenceEqual(piece.CachedMelDims) && piece.CachedMel.Length == newMel.Length)
-        {
-            finalMel = StitchMel(newMel, piece.CachedMel, frameTimes, nFrames, numMelBins, mAffectedStartTime, mAffectedEndTime);
-        }
-        else
-        {
-            finalMel = newMel;
-        }
-
-        // 更新 mel 缓存
-        piece.CachedMel = finalMel;
-        piece.CachedMelDims = melDims;
-
+        var melOut = DiffSingerTensorCache.Run(ac, models.AcousticHash, inputs, mTensorCache);
+        var mel = melOut.First(v => v.Name == "mel").AsTensor<float>();
         progress?.Report(0.75);
         if (cancellation.IsCancellationRequested)
             return null;
@@ -597,7 +455,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         };
         if (voc.InputMetadata.ContainsKey("f0"))
             vInputs.Add(NamedOnnxValue.CreateFromTensor("f0", new DenseTensor<float>(f0, new[] { 1, nFrames })));
-        using var wavOut = models.RunVocoder(vInputs);
+        var wavOut = DiffSingerTensorCache.Run(voc, models.VocoderHash, vInputs, mTensorCache);
         var audio = wavOut.First(v => v.Name == "waveform").AsTensor<float>().ToArray();
         progress?.Report(1.0);
 
@@ -928,66 +786,10 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
                 var segments = new List<IReadOnlyList<Point>>();
                 var stopSets = new List<IReadOnlyList<Point>>();
                 foreach (var piece in mPieces)
-                {
-                    if (!piece.VarianceReadback.TryGetValue(kvp.Key, out var allPoints) || allPoints.Count == 0)
-                        continue;
-
-                    var phones = piece.CachedPhones;
-                    if (phones == null || phones.Count == 0 || allPoints.Count < 2)
-                    {
-                        segments.Add(allPoints);
-                        stopSets.Add([new(0, 0.25), new(1, 0.25)]);
-                        continue;
-                    }
-
-                    double bodyStart = phones[0].StartTime;
-                    double bodyEnd = phones[^1].EndTime;
-                    int headEnd = 0, bodyEndIdx = allPoints.Count;
-                    while (headEnd < allPoints.Count && allPoints[headEnd].X < bodyStart) headEnd++;
-                    int bodyStartIdx = headEnd;
-                    while (bodyEndIdx > 0 && allPoints[bodyEndIdx - 1].X > bodyEnd) bodyEndIdx--;
-                    int total = allPoints.Count;
-                    bool hasHead = headEnd > 0;
-                    bool hasTail = bodyEndIdx < total;
-
-                    // 整段作为一个 segment
-                    segments.Add(allPoints);
-
-                    // 构造 GradientStop，按有无 head/tail 调整
-                    var stops = new List<Point>(4);
-                    if (hasHead)
-                    {
-                        stops.Add(new(0.0, 0.0));
-                        double headRatio = (double)headEnd / total;
-                        stops.Add(new(Math.Clamp(headRatio, 0, 1), 0.25));
-                    }
-                    else
-                    {
-                        stops.Add(new(0.0, 0.25));
-                    }
-
-                    double bodyEndRatio = (double)bodyEndIdx / total;
-                    if (hasTail)
-                    {
-                        stops.Add(new(Math.Clamp(bodyEndRatio, 0, 1), 0.25));
-                        stops.Add(new(1.0, 0.0));
-                    }
-                    else
-                    {
-                        stops.Add(new(1.0, 0.25));
-                    }
-
-                    // 移除相邻等偏移的退化 stop
-                    var dedup = new List<Point>(stops.Count);
-                    for (int i = 0; i < stops.Count; i++)
-                        if (i == stops.Count - 1 || Math.Abs(stops[i].X - stops[i + 1].X) > 0.0001)
-                            dedup.Add(stops[i]);
-                    while (dedup.Count < 2) dedup.Add(new(1, 0.25));
-
-                    stopSets.Add(dedup);
-                }
+                    if (piece.VarianceReadback.TryGetValue(kvp.Key.Id, out var segment) && segment.Count > 0)
+                        segments.Add(segment);
                 if (segments.Count > 0)
-                    map.Add(kvp.Key, new SynthesizedParameter { Segments = segments, SegmentOpacityStops = stopSets });
+                    map.Add(kvp.Key.Id, new SynthesizedParameter { Segments = segments });
             }
             return map;
         }
@@ -1028,6 +830,8 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         mContext.Pitch.RangeModified -= OnRangeModified;
         mContext.PitchDeviation.RangeModified -= OnRangeModified;
         foreach (var automation in mSubscribedAutomations)
+            automation.RangeModified -= OnRangeModified;
+        foreach (var automation in mMixSubscriptions.Values)
             automation.RangeModified -= OnRangeModified;
         mContext.Committed -= OnCommitted;
         foreach (var piece in mPieces)
@@ -1174,6 +978,31 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
             // 保留 pitch 缓存
         }
         mNeedResegment = true;
+        // part 属性变更可能增删了说话人混合轨：补订新出现的、退订已消失的，使后续画曲线（RangeModified）能标脏。
+        //   时序安全：宿主 OnPartPropertiesModified（part 构造期订阅）先于本会话 handler（会话构造期订阅）执行，
+        //   它已 RebuildAutomationConfigs 填好 Voice.AutomationConfigs，故此刻 TryGetAutomation 对已选轨即命中。
+        SyncMixSubscriptions();
+    }
+
+    // 同步说话人混合轨订阅到当前 part 属性已选集：遍历全量去重 speaker 表（无需枚举 part 属性，live 视图也不支持），
+    //   逐个 TryGetAutomation——命中（= 已声明 = 已选）且未订则订、不命中且已订则退。幂等，可反复调。
+    void SyncMixSubscriptions()
+    {
+        foreach (var (key, _) in SpeakerMixTracks(mConfig))   // key = mix:<suffix>
+        {
+            bool live = mContext.TryGetAutomation(key, out var automation);
+            bool subscribed = mMixSubscriptions.ContainsKey(key);
+            if (live && !subscribed)
+            {
+                automation!.RangeModified += OnRangeModified;
+                mMixSubscriptions[key] = automation;
+            }
+            else if (!live && subscribed)
+            {
+                mMixSubscriptions[key].RangeModified -= OnRangeModified;
+                mMixSubscriptions.Remove(key);
+            }
+        }
     }
 
     void OnCommitted()
