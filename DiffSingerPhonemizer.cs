@@ -11,23 +11,17 @@ namespace DiffSingerForTuneLab;
 //   IsLead：音节核之前的引导辅音（onset），由 ProcessWord 的前置组判定；产物按时长模型回报时随之带出（§5.7）。
 public readonly record struct PhonemeSpan(string Symbol, double StartTime, double EndTime, int NoteIndex, bool IsVowel, bool IsLead = false);
 
-// DiffSinger phonemizer：歌词 → 音素时间线。忠实移植 OpenUtau DiffSingerBasePhonemizer.ProcessPart：
+// DiffSinger phonemizer：歌词 → 音素时间线。G2P / 分组 / dur 预测忠实移植 OpenUtau DiffSingerBasePhonemizer：
 //   · 短语首加前导 SP 组 + 500ms padding（给首辅音留空间），尾加哨兵；
-//   · 音素按元音对齐到 note 起点（consonant-glide-vowel 特例：滑音起拍）；onset 辅音归前一组、侵入前一 note 尾；
-//   · word_div=各组音素数、word_dur=相邻组（note 起点）间帧数 → linguistic(词模式) + dur → 每音素帧；
-//   · 对齐：首辅音保自然时长（ratio=frameSec），其余每组按比例缩放、终点对齐到下一 note 起点。
-// 在 TuneLab 绝对秒域工作（OpenUtau 用 tick+tempo，这里 note 边界即秒）。钉死 note（note.Phonemes 非空）
-// 用其相对偏移覆盖对齐结果（§5.7：用户钉死全音素，引擎遵守时序）。
+//   · 音素按元音对齐到 note 起点（consonant-glide-vowel 特例：滑音起拍）；onset 辅音归前一组、定 IsLead；
+//   · word_div=各组音素数、word_dur=相邻组（note 起点）间帧数 → linguistic(词模式) + dur → 每音素标称帧。
+// 最终定位不再自己做对齐 / 钉死布局：把每发声 note 的标称音素（钉死值或 dur 预测）+ 几何（核起点 / FillEnd）
+// 交宿主 SDK 的 VoicePhonemeLayout.Resolve 统一派生 + 跨 note 去重叠——与宿主显示同源（WYSIWYG），钉死长辅音
+// 越界自动压缩。在 TuneLab 绝对秒域工作（note 边界即秒）。延音符由宿主 VoiceNoteSnapshot.IsContinuation 标志判定。
 public static class DiffSingerPhonemizer
 {
     const string Pause = "SP";
     const double PaddingSec = 0.5;   // 短语首辅音前导空间（OpenUtau padding=500ms）
-
-    // 延音符（tenuto/slur）：TuneLab 原生延音符歌词为 "-"；兼容 OpenUtau 导入工程的 "+"/"+~"/"+*" 前缀。
-    //   延音符不带自身音素——沿用前一发声 note 的元音、令其延展过来；其音高仅在 pitch 时间线（note_midi）上承载，
-    //   故声学/音素侧把它「跳过」即可让前元音自然伸到下一发声 note 起点。见 DiffSingerPitch.BuildNotes 对称处理。
-    public static bool IsSlur(string? lyric)
-        => lyric == "-" || (lyric != null && lyric.StartsWith("+"));
 
     sealed class Group
     {
@@ -57,9 +51,9 @@ public static class DiffSingerPhonemizer
         {
             var note = notes[i];
 
-            // 延音符：不产音素、不建组——前一组（前元音）会自然伸展到下一发声 note 起点（对齐终点跨过本 note）。
-            //   notePhIndex 记空区间（本 note 无音素，NoteOf 不会落到它）。首 note 即延音符则无前可沿，退化为常规 G2P。
-            if (i > 0 && IsSlur(note.Lyric))
+            // 延音符（宿主 IsContinuation 标志）：不产音素、不建组——前一发声 note 的元音经 FillEnd 铺过它。
+            //   notePhIndex 记空区间。首 note 即延续则无前可沿，退化为常规 G2P。
+            if (i > 0 && note.IsContinuation)
             {
                 pinned[i] = false;
                 noteSymbolCount[i] = 0;
@@ -93,110 +87,66 @@ public static class DiffSingerPhonemizer
 
         var durationFrames = RunDur(dur, tokens, langs, wordDiv, wordDur, flatTone, speaker, tensorCache);
 
-        // —— 对齐：首辅音自然，其余每组按比例缩放，终点对齐到下一组(note)起点 ——
-        // phAlignPoints[k] = (展平下标=第 k+1 组首音素, 第 k+1 组起点秒)
-        var cum = new int[groups.Count];
-        for (int i = 1; i < groups.Count; i++) cum[i] = cum[i - 1] + groups[i - 1].Phonemes.Count;
-        var alignIdx = new List<int>();
-        var alignPos = new List<double>();
-        for (int k = 1; k < groups.Count; k++) { alignIdx.Add(cum[k]); alignPos.Add(groups[k].Pos); }
-
-        var positions = new List<double>(nTokens - 1);   // flat[1..] 的起点秒
-        // 首组：跳过 index 0 的前导 SP，取首 note 的前置辅音，自然时长(ratio=frameSec)、终点对齐首 note 起点
-        positions.AddRange(Stretch(durationFrames, 1, alignIdx[0] - 1, frameSec, alignPos[0]));
-        for (int k = 0; k < alignIdx.Count - 1; k++)
-        {
-            int from = alignIdx[k], to = alignIdx[k + 1];
-            double sum = 0;
-            for (int j = from; j < to; j++) sum += durationFrames[j];
-            double ratio = sum > 0 ? (alignPos[k + 1] - alignPos[k]) / sum : frameSec;
-            positions.AddRange(Stretch(durationFrames, from, to - from, ratio, alignPos[k + 1]));
-        }
-
-        // —— 展平 → body 音素时间线（flat[1..]，跳过前导 SP；末音素终点=哨兵=末 note 终点）——
-        var result = new List<PhonemeSpan>(nTokens - 1);
-        int bodyCount = nTokens - 1;
-        for (int b = 0; b < bodyCount; b++)
-        {
-            int flatIndex = b + 1;
-            double start = positions[b];
-            double end = b + 1 < bodyCount ? positions[b + 1] : last.EndTime;
-            int noteIndex = NoteOf(notePhIndex, flatIndex);
-            // IsLead：本 note 内位序落在前置组（前 leadCounts[noteIndex] 个）即引导辅音。
-            bool isLead = flatIndex - notePhIndex[noteIndex] < leadCounts[noteIndex];
-            string sym = flatSymbols[flatIndex];
-            result.Add(new PhonemeSpan(sym, start, end, noteIndex, dur.IsVowel(sym), isLead));
-        }
-
-        // —— 钉死 note：时长模型布局覆盖（§5.7）——
-        // 用户钉死的是「时长 + 权重 + IsLead」（无绝对位置），故按宿主同一布局规则解析为真实时序：
-        //   核起点 = 音符头；前置(IsLead)从核起点往左累积固定时长；核(w>0)填充到组末、后辅音(w=0)占组末固定时长。
-        //   组末 = 自然对齐下本 note 末音素终点（= 下一组起点 / 末 note 终点），保证与相邻自由 note 的对齐衔接不变。
+        // —— 定位：每发声 note 物化为 VoicePhonemeLayoutNote，交 SDK 的 VoicePhonemeLayout.Resolve 统一派生 ——
+        //   核起点 = 音符头；标称音素 = 钉死值（note.Phonemes）或 dur 模型预测（自由 note）；权重核 1 / 辅音 0；
+        //   FillEnd = 下一发声 note 起点（跨延音符 / 空隙）或末 note 满末——令元音铺到下一发声 note、音素帧时间线连续。
+        //   Resolve 内部「核起点=音符头、前置往左累积、核填到 FillEnd」+ 跨 note 两阶去重叠（元音先让、辅音簇等比压），
+        //   故钉死长辅音越界自动压缩、自由 / 钉死混排边界协同一致，且与宿主显示同源（WYSIWYG）。
+        var layoutNotes = new List<VoicePhonemeLayoutNote>();
+        var layoutNoteIndex = new List<int>();          // layoutNotes[ln] → snapshot note 下标
         for (int i = 0; i < notes.Count; i++)
         {
-            if (!pinned[i]) continue;
-            var note = notes[i];
-            var ph = note.Phonemes;
-            int baseIdx = notePhIndex[i] - 1;   // body 下标（flat-1）
             int count = noteSymbolCount[i];
-            if (count <= 0 || baseIdx < 0 || baseIdx >= result.Count) continue;
-            int lastIdx = Math.Min(baseIdx + count - 1, result.Count - 1);
-            double groupEndRel = Math.Max(0, result[lastIdx].EndTime - note.StartTime);
-
-            var layout = LayoutPinned(ph, groupEndRel);
-            for (int j = 0; j < ph.Count && j < count && baseIdx + j < result.Count; j++)
+            if (count <= 0) continue;                   // 延音符 / 空 note：无音素，元音由前一发声 note 铺过
+            int baseFlat = notePhIndex[i];
+            var ph = notes[i].Phonemes;
+            bool isPinned = pinned[i];
+            var items = new VoicePhoneme[count];
+            for (int k = 0; k < count; k++)
             {
-                var span = result[baseIdx + j];
-                result[baseIdx + j] = span with
+                string sym = flatSymbols[baseFlat + k];
+                bool usePin = isPinned && k < ph.Count;
+                items[k] = new VoicePhoneme
                 {
-                    StartTime = note.StartTime + layout[j].Start,
-                    EndTime = note.StartTime + layout[j].End,
-                    IsLead = ph[j].IsLead,
+                    Symbol = sym,
+                    Duration = usePin ? ph[k].Duration : durationFrames[baseFlat + k] * frameSec,
+                    StretchWeight = usePin ? ph[k].StretchWeight : (dur.IsVowel(sym) ? 1 : 0),
+                    IsLead = usePin ? ph[k].IsLead : k < leadCounts[i],
                 };
+            }
+            layoutNotes.Add(new VoicePhonemeLayoutNote
+            {
+                FillStart = notes[i].StartTime,
+                FillEnd = NextSoundingStart(notes, noteSymbolCount, i),
+                Phonemes = items,
+            });
+            layoutNoteIndex.Add(i);
+        }
+
+        var resolved = VoicePhonemeLayout.Resolve(layoutNotes);
+
+        var result = new List<PhonemeSpan>(nTokens);
+        for (int ln = 0; ln < layoutNotes.Count; ln++)
+        {
+            int noteIndex = layoutNoteIndex[ln];
+            var items = layoutNotes[ln].Phonemes;
+            var times = resolved[ln];
+            for (int k = 0; k < items.Count; k++)
+            {
+                var it = items[k];
+                result.Add(new PhonemeSpan(it.Symbol, times[k].Start, times[k].End, noteIndex, dur.IsVowel(it.Symbol), it.IsLead));
             }
         }
         return result;
     }
 
-    // 钉死音素（SynthesisPhoneme：时长 / 权重 / IsLead）→ 相对 note 起点的秒偏移（核起点=0）。
-    //   前置(IsLead)：从 0 往左依次累积各自固定时长。
-    //   非前置：核(w>0)分摊填充空间（= groupEndRel − Σ后辅音固定时长），后辅音(w=0)占其固定时长，从 0 往右依次铺。
-    //   Σ核权重 ≤ 0 时核取 0 长（退化，无除零）；负时长按 0 处理。
-    static (double Start, double End)[] LayoutPinned(IReadOnlyList<VoicePhoneme> ph, double groupEndRel)
+    // 下一发声 note（noteSymbolCount>0）的起点；跨延音符 / 空隙；无则末 note 满末。作核(元音)填充终点 FillEnd。
+    static double NextSoundingStart(IReadOnlyList<VoiceNoteSnapshot> notes, int[] noteSymbolCount, int i)
     {
-        int n = ph.Count;
-        var rel = new (double Start, double End)[n];
-
-        double totalLead = 0;
-        for (int i = 0; i < n; i++) if (ph[i].IsLead) totalLead += Math.Max(0, ph[i].Duration);
-        double pos = -totalLead;
-        for (int i = 0; i < n; i++)
-        {
-            if (!ph[i].IsLead) continue;
-            double d = Math.Max(0, ph[i].Duration);
-            rel[i] = (pos, pos + d);
-            pos += d;
-        }
-
-        double totalTrail = 0, totalCoreWeight = 0;
-        for (int i = 0; i < n; i++)
-            if (!ph[i].IsLead)
-            {
-                if (ph[i].StretchWeight > 0) totalCoreWeight += ph[i].StretchWeight;
-                else totalTrail += Math.Max(0, ph[i].Duration);
-            }
-        double fill = Math.Max(0, groupEndRel - totalTrail);
-        pos = 0;
-        for (int i = 0; i < n; i++)
-        {
-            if (ph[i].IsLead) continue;
-            double d = ph[i].StretchWeight > 0
-                ? (totalCoreWeight > 0 ? fill * ph[i].StretchWeight / totalCoreWeight : 0)
-                : Math.Max(0, ph[i].Duration);
-            rel[i] = (pos, pos + d);
-            pos += d;
-        }
-        return rel;
+        for (int j = i + 1; j < notes.Count; j++)
+            if (noteSymbolCount[j] > 0)
+                return notes[j].StartTime;
+        return notes[^1].EndTime;
     }
 
     // 单 note 的音素→组分配：元音起拍（consonant-glide-vowel：滑音起拍）；前置辅音落在 wordGroups[0]（归前组）。
@@ -236,30 +186,8 @@ public static class DiffSingerPhonemizer
         return symbols.Length > 0 ? symbols : new[] { Pause };
     }
 
-    // OpenUtau stretch：source[from..from+count) 的帧时长按 ratio 缩放、终点对齐 endPos，返回各音素起点秒。
-    static IEnumerable<double> Stretch(IReadOnlyList<double> source, int from, int count, double ratio, double endPos)
-    {
-        double sum = 0;
-        for (int j = 0; j < count; j++) sum += source[from + j];
-        double pos = endPos - sum * ratio;
-        for (int j = 0; j < count; j++)
-        {
-            yield return pos;
-            pos += source[from + j] * ratio;
-        }
-    }
-
     static int FramesBetween(double t1, double t2, double frameSec)
         => (int)(t2 / frameSec) - (int)(t1 / frameSec);
-
-    static int NoteOf(List<int> notePhIndex, int flatIndex)
-    {
-        // notePhIndex[i] = note i 起始 flat 下标；返回包含 flatIndex 的 note。
-        for (int i = 0; i < notePhIndex.Count - 1; i++)
-            if (flatIndex >= notePhIndex[i] && flatIndex < notePhIndex[i + 1])
-                return i;
-        return Math.Max(0, notePhIndex.Count - 2);
-    }
 
     static string PhonemeLanguage(string phoneme)
     {

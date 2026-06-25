@@ -136,8 +136,8 @@ public static class DiffSingerPitch
             }
             durSec.Add(Math.Max(0, effectiveEnd - note.StartTime));
             midiList.Add(note.Pitch);
-            // 延音符（"-"/"+"）：无自身音素，沿用前一个 note 的 rest 状态（前为发声 ⇒ 本帧也发声、携自身 MIDI 滑过去）。
-            if (DiffSingerPhonemizer.IsSlur(note.Lyric))
+            // 延音符（宿主 IsContinuation）：无自身音素，沿用前一个 note 的 rest 状态（前为发声 ⇒ 本帧也发声、携自身 MIDI 滑过去）。
+            if (note.IsContinuation)
             {
                 restList.Add(restList[^1]);
             }
