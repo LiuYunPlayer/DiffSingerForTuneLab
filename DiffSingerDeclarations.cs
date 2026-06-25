@@ -113,7 +113,7 @@ public static class DiffSingerDeclarations
     }
 
     // part 级面板：多说话人暴露「主/兜底 speaker 选择 + 说话人混合容器」、多语言暴露 part 默认语言。
-    public static ObjectConfig BuildPartConfig(VoicebankConfig config, IPartPropertyContext context)
+    public static ObjectConfig BuildPartConfig(VoicebankConfig config, IVoicePartPropertyContext context)
     {
         var properties = new OrderedMap<PropertyKey, IControllerConfig>();
 
@@ -126,7 +126,7 @@ public static class DiffSingerDeclarations
             });
             // 说话人混合：变长键控容器（ExtensibleObjectConfig）。用户从 + 菜单挑 speaker 加入（纯开关、空对象条目），
             //   加入即出现该 speaker 的 [0,100] 逐帧混合曲线、删除即消失——免一次平铺所有 speaker 的曲线。
-            properties.Add((KeyMix, L.Tr("Speaker mix")), BuildSpeakerMixConfig(config, context.PartProperties));
+            properties.Add((KeyMix, L.Tr("Speaker mix")), BuildSpeakerMixConfig(config, context.PartProperties.Merge()));
         }
 
         if (HasLanguageChoice(config))
@@ -157,7 +157,7 @@ public static class DiffSingerDeclarations
     static ObjectConfig EmptyEntry() => new() { Properties = new OrderedMap<PropertyKey, IControllerConfig>() };
 
     // note 级面板：多语言声库暴露 per-note 语言覆盖；默认值取 part 当前默认语言（依赖 part 值 ⇒ 逐次构建）。
-    public static ObjectConfig BuildNoteConfig(VoicebankConfig config, INotePropertyContext context)
+    public static ObjectConfig BuildNoteConfig(VoicebankConfig config, IVoiceNotePropertyContext context)
     {
         var properties = new OrderedMap<PropertyKey, IControllerConfig>();
         if (HasLanguageChoice(config))

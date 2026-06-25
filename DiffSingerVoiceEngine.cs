@@ -34,7 +34,7 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
         mModelCache = null;
     }
 
-    public ISynthesisSession CreateSession(string voiceId, ISynthesisContext context)
+    public IVoiceSession CreateSession(string voiceId, IVoiceContext context)
     {
         if (!mState.Banks.ContainsKey(voiceId))
             throw new ArgumentException($"未知声库 voiceId: {voiceId}");
@@ -50,16 +50,16 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
 
     // —— 声明（引擎层、纯函数 of (voiceId, part 值)；宿主在每次 part 参数 commit 时按当前值重算 diff 到 UI）——
     //   据 context.VoiceId 取声库能力集，委托 DiffSingerDeclarations 建轨/面板。未知声库 → 空声明（不抛，见接口契约）。
-    public IReadOnlyOrderedMap<PropertyKey, AutomationConfig> GetAutomationConfigs(IPartPropertyContext context)
-        => ConfigFor(context.VoiceId) is { } c ? DiffSingerDeclarations.BuildAutomationConfigs(c, context.PartProperties) : EmptyAutomations;
+    public IReadOnlyOrderedMap<PropertyKey, AutomationConfig> GetAutomationConfigs(IVoicePartPropertyContext context)
+        => ConfigFor(context.VoiceId) is { } c ? DiffSingerDeclarations.BuildAutomationConfigs(c, context.PartProperties.Merge()) : EmptyAutomations;
 
-    public IReadOnlyOrderedMap<PropertyKey, AutomationConfig> GetSynthesizedParameterConfigs(IPartPropertyContext context)
+    public IReadOnlyOrderedMap<PropertyKey, AutomationConfig> GetSynthesizedParameterConfigs(IVoicePartPropertyContext context)
         => ConfigFor(context.VoiceId) is { } c ? DiffSingerDeclarations.BuildReadbackConfigs(c) : EmptyAutomations;
 
-    public ObjectConfig GetPartPropertyConfig(IPartPropertyContext context)
+    public ObjectConfig GetPartPropertyConfig(IVoicePartPropertyContext context)
         => ConfigFor(context.VoiceId) is { } c ? DiffSingerDeclarations.BuildPartConfig(c, context) : EmptyConfig;
 
-    public ObjectConfig GetNotePropertyConfig(INotePropertyContext context)
+    public ObjectConfig GetNotePropertyConfig(IVoiceNotePropertyContext context)
         => ConfigFor(context.VoiceId) is { } c ? DiffSingerDeclarations.BuildNoteConfig(c, context) : EmptyConfig;
 
     // 声库能力集按 voiceId 缓存（声明每次 commit 都调，避免重复解析 dsconfig）；config 随声库不可变，扫描重建时清空。

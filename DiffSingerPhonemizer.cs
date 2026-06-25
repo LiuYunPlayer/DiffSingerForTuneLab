@@ -38,7 +38,7 @@ public static class DiffSingerPhonemizer
     }
 
     public static List<PhonemeSpan> Phonemize(
-        DiffSingerPredictor dur, IReadOnlyList<SynthesisNoteSnapshot> notes,
+        DiffSingerPredictor dur, IReadOnlyList<VoiceNoteSnapshot> notes,
         IReadOnlyList<string> noteLang, string speaker, int hop, int sampleRate, bool tensorCache)
     {
         if (notes.Count == 0)
@@ -162,7 +162,7 @@ public static class DiffSingerPhonemizer
     //   前置(IsLead)：从 0 往左依次累积各自固定时长。
     //   非前置：核(w>0)分摊填充空间（= groupEndRel − Σ后辅音固定时长），后辅音(w=0)占其固定时长，从 0 往右依次铺。
     //   Σ核权重 ≤ 0 时核取 0 长（退化，无除零）；负时长按 0 处理。
-    static (double Start, double End)[] LayoutPinned(IReadOnlyList<SynthesisPhoneme> ph, double groupEndRel)
+    static (double Start, double End)[] LayoutPinned(IReadOnlyList<VoicePhoneme> ph, double groupEndRel)
     {
         int n = ph.Count;
         var rel = new (double Start, double End)[n];
@@ -200,7 +200,7 @@ public static class DiffSingerPhonemizer
     }
 
     // 单 note 的音素→组分配：元音起拍（consonant-glide-vowel：滑音起拍）；前置辅音落在 wordGroups[0]（归前组）。
-    static List<Group> ProcessWord(DiffSingerPredictor dur, SynthesisNoteSnapshot note, string[] symbols)
+    static List<Group> ProcessWord(DiffSingerPredictor dur, VoiceNoteSnapshot note, string[] symbols)
     {
         var wordGroups = new List<Group> { new(-1, note.Pitch) };
         var isVowel = symbols.Select(dur.IsVowel).ToArray();
@@ -226,7 +226,7 @@ public static class DiffSingerPhonemizer
     }
 
     // 取音素符号串：钉死=用 note.Phonemes 符号；否则 G2P。过滤到「类型已定义 且 dur 表可 tokenize」；空则 [SP]。
-    static string[] GetSymbols(DiffSingerPredictor dur, SynthesisNoteSnapshot note, string lang, out bool pinned)
+    static string[] GetSymbols(DiffSingerPredictor dur, VoiceNoteSnapshot note, string lang, out bool pinned)
     {
         pinned = note.Phonemes.Count > 0;
         IEnumerable<string> raw = pinned

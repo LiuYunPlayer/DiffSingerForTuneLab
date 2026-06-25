@@ -17,10 +17,10 @@ namespace DiffSingerForTuneLab;
 // 会话呈现属性面板与轨但不产音——诚实的中间态。
 // 声明面（轨集合/属性面板）已上移到 DiffSingerVoiceEngine（经 DiffSingerDeclarations）；本会话仅承载运行时：
 // 调度、6 级推理管线、产物发布。轨 key 与 variance/gender/speed 规格复用 DiffSingerDeclarations（using static 引入）。
-public sealed class DiffSingerSynthesisSession : ISynthesisSession
+public sealed class DiffSingerSynthesisSession : IVoiceSession
 {
     readonly VoicebankConfig mConfig;
-    readonly ISynthesisContext mContext;
+    readonly IVoiceContext mContext;
     readonly string mVoiceId;
     readonly DiffSingerModelCache mModelCache;
     readonly int mSamplingSteps;
@@ -33,13 +33,13 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
 
     // —— 调度状态（数据线程；按 note 间隙分块，账本式托管失效与产物）——
     readonly IDisposable mNotesSubscription;
-    readonly List<ILiveAutomation> mSubscribedAutomations = new();   // 已订阅 RangeModified 的固定轨（variance/gender/speed，恒定，Dispose 退订）
-    readonly Dictionary<string, ILiveAutomation> mMixSubscriptions = new();   // 已订阅的说话人混合轨（动态，key=mix:suffix，随 part 属性增减）
-    readonly Dictionary<ILiveNote, Action> mNoteHandlers = new();
+    readonly List<ISynthesisAutomation> mSubscribedAutomations = new();   // 已订阅 RangeModified 的固定轨（variance/gender/speed，恒定，Dispose 退订）
+    readonly Dictionary<string, ISynthesisAutomation> mMixSubscriptions = new();   // 已订阅的说话人混合轨（动态，key=mix:suffix，随 part 属性增减）
+    readonly Dictionary<IVoiceNote, Action> mNoteHandlers = new();
     readonly List<Piece> mPieces = new();
     bool mNeedResegment;
 
-    public DiffSingerSynthesisSession(VoicebankConfig config, ISynthesisContext context,
+    public DiffSingerSynthesisSession(VoicebankConfig config, IVoiceContext context,
         string voiceId, DiffSingerModelCache modelCache, int samplingSteps, bool tensorCache, int cacheMaxSizeMb)
     {
         mConfig = config;
@@ -157,7 +157,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
     //   phonemizer(dsdur) → 音素时间线；renderer 加 head/tail SP padding、tokens[SP..SP]、durations[8..8]、
     //   f0(Hz over totalFrames)、variance 预测+用户 delta 合成喂声学（纯预测产回显轨）、spk by frame、depth/steps。
     //   gender/velocity 走用户曲线 + OpenUtau GENC/VELC convert；pitch 自由区走 dspitch 预测轮廓、已画处用户值覆盖。
-    RenderResult? Render(SynthesisSnapshot snapshot, IReadOnlyList<ILiveNote> origins,
+    RenderResult? Render(VoiceSnapshot snapshot, IReadOnlyList<IVoiceNote> origins,
         IProgress<double>? progress, CancellationToken cancellation)
     {
         var notes = snapshot.Notes;
@@ -335,12 +335,12 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         // —— 音素产物（按归属 note 键，只报标称时长 + 权重 + IsLead；定位 / 跨 note 去重叠 / melisma 归宿主，见 §5.7）——
         //   时长 = 解析出的 EndTime − StartTime（核含 melisma 填充量、辅音为固定长）；权重核 1 / 辅音 0；IsLead 随解析带出。
         //   归属：p.NoteIndex 对齐 snapshot.Notes，故以 origins[NoteIndex] 为键回指活 note（仅作身份 token）。
-        var byNote = new Dictionary<int, List<SynthesisPhoneme>>();
+        var byNote = new Dictionary<int, List<VoicePhoneme>>();
         foreach (var p in phones)
         {
             if (!byNote.TryGetValue(p.NoteIndex, out var list))
-                byNote[p.NoteIndex] = list = new List<SynthesisPhoneme>();
-            list.Add(new SynthesisPhoneme
+                byNote[p.NoteIndex] = list = new List<VoicePhoneme>();
+            list.Add(new VoicePhoneme
             {
                 Symbol = p.Symbol,
                 Duration = Math.Max(0, p.EndTime - p.StartTime),
@@ -348,7 +348,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
                 IsLead = p.IsLead,
             });
         }
-        var phonemes = new Map<ILiveNote, IReadOnlyList<SynthesisPhoneme>>();
+        var phonemes = new Map<IVoiceNote, IReadOnlyList<VoicePhoneme>>();
         foreach (var kvp in byNote)
             phonemes.Add(origins[kvp.Key], kvp.Value);
 
@@ -356,7 +356,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
     }
 
     // 无 dur 预测器兜底：每 note 一元音、占满 note 时长（无对齐/无 head/tail 之外的处理）。
-    static List<PhonemeSpan> FallbackPhonemes(VoiceModels models, IReadOnlyList<SynthesisNoteSnapshot> notes, string[] noteLang)
+    static List<PhonemeSpan> FallbackPhonemes(VoiceModels models, IReadOnlyList<VoiceNoteSnapshot> notes, string[] noteLang)
     {
         var result = new List<PhonemeSpan>(notes.Count);
         for (int i = 0; i < notes.Count; i++)
@@ -392,7 +392,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
 
     // 纯用户曲线 → 帧级声学输入：按帧求值用户轨（无轨 / NaN 自由区 → 中性），逐帧 convert。
     //   不 clamp（OpenUtau 亦不 clamp，连续轨的 UI 量程已界定取值范围）。
-    static float[] BuildCurveInput(SynthesisSnapshot snapshot, string key, double neutral,
+    static float[] BuildCurveInput(VoiceSnapshot snapshot, string key, double neutral,
         Func<double, double> convert, double[] frameTimes, int n)
     {
         double[]? user = snapshot.TryGetAutomation(key, out var auto)
@@ -475,11 +475,11 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
 
     // 合成音素（按归属 note 键）：各已合成 piece 的 note→音素组并入一张 map（块间 note 不相交，直接并）；
     //   只报 Symbol / Duration / StretchWeight / IsLead——定位 / 去重叠 / melisma 归宿主（见 §5.7）。失败 / 未合成块不报。
-    public IReadOnlyMap<ILiveNote, IReadOnlyList<SynthesisPhoneme>> SynthesizedPhonemes
+    public IReadOnlyMap<IVoiceNote, IReadOnlyList<VoicePhoneme>> SynthesizedPhonemes
     {
         get
         {
-            var result = new Map<ILiveNote, IReadOnlyList<SynthesisPhoneme>>();
+            var result = new Map<IVoiceNote, IReadOnlyList<VoicePhoneme>>();
             foreach (var piece in mPieces)
             {
                 if (piece.Failed || piece.Segment == null)
@@ -551,14 +551,14 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
     {
         mNeedResegment = false;
 
-        var groups = new List<List<ILiveNote>>();
-        List<ILiveNote>? current = null;
+        var groups = new List<List<IVoiceNote>>();
+        List<IVoiceNote>? current = null;
         double groupMaxEnd = 0;
         foreach (var note in mContext.Notes)
         {
             if (current == null || note.StartTime.Value > groupMaxEnd)
             {
-                current = new List<ILiveNote>();
+                current = new List<IVoiceNote>();
                 groups.Add(current);
                 groupMaxEnd = note.EndTime.Value;
             }
@@ -601,7 +601,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         NotifyProducts();
     }
 
-    void SubscribeNote(ILiveNote note)
+    void SubscribeNote(IVoiceNote note)
     {
         void Handler()
         {
@@ -618,7 +618,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         note.Properties.Modified += Handler;
     }
 
-    void UnsubscribeNote(ILiveNote note)
+    void UnsubscribeNote(IVoiceNote note)
     {
         if (!mNoteHandlers.Remove(note, out var handler))
             return;
@@ -630,7 +630,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         note.Properties.Modified -= handler;
     }
 
-    void OnNotesStructureChanged(ILiveNote note) => mNeedResegment = true;
+    void OnNotesStructureChanged(IVoiceNote note) => mNeedResegment = true;
 
     void MarkAllDirtyAndResegment()
     {
@@ -682,12 +682,12 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
     }
 
     sealed record RenderResult(float[] Audio, double StartTime, int SampleRate,
-        IReadOnlyMap<ILiveNote, IReadOnlyList<SynthesisPhoneme>> Phonemes, List<Point> PitchReadback,
+        IReadOnlyMap<IVoiceNote, IReadOnlyList<VoicePhoneme>> Phonemes, List<Point> PitchReadback,
         Dictionary<string, IReadOnlyList<Point>> VarianceReadback);
 
     sealed class Piece
     {
-        public required IReadOnlyList<ILiveNote> Notes;
+        public required IReadOnlyList<IVoiceNote> Notes;
         public double StartTime;
         public double EndTime;
         public bool Dirty;
@@ -696,7 +696,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         public string? Error;
         public double Progress;
         public IAudioSegment? Segment;
-        public IReadOnlyMap<ILiveNote, IReadOnlyList<SynthesisPhoneme>> Phonemes = new Map<ILiveNote, IReadOnlyList<SynthesisPhoneme>>();
+        public IReadOnlyMap<IVoiceNote, IReadOnlyList<VoicePhoneme>> Phonemes = new Map<IVoiceNote, IReadOnlyList<VoicePhoneme>>();
         public IReadOnlyList<Point> PitchReadback = [];
         public IReadOnlyDictionary<string, IReadOnlyList<Point>> VarianceReadback = new Dictionary<string, IReadOnlyList<Point>>();
     }
