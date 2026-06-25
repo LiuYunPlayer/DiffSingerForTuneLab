@@ -10,7 +10,8 @@ using YamlDotNet.Serialization;
 namespace DiffSingerForTuneLab;
 
 // 引擎级模型缓存：按 voiceId 缓存声学模型束、按声码器名共享声码器会话。
-//   · 懒加载（首次合成时按需载入）、加锁串行化首载，ORT 的 Run 并发安全故载入后多会话共享同一会话；
+//   · 懒加载（首次合成时按需载入）、加锁串行化首载；载入后多会话共享同一会话，但 DirectML EP 的 Run
+//     是设备级不可并发（跨会话亦然），故所有推理 Run 进程级全局串行（见 DiffSingerTensorCache.Run）；
 //   · 执行设备由引擎设置决定：directml 失败（无 DX12/驱动）回退 CPU，回退在每个模型载入时判定并落地；
 //   · provider 变更 → 引擎弃旧缓存建新缓存（旧缓存 Dispose 释放原生会话）。
 // 原生 onnxruntime/DirectML 库随包进本插件 ALC（见 csproj 注释）；首次构造 InferenceSession 即触发原生加载，

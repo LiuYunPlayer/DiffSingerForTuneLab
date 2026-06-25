@@ -47,6 +47,20 @@ public sealed class DiffSingerTensorCache
 
     // —— 编排封装 ——
 
+    // 推理串行化锁（进程级单锁）：DirectML EP 下 InferenceSession.Run() 不可并发——约束是设备级的，
+    //   不仅同一会话，同一 GPU 上不同会话并发 Run 也会崩/出错。宿主会为每条 part 各开合成会话，
+    //   且多会话经引擎级缓存共享声学/声码器会话，故必须跨会话全局串行（按会话实例上锁挡不住跨 voiceId 的并发）。
+    //   CPU EP 虽线程安全，但单次 Run 已用满 intra-op 线程池，并发 Run 只会过订阅线程；全局串行对其亦中性偏好，
+    //   换取「无论 provider / 会话数 / 模型束都正确」的简单性。锁只罩 Run 本身，缓存 Load/Save 等磁盘 IO 在锁外。
+    static readonly object sRunLock = new();
+
+    static IDisposableReadOnlyCollection<DisposableNamedOnnxValue> RunSerialized(
+        InferenceSession model, IReadOnlyCollection<NamedOnnxValue> inputs)
+    {
+        lock (sRunLock)
+            return model.Run(inputs);
+    }
+
     // 跑一个模型并经缓存：命中直接返回缓存输出；未命中则 Run + Save。返回的张量均为托管 DenseTensor（脱离原生内存，可在调用处延后读取）。
     //   enabled=false 时跳过磁盘缓存，但仍把原生输出深拷为托管返回（调用方约定可在 Run 作用域外读取输出）。
     public static IReadOnlyList<NamedOnnxValue> Run(
@@ -54,7 +68,7 @@ public sealed class DiffSingerTensorCache
     {
         if (!enabled)
         {
-            using var raw = model.Run(inputs);
+            using var raw = RunSerialized(model, inputs);
             return Clone(raw);
         }
 
@@ -63,7 +77,7 @@ public sealed class DiffSingerTensorCache
         if (loaded != null)
             return loaded;
 
-        using var run = model.Run(inputs);
+        using var run = RunSerialized(model, inputs);
         var result = Clone(run);   // 先脱离原生内存，再落盘（Save 读托管张量即可）
         cache.Save(result);
         return result;
