@@ -148,7 +148,8 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         finally
         {
             piece.Synthesizing = false;
-            StatusChanged?.Invoke();
+            // 块完成（产物写入）/ 失败（从产物中排除）→ 音素 / 参数 / 音高产物变化，连同状态一并通知。
+            NotifyProducts();
         }
     }
 
@@ -331,15 +332,25 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         var audio = wavOut.First(v => v.Name == "waveform").AsTensor<float>().ToArray();
         progress?.Report(1.0);
 
-        // —— 音素产物（绝对秒、韵核吸收伸缩）——
-        var phonemes = phones.Select(p => new SynthesizedPhoneme
+        // —— 音素产物（按归属 note 键，只报标称时长 + 权重 + IsLead；定位 / 跨 note 去重叠 / melisma 归宿主，见 §5.7）——
+        //   时长 = 解析出的 EndTime − StartTime（核含 melisma 填充量、辅音为固定长）；权重核 1 / 辅音 0；IsLead 随解析带出。
+        //   归属：p.NoteIndex 对齐 snapshot.Notes，故以 origins[NoteIndex] 为键回指活 note（仅作身份 token）。
+        var byNote = new Dictionary<int, List<SynthesisPhoneme>>();
+        foreach (var p in phones)
         {
-            Symbol = p.Symbol,
-            StartTime = p.StartTime,
-            EndTime = p.EndTime,
-            Note = origins[p.NoteIndex],
-            StretchWeight = p.IsVowel ? 1 : 0,
-        }).ToList();
+            if (!byNote.TryGetValue(p.NoteIndex, out var list))
+                byNote[p.NoteIndex] = list = new List<SynthesisPhoneme>();
+            list.Add(new SynthesisPhoneme
+            {
+                Symbol = p.Symbol,
+                Duration = Math.Max(0, p.EndTime - p.StartTime),
+                StretchWeight = p.IsVowel ? 1 : 0,
+                IsLead = p.IsLead,
+            });
+        }
+        var phonemes = new Map<ILiveNote, IReadOnlyList<SynthesisPhoneme>>();
+        foreach (var kvp in byNote)
+            phonemes.Add(origins[kvp.Key], kvp.Value);
 
         return new RenderResult(audio, renderStart, sr, phonemes, pitchReadback, varReadback);
     }
@@ -430,8 +441,18 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
     }
 
     // —— 产物（数据线程发布、可跨线程读）——
-    public IReadOnlyList<IReadOnlyList<Point>> SynthesizedPitch
-        => mPieces.Where(p => p.PitchReadback.Count > 0).Select(p => p.PitchReadback).ToList();
+    // 合成音高（具名富类型）：各已合成 piece 的逐帧回显聚为分段折线（每 piece 一段、段间断开）；失败 / 未合成块不报。
+    public SynthesizedPitch SynthesizedPitch
+    {
+        get
+        {
+            var segments = new List<IReadOnlyList<Point>>();
+            foreach (var piece in mPieces)
+                if (!piece.Failed && piece.Segment != null && piece.PitchReadback.Count > 0)
+                    segments.Add(piece.PitchReadback);
+            return new SynthesizedPitch { Segments = segments };
+        }
+    }
 
     // 回显产物（数据线程发布、可跨线程读）：按声明的回显轨 key 聚合各 piece 的纯预测段（每 piece 一段、段间断开）。
     public IReadOnlyMap<string, SynthesizedParameter> SynthesizedParameters
@@ -452,8 +473,23 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         }
     }
 
-    public IReadOnlyList<SynthesizedPhoneme> Phonemes
-        => mPieces.SelectMany(p => p.Phonemes).ToList();
+    // 合成音素（按归属 note 键）：各已合成 piece 的 note→音素组并入一张 map（块间 note 不相交，直接并）；
+    //   只报 Symbol / Duration / StretchWeight / IsLead——定位 / 去重叠 / melisma 归宿主（见 §5.7）。失败 / 未合成块不报。
+    public IReadOnlyMap<ILiveNote, IReadOnlyList<SynthesisPhoneme>> SynthesizedPhonemes
+    {
+        get
+        {
+            var result = new Map<ILiveNote, IReadOnlyList<SynthesisPhoneme>>();
+            foreach (var piece in mPieces)
+            {
+                if (piece.Failed || piece.Segment == null)
+                    continue;
+                foreach (var kvp in piece.Phonemes)
+                    result.Add(kvp.Key, kvp.Value);
+            }
+            return result;
+        }
+    }
 
     public IReadOnlyList<SynthesisStatusSegment> GetStatus()
     {
@@ -476,7 +512,20 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         return result;
     }
 
+    // 更新信号按产物分离（SDK 契约）。本会话的产物三者同源——piece 完成 / 失败 / 重分块时一起变，故 NotifyProducts 一并 fire；
+    //   高频的进度（StatusChanged，逐 tick）单独 fire、不带动产物重读。
+    public event Action? SynthesizedPhonemesChanged;
+    public event Action? SynthesizedParametersChanged;
+    public event Action? SynthesizedPitchChanged;
     public event Action? StatusChanged;
+
+    void NotifyProducts()
+    {
+        SynthesizedPhonemesChanged?.Invoke();
+        SynthesizedParametersChanged?.Invoke();
+        SynthesizedPitchChanged?.Invoke();
+        StatusChanged?.Invoke();
+    }
 
     public void Dispose()
     {
@@ -548,7 +597,8 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
             piece.Segment?.Dispose();
         mPieces.Clear();
         mPieces.AddRange(newPieces);
-        StatusChanged?.Invoke();
+        // 重分块：块集合 / 脏态变 → 产物报告随之变化（旧块的音素 / 回显可能不再在新块集中）。
+        NotifyProducts();
     }
 
     void SubscribeNote(ILiveNote note)
@@ -632,7 +682,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
     }
 
     sealed record RenderResult(float[] Audio, double StartTime, int SampleRate,
-        List<SynthesizedPhoneme> Phonemes, List<Point> PitchReadback,
+        IReadOnlyMap<ILiveNote, IReadOnlyList<SynthesisPhoneme>> Phonemes, List<Point> PitchReadback,
         Dictionary<string, IReadOnlyList<Point>> VarianceReadback);
 
     sealed class Piece
@@ -646,7 +696,7 @@ public sealed class DiffSingerSynthesisSession : ISynthesisSession
         public string? Error;
         public double Progress;
         public IAudioSegment? Segment;
-        public IReadOnlyList<SynthesizedPhoneme> Phonemes = [];
+        public IReadOnlyMap<ILiveNote, IReadOnlyList<SynthesisPhoneme>> Phonemes = new Map<ILiveNote, IReadOnlyList<SynthesisPhoneme>>();
         public IReadOnlyList<Point> PitchReadback = [];
         public IReadOnlyDictionary<string, IReadOnlyList<Point>> VarianceReadback = new Dictionary<string, IReadOnlyList<Point>>();
     }

@@ -7,8 +7,9 @@ using TuneLab.SDK;
 
 namespace DiffSingerForTuneLab;
 
-// 一个音素的解析结果（绝对秒、归属 note、是否韵核）。时间可越界 note（前置辅音落在 note 起点之前）。
-public readonly record struct PhonemeSpan(string Symbol, double StartTime, double EndTime, int NoteIndex, bool IsVowel);
+// 一个音素的解析结果（绝对秒、归属 note、是否韵核、是否前置辅音）。时间可越界 note（前置辅音落在 note 起点之前）。
+//   IsLead：音节核之前的引导辅音（onset），由 ProcessWord 的前置组判定；产物按时长模型回报时随之带出（§5.7）。
+public readonly record struct PhonemeSpan(string Symbol, double StartTime, double EndTime, int NoteIndex, bool IsVowel, bool IsLead = false);
 
 // DiffSinger phonemizer：歌词 → 音素时间线。忠实移植 OpenUtau DiffSingerBasePhonemizer.ProcessPart：
 //   · 短语首加前导 SP 组 + 500ms padding（给首辅音留空间），尾加哨兵；
@@ -49,6 +50,7 @@ public static class DiffSingerPhonemizer
         groups[0].Phonemes.Add(Pause);
         var notePhIndex = new List<int> { 1 };          // 各 note 在展平序列中的起始下标（含前导 SP 占 0）
         var noteSymbolCount = new int[notes.Count];     // 每 note 的音素数（onset+韵核）
+        var leadCounts = new int[notes.Count];          // 每 note 的前置辅音数（ProcessWord 的前置组大小）：定 IsLead
         var pinned = new bool[notes.Count];
 
         for (int i = 0; i < notes.Count; i++)
@@ -69,6 +71,7 @@ public static class DiffSingerPhonemizer
             noteSymbolCount[i] = symbols.Length;
 
             var wordGroups = ProcessWord(dur, note, symbols);
+            leadCounts[i] = wordGroups[0].Phonemes.Count;           // 前置辅音（onset）数：归本 note，标 IsLead
             groups[^1].Phonemes.AddRange(wordGroups[0].Phonemes);   // 前置辅音并入前一组（侵入前一 note 尾）
             groups.AddRange(wordGroups.Skip(1));                    // 韵核组（起点=note 起点）
             notePhIndex.Add(notePhIndex[^1] + symbols.Length);
@@ -119,28 +122,81 @@ public static class DiffSingerPhonemizer
             double start = positions[b];
             double end = b + 1 < bodyCount ? positions[b + 1] : last.EndTime;
             int noteIndex = NoteOf(notePhIndex, flatIndex);
+            // IsLead：本 note 内位序落在前置组（前 leadCounts[noteIndex] 个）即引导辅音。
+            bool isLead = flatIndex - notePhIndex[noteIndex] < leadCounts[noteIndex];
             string sym = flatSymbols[flatIndex];
-            result.Add(new PhonemeSpan(sym, start, end, noteIndex, dur.IsVowel(sym)));
+            result.Add(new PhonemeSpan(sym, start, end, noteIndex, dur.IsVowel(sym), isLead));
         }
 
-        // —— 钉死 note：用相对偏移覆盖（§5.7）——
+        // —— 钉死 note：时长模型布局覆盖（§5.7）——
+        // 用户钉死的是「时长 + 权重 + IsLead」（无绝对位置），故按宿主同一布局规则解析为真实时序：
+        //   核起点 = 音符头；前置(IsLead)从核起点往左累积固定时长；核(w>0)填充到组末、后辅音(w=0)占组末固定时长。
+        //   组末 = 自然对齐下本 note 末音素终点（= 下一组起点 / 末 note 终点），保证与相邻自由 note 的对齐衔接不变。
         for (int i = 0; i < notes.Count; i++)
         {
             if (!pinned[i]) continue;
             var note = notes[i];
+            var ph = note.Phonemes;
             int baseIdx = notePhIndex[i] - 1;   // body 下标（flat-1）
-            for (int j = 0; j < note.Phonemes.Count && baseIdx + j < result.Count; j++)
+            int count = noteSymbolCount[i];
+            if (count <= 0 || baseIdx < 0 || baseIdx >= result.Count) continue;
+            int lastIdx = Math.Min(baseIdx + count - 1, result.Count - 1);
+            double groupEndRel = Math.Max(0, result[lastIdx].EndTime - note.StartTime);
+
+            var layout = LayoutPinned(ph, groupEndRel);
+            for (int j = 0; j < ph.Count && j < count && baseIdx + j < result.Count; j++)
             {
-                var p = note.Phonemes[j];
                 var span = result[baseIdx + j];
                 result[baseIdx + j] = span with
                 {
-                    StartTime = note.StartTime + p.StartTime,
-                    EndTime = note.StartTime + p.EndTime,
+                    StartTime = note.StartTime + layout[j].Start,
+                    EndTime = note.StartTime + layout[j].End,
+                    IsLead = ph[j].IsLead,
                 };
             }
         }
         return result;
+    }
+
+    // 钉死音素（SynthesisPhoneme：时长 / 权重 / IsLead）→ 相对 note 起点的秒偏移（核起点=0）。
+    //   前置(IsLead)：从 0 往左依次累积各自固定时长。
+    //   非前置：核(w>0)分摊填充空间（= groupEndRel − Σ后辅音固定时长），后辅音(w=0)占其固定时长，从 0 往右依次铺。
+    //   Σ核权重 ≤ 0 时核取 0 长（退化，无除零）；负时长按 0 处理。
+    static (double Start, double End)[] LayoutPinned(IReadOnlyList<SynthesisPhoneme> ph, double groupEndRel)
+    {
+        int n = ph.Count;
+        var rel = new (double Start, double End)[n];
+
+        double totalLead = 0;
+        for (int i = 0; i < n; i++) if (ph[i].IsLead) totalLead += Math.Max(0, ph[i].Duration);
+        double pos = -totalLead;
+        for (int i = 0; i < n; i++)
+        {
+            if (!ph[i].IsLead) continue;
+            double d = Math.Max(0, ph[i].Duration);
+            rel[i] = (pos, pos + d);
+            pos += d;
+        }
+
+        double totalTrail = 0, totalCoreWeight = 0;
+        for (int i = 0; i < n; i++)
+            if (!ph[i].IsLead)
+            {
+                if (ph[i].StretchWeight > 0) totalCoreWeight += ph[i].StretchWeight;
+                else totalTrail += Math.Max(0, ph[i].Duration);
+            }
+        double fill = Math.Max(0, groupEndRel - totalTrail);
+        pos = 0;
+        for (int i = 0; i < n; i++)
+        {
+            if (ph[i].IsLead) continue;
+            double d = ph[i].StretchWeight > 0
+                ? (totalCoreWeight > 0 ? fill * ph[i].StretchWeight / totalCoreWeight : 0)
+                : Math.Max(0, ph[i].Duration);
+            rel[i] = (pos, pos + d);
+            pos += d;
+        }
+        return rel;
     }
 
     // 单 note 的音素→组分配：元音起拍（consonant-glide-vowel：滑音起拍）；前置辅音落在 wordGroups[0]（归前组）。
