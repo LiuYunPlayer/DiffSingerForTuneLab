@@ -40,16 +40,21 @@ public static class DiffSingerVariance
         var tokens = symbols.Select(s => (long)v.PhonemeToken(s)).Prepend((long)v.PhonemeToken("SP"))
             .Append((long)v.PhonemeToken("SP")).ToArray();
         var langs = symbols.Select(s => v.LangId(PhonemeLanguage(s))).Prepend(0L).Append(0L).ToArray();
-        var isVowel = symbols.Select(v.IsVowel).ToArray();
-
-        // —— linguistic（词模式）——
-        var (wordDiv, wordDur) = DiffSingerFrames.PaddedWordDivAndDur(isVowel, phDur);
-        var lingInputs = new List<NamedOnnxValue>
+        // —— linguistic（词模式吃 word_div/word_dur，否则音素模式吃 ph_dur；同 dspitch 按编码器实际输入判）——
+        //   variance 的编码器模式随 dsconfig.predict_dur：true=词模式、false=音素模式（ph_dur 已知）；
+        //   忠实对齐 OpenUtau DiffSingerVariance，且与本插件 dspitch 路径同构。
+        var lingInputs = new List<NamedOnnxValue> { NvL("tokens", tokens, nTokens) };
+        if (v.LinguisticUsesWordBoundary)
         {
-            NvL("tokens", tokens, nTokens),
-            NvL("word_div", wordDiv, wordDiv.Length),
-            NvL("word_dur", wordDur, wordDur.Length),
-        };
+            var isVowel = symbols.Select(v.IsVowel).ToArray();
+            var (wordDiv, wordDur) = DiffSingerFrames.PaddedWordDivAndDur(isVowel, phDur);
+            lingInputs.Add(NvL("word_div", wordDiv, wordDiv.Length));
+            lingInputs.Add(NvL("word_dur", wordDur, wordDur.Length));
+        }
+        else
+        {
+            lingInputs.Add(NvL("ph_dur", phDur.Select(x => (long)x).ToArray(), nTokens));
+        }
         if (v.Linguistic.InputMetadata.ContainsKey("languages"))
             lingInputs.Add(NvL("languages", langs, nTokens));
         var lingOut = DiffSingerTensorCache.Run(v.Linguistic, v.LinguisticHash, lingInputs, tensorCache);
