@@ -17,7 +17,7 @@ public readonly record struct PhonemeSpan(string Symbol, double StartTime, doubl
 //   · word_div=各组音素数、word_dur=相邻组（note 起点）间帧数 → linguistic(词模式) + dur → 每音素标称帧。
 // 最终定位不再自己做对齐 / 钉死布局：把每发声 note 的标称音素（钉死值或 dur 预测）+ 几何（核起点 / FillEnd）
 // 交宿主 SDK 的 VoicePhonemeLayout.Resolve 统一派生 + 跨 note 去重叠——与宿主显示同源（WYSIWYG），钉死长辅音
-// 越界自动压缩。在 TuneLab 绝对秒域工作（note 边界即秒）。延音符由宿主 VoiceNoteSnapshot.IsContinuation 标志判定。
+// 越界自动压缩。在 TuneLab 绝对秒域工作（note 边界即秒）。延音符由宿主 VoiceSynthesisNoteSnapshot.IsContinuation 标志判定。
 public static class DiffSingerPhonemizer
 {
     const string Pause = "SP";
@@ -32,7 +32,7 @@ public static class DiffSingerPhonemizer
     }
 
     public static List<PhonemeSpan> Phonemize(
-        DiffSingerPredictor dur, IReadOnlyList<VoiceNoteSnapshot> notes,
+        DiffSingerPredictor dur, IReadOnlyList<VoiceSynthesisNoteSnapshot> notes,
         IReadOnlyList<string> noteLang, string speaker, int hop, int sampleRate, bool tensorCache)
     {
         if (notes.Count == 0)
@@ -141,7 +141,7 @@ public static class DiffSingerPhonemizer
     }
 
     // 下一发声 note（noteSymbolCount>0）的起点；跨延音符 / 空隙；无则末 note 满末。作核(元音)填充终点 FillEnd。
-    static double NextSoundingStart(IReadOnlyList<VoiceNoteSnapshot> notes, int[] noteSymbolCount, int i)
+    static double NextSoundingStart(IReadOnlyList<VoiceSynthesisNoteSnapshot> notes, int[] noteSymbolCount, int i)
     {
         for (int j = i + 1; j < notes.Count; j++)
             if (noteSymbolCount[j] > 0)
@@ -150,7 +150,7 @@ public static class DiffSingerPhonemizer
     }
 
     // 单 note 的音素→组分配：元音起拍（consonant-glide-vowel：滑音起拍）；前置辅音落在 wordGroups[0]（归前组）。
-    static List<Group> ProcessWord(DiffSingerPredictor dur, VoiceNoteSnapshot note, string[] symbols)
+    static List<Group> ProcessWord(DiffSingerPredictor dur, VoiceSynthesisNoteSnapshot note, string[] symbols)
     {
         var wordGroups = new List<Group> { new(-1, note.Pitch) };
         var isVowel = symbols.Select(dur.IsVowel).ToArray();
@@ -176,7 +176,7 @@ public static class DiffSingerPhonemizer
     }
 
     // 取音素符号串：钉死=用 note.Phonemes 符号；否则 G2P。过滤到「类型已定义 且 dur 表可 tokenize」；空则 [SP]。
-    static string[] GetSymbols(DiffSingerPredictor dur, VoiceNoteSnapshot note, string lang, out bool pinned)
+    static string[] GetSymbols(DiffSingerPredictor dur, VoiceSynthesisNoteSnapshot note, string lang, out bool pinned)
     {
         pinned = note.Phonemes.Count > 0;
         IEnumerable<string> raw = pinned

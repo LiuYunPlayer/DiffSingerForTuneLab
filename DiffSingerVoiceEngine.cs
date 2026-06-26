@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using TuneLab.Foundation;
 using TuneLab.SDK;
 
@@ -12,7 +13,7 @@ namespace DiffSingerForTuneLab;
 //   - 扫描声库目录、缓存为 VoiceSourceInfos（get 仅返缓存、不阻塞，扫描在 Init/ApplySettings 期做）；
 //   - 为每条 part 建一个合成会话（会话承载分块/失效/产物管线，后续实现）。
 // 声库以原生 DiffSinger 目录形态存在、与本插件版本解耦：插件不打包声库，只按结构特征扫描发现。
-public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
+public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSettings
 {
     const string KeyVoicebankDirs = "voicebank_dirs";
     const string KeyExecutionProvider = "execution_provider";
@@ -34,8 +35,10 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
         mModelCache = null;
     }
 
-    public IVoiceSession CreateSession(string voiceId, IVoiceContext context)
+    public IVoiceSynthesisSession CreateSession(IVoiceSynthesisContext context)
     {
+        // voiceId 已并入 context（换声库 = 宿主重建 context + 会话），不再单列。
+        var voiceId = context.VoiceId;
         if (!mState.Banks.ContainsKey(voiceId))
             throw new ArgumentException($"未知声库 voiceId: {voiceId}");
 
@@ -48,19 +51,44 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
             samplingSteps, tensorCache, cacheMaxSizeMb);
     }
 
-    // —— 声明（引擎层、纯函数 of (voiceId, part 值)；宿主在每次 part 参数 commit 时按当前值重算 diff 到 UI）——
-    //   据 context.VoiceId 取声库能力集，委托 DiffSingerDeclarations 建轨/面板。未知声库 → 空声明（不抛，见接口契约）。
-    public IReadOnlyOrderedMap<PropertyKey, AutomationConfig> GetAutomationConfigs(IVoicePartPropertyContext context)
-        => ConfigFor(context.VoiceId) is { } c ? DiffSingerDeclarations.BuildAutomationConfigs(c, context.PartProperties.Merge()) : EmptyAutomations;
+    // —— 声明（引擎层、纯函数 of (part 声库 + part 值)；宿主在每次 part 参数 commit 时按当前值重算 diff 到 UI）——
+    //   多选 part 跨声库的契约：只暴露所有选中 part 的声库**共有**的 config 项（按 key 取交集）——schema 层的三态合并，
+    //   等价于属性值 .Merge() 在 schema 维度的对应物。单选即退化为该库全量；无选中 / 全未知声库 → 空声明（不抛，见接口契约）。
+    //   属性值仍按全 part 三态合并喂给逐库声明（Merge）；交集项的 value 取首库（DiffSinger 轨规格 Min/Max/Color 是
+    //   DiffSingerDeclarations 常量、跨库同值，取首库无歧义）。
+    public IReadOnlyOrderedMap<PropertyKey, AutomationConfig> GetAutomationConfigs(IVoiceSynthesisPartPropertyContext context)
+    {
+        var merged = context.Parts.Select(p => p.PartProperties).Merge();
+        return CommonItems(SelectedConfigs(context).Select(c => (IReadOnlyOrderedMap<PropertyKey, AutomationConfig>)DiffSingerDeclarations.BuildAutomationConfigs(c, merged)));
+    }
 
-    public IReadOnlyOrderedMap<PropertyKey, AutomationConfig> GetSynthesizedParameterConfigs(IVoicePartPropertyContext context)
-        => ConfigFor(context.VoiceId) is { } c ? DiffSingerDeclarations.BuildReadbackConfigs(c) : EmptyAutomations;
+    public IReadOnlyOrderedMap<PropertyKey, AutomationConfig> GetSynthesizedParameterConfigs(IVoiceSynthesisPartPropertyContext context)
+        => CommonItems(SelectedConfigs(context).Select(c => (IReadOnlyOrderedMap<PropertyKey, AutomationConfig>)DiffSingerDeclarations.BuildReadbackConfigs(c)));
 
-    public ObjectConfig GetPartPropertyConfig(IVoicePartPropertyContext context)
-        => ConfigFor(context.VoiceId) is { } c ? DiffSingerDeclarations.BuildPartConfig(c, context) : EmptyConfig;
+    public ObjectConfig GetPartPropertyConfig(IVoiceSynthesisPartPropertyContext context)
+        => new() { Properties = CommonItems(SelectedConfigs(context).Select(c => DiffSingerDeclarations.BuildPartConfig(c, context).Properties)) };
 
-    public ObjectConfig GetNotePropertyConfig(IVoiceNotePropertyContext context)
-        => ConfigFor(context.VoiceId) is { } c ? DiffSingerDeclarations.BuildNoteConfig(c, context) : EmptyConfig;
+    // note 级声明壳是单 part（context.Part），无跨库交集；按该 part 声库出 schema。
+    public ObjectConfig GetNotePropertyConfig(IVoiceSynthesisNotePropertyContext context)
+        => ConfigFor(context.Part.VoiceId) is { } c ? DiffSingerDeclarations.BuildNoteConfig(c, context) : EmptyConfig;
+
+    // 选中 part 去重后的已知声库集（未知 voiceId 过滤掉）：逐库出声明、再取交集。
+    IEnumerable<VoicebankConfig> SelectedConfigs(IVoiceSynthesisPartPropertyContext context)
+        => context.Parts.Select(p => ConfigFor(p.VoiceId)).OfType<VoicebankConfig>();
+
+    // 按 key 取多张有序 map 的交集（只保留每张都含的键，顺序与 value 取首张）：跨声库声明的"共有项"。
+    //   零张（无选中 part）→ 空 map。
+    static OrderedMap<PropertyKey, T> CommonItems<T>(IEnumerable<IReadOnlyOrderedMap<PropertyKey, T>> maps)
+    {
+        var list = maps.ToList();
+        var result = new OrderedMap<PropertyKey, T>();
+        if (list.Count == 0)
+            return result;
+        foreach (var kvp in list[0])
+            if (list.All(m => m.ContainsKey(kvp.Key)))
+                result.Add(kvp.Key, kvp.Value);
+        return result;
+    }
 
     // 声库能力集按 voiceId 缓存（声明每次 commit 都调，避免重复解析 dsconfig）；config 随声库不可变，扫描重建时清空。
     VoicebankConfig? ConfigFor(string voiceId)
@@ -189,9 +217,8 @@ public sealed class DiffSingerVoiceEngine : IVoiceEngine, IExtensionSettings
 
     PropertyObject mSettings = PropertyObject.Empty;
 
-    // 声明缓存（声库能力集按 voiceId）与空声明兜底（未知声库 / 引擎未就绪时返回）。
+    // 声明缓存（声库能力集按 voiceId）与空声明兜底（note 级未知声库 / 引擎未就绪时返回）。
     readonly Dictionary<string, VoicebankConfig> mConfigCache = new(StringComparer.Ordinal);
-    static readonly OrderedMap<PropertyKey, AutomationConfig> EmptyAutomations = new();
     static readonly ObjectConfig EmptyConfig = new() { Properties = new OrderedMap<PropertyKey, IControllerConfig>() };
 
     // 引擎级模型缓存（跨会话共享、按 voiceId/声码器名缓存）；mProviderInUse 记当前缓存所用执行设备。

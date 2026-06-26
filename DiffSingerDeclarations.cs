@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using TuneLab.Foundation;
 using TuneLab.SDK;
 
@@ -8,9 +9,9 @@ namespace DiffSingerForTuneLab;
 
 // 声明面（声库能力集 VoicebankConfig 的纯函数）：自动化轨 / 回显轨 / part 面板 / note 面板。
 //   据 use_*_embed 暴露可编辑曲线、据 predict_* 暴露只读回显轨、据 speakers/languages 暴露 part/note 属性。
-// SDK 把声明上移到 IVoiceEngine（不依赖会话实例、宿主在「建会话之前」即填好 Voice.AutomationConfigs）：
-//   引擎据 context.VoiceId 取 config 调本类建声明；会话在运行时复用此处的轨 key 与 variance/gender/speed 规格
-//   （故规格集中在此、单一真相源）。见 IVoiceEngine 注释与 MidiPart 的 RefreshDeclarations→CreateSession 时序。
+// SDK 把声明上移到 IVoiceSynthesisEngine（不依赖会话实例、宿主在「建会话之前」即填好 Voice.AutomationConfigs）：
+//   引擎据声明上下文的 part 声库取 config 调本类建声明；会话在运行时复用此处的轨 key 与 variance/gender/speed 规格
+//   （故规格集中在此、单一真相源）。见 IVoiceSynthesisEngine 注释与 MidiPart 的 RefreshDeclarations→CreateSession 时序。
 public static class DiffSingerDeclarations
 {
     // 插件独立用户数据根：在 TuneLab 宿主目录之外（宿主目录只存宿主自己的数据，外来插件应有独立用户目录）。
@@ -113,7 +114,7 @@ public static class DiffSingerDeclarations
     }
 
     // part 级面板：多说话人暴露「主/兜底 speaker 选择 + 说话人混合容器」、多语言暴露 part 默认语言。
-    public static ObjectConfig BuildPartConfig(VoicebankConfig config, IVoicePartPropertyContext context)
+    public static ObjectConfig BuildPartConfig(VoicebankConfig config, IVoiceSynthesisPartPropertyContext context)
     {
         var properties = new OrderedMap<PropertyKey, IControllerConfig>();
 
@@ -126,7 +127,7 @@ public static class DiffSingerDeclarations
             });
             // 说话人混合：变长键控容器（ExtensibleObjectConfig）。用户从 + 菜单挑 speaker 加入（纯开关、空对象条目），
             //   加入即出现该 speaker 的 [0,100] 逐帧混合曲线、删除即消失——免一次平铺所有 speaker 的曲线。
-            properties.Add((KeyMix, L.Tr("Speaker mix")), BuildSpeakerMixConfig(config, context.PartProperties.Merge()));
+            properties.Add((KeyMix, L.Tr("Speaker mix")), BuildSpeakerMixConfig(config, context.Parts.Select(p => p.PartProperties).Merge()));
         }
 
         if (HasLanguageChoice(config))
@@ -157,12 +158,12 @@ public static class DiffSingerDeclarations
     static ObjectConfig EmptyEntry() => new() { Properties = new OrderedMap<PropertyKey, IControllerConfig>() };
 
     // note 级面板：多语言声库暴露 per-note 语言覆盖；默认值取 part 当前默认语言（依赖 part 值 ⇒ 逐次构建）。
-    public static ObjectConfig BuildNoteConfig(VoicebankConfig config, IVoiceNotePropertyContext context)
+    public static ObjectConfig BuildNoteConfig(VoicebankConfig config, IVoiceSynthesisNotePropertyContext context)
     {
         var properties = new OrderedMap<PropertyKey, IControllerConfig>();
         if (HasLanguageChoice(config))
         {
-            var partDefault = context.PartProperties.GetString(KeyLanguage, config.Languages[0]);
+            var partDefault = context.Part.PartProperties.GetString(KeyLanguage, config.Languages[0]);
             properties.Add((KeyLanguage, L.Tr("Language")), LanguageCombo(config, partDefault));
         }
         return new ObjectConfig { Properties = properties };

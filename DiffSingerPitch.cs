@@ -20,7 +20,7 @@ public static class DiffSingerPitch
     // renderStart = 渲染起点秒（phones[0].StartTime - head*frameSec）。返回逐帧 MIDI 音高（len=totalFrames），无预测器返回 null。
     public static float[]? Predict(
         DiffSingerPredictor? v, IReadOnlyList<PhonemeSpan> phones,
-        IReadOnlyList<VoiceNoteSnapshot> notes, int[] phDur,
+        IReadOnlyList<VoiceSynthesisNoteSnapshot> notes, int[] phDur,
         double renderStart, double frameSec, DiffSingerSpeakerMix mix, VoicebankConfig cfg, int steps, bool tensorCache)
     {
         if (v is null || !v.HasModel("pitch") || phones.Count == 0 || notes.Count == 0)
@@ -107,7 +107,7 @@ public static class DiffSingerPitch
     //   同起点和弦退化为 dur=0 塌缩（排序长者在前先塌，短者存活）。
     static (float[] midi, int[] durFrames, bool[] rest) BuildNotes(
         DiffSingerPredictor v, IReadOnlyList<PhonemeSpan> phones,
-        IReadOnlyList<VoiceNoteSnapshot> notes,
+        IReadOnlyList<VoiceSynthesisNoteSnapshot> notes,
         double renderStart, double frameSec, int totalFrames, int head, int tail)
     {
         var durSec = new List<double>();
