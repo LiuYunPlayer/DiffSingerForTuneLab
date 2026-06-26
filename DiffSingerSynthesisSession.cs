@@ -335,20 +335,20 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         // —— 音素产物（按归属 note 键，只报标称时长 + 权重 + IsLead；定位 / 跨 note 去重叠 / melisma 归宿主，见 §5.7）——
         //   时长 = 解析出的 EndTime − StartTime（核含 melisma 填充量、辅音为固定长）；权重核 1 / 辅音 0；IsLead 随解析带出。
         //   归属：p.NoteIndex 对齐 snapshot.Notes，故以 origins[NoteIndex] 为键回指活 note（仅作身份 token）。
-        var byNote = new Dictionary<int, List<VoicePhoneme>>();
+        var byNote = new Dictionary<int, List<SynthesizedPhoneme>>();
         foreach (var p in phones)
         {
             if (!byNote.TryGetValue(p.NoteIndex, out var list))
-                byNote[p.NoteIndex] = list = new List<VoicePhoneme>();
-            list.Add(new VoicePhoneme
+                byNote[p.NoteIndex] = list = new List<SynthesizedPhoneme>();
+            list.Add(new SynthesizedPhoneme
             {
-                Symbol = p.Symbol,
+                Symbol = CleanSymbol(p.Symbol),   // 剥 lang/ 前缀：显示/钉死符号保持干净，语种走 per-phoneme 属性
                 Duration = Math.Max(0, p.EndTime - p.StartTime),
                 StretchWeight = p.IsVowel ? 1 : 0,
                 IsLead = p.IsLead,
             });
         }
-        var phonemes = new Map<IVoiceSynthesisNote, IReadOnlyList<VoicePhoneme>>();
+        var phonemes = new Map<IVoiceSynthesisNote, IReadOnlyList<SynthesizedPhoneme>>();
         foreach (var kvp in byNote)
             phonemes.Add(origins[kvp.Key], kvp.Value);
 
@@ -374,6 +374,13 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
     {
         int slash = phoneme.IndexOf('/');
         return slash > 0 ? phoneme[..slash] : string.Empty;
+    }
+
+    // 上报显示用：剥掉 lang/ 前缀（语种走 per-phoneme 属性，符号保持干净）。语言无关符号（SP/AP/cl…）无前缀、原样返回。
+    static string CleanSymbol(string symbol)
+    {
+        int slash = symbol.IndexOf('/');
+        return slash > 0 ? symbol[(slash + 1)..] : symbol;
     }
 
     // 预测 x 与用户值 y（UI 单位，NaN 自由区代入中性）按 OpenUtau delta 函数合成，clamp 到声学值域。
@@ -475,11 +482,11 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
 
     // 合成音素（按归属 note 键）：各已合成 piece 的 note→音素组并入一张 map（块间 note 不相交，直接并）；
     //   只报 Symbol / Duration / StretchWeight / IsLead——定位 / 去重叠 / melisma 归宿主（见 §5.7）。失败 / 未合成块不报。
-    public IReadOnlyMap<IVoiceSynthesisNote, IReadOnlyList<VoicePhoneme>> SynthesizedPhonemes
+    public IReadOnlyMap<IVoiceSynthesisNote, IReadOnlyList<SynthesizedPhoneme>> SynthesizedPhonemes
     {
         get
         {
-            var result = new Map<IVoiceSynthesisNote, IReadOnlyList<VoicePhoneme>>();
+            var result = new Map<IVoiceSynthesisNote, IReadOnlyList<SynthesizedPhoneme>>();
             foreach (var piece in mPieces)
             {
                 if (piece.Failed || piece.Segment == null)
@@ -682,7 +689,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
     }
 
     sealed record RenderResult(float[] Audio, double StartTime, int SampleRate,
-        IReadOnlyMap<IVoiceSynthesisNote, IReadOnlyList<VoicePhoneme>> Phonemes, List<Point> PitchReadback,
+        IReadOnlyMap<IVoiceSynthesisNote, IReadOnlyList<SynthesizedPhoneme>> Phonemes, List<Point> PitchReadback,
         Dictionary<string, IReadOnlyList<Point>> VarianceReadback);
 
     sealed class Piece
@@ -696,7 +703,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         public string? Error;
         public double Progress;
         public IAudioSegment? Segment;
-        public IReadOnlyMap<IVoiceSynthesisNote, IReadOnlyList<VoicePhoneme>> Phonemes = new Map<IVoiceSynthesisNote, IReadOnlyList<VoicePhoneme>>();
+        public IReadOnlyMap<IVoiceSynthesisNote, IReadOnlyList<SynthesizedPhoneme>> Phonemes = new Map<IVoiceSynthesisNote, IReadOnlyList<SynthesizedPhoneme>>();
         public IReadOnlyList<Point> PitchReadback = [];
         public IReadOnlyDictionary<string, IReadOnlyList<Point>> VarianceReadback = new Dictionary<string, IReadOnlyList<Point>>();
     }

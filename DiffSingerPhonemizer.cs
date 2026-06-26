@@ -16,7 +16,7 @@ public readonly record struct PhonemeSpan(string Symbol, double StartTime, doubl
 //   · 音素按元音对齐到 note 起点（consonant-glide-vowel 特例：滑音起拍）；onset 辅音归前一组、定 IsLead；
 //   · word_div=各组音素数、word_dur=相邻组（note 起点）间帧数 → linguistic(词模式) + dur → 每音素标称帧。
 // 最终定位不再自己做对齐 / 钉死布局：把每发声 note 的标称音素（钉死值或 dur 预测）+ 几何（核起点 / FillEnd）
-// 交宿主 SDK 的 VoicePhonemeLayout.Resolve 统一派生 + 跨 note 去重叠——与宿主显示同源（WYSIWYG），钉死长辅音
+// 交宿主 SDK 的 PhonemeLayout.Resolve 统一派生 + 跨 note 去重叠——与宿主显示同源（WYSIWYG），钉死长辅音
 // 越界自动压缩。在 TuneLab 绝对秒域工作（note 边界即秒）。延音符由宿主 VoiceSynthesisNoteSnapshot.IsContinuation 标志判定。
 public static class DiffSingerPhonemizer
 {
@@ -87,12 +87,12 @@ public static class DiffSingerPhonemizer
 
         var durationFrames = RunDur(dur, tokens, langs, wordDiv, wordDur, flatTone, speaker, tensorCache);
 
-        // —— 定位：每发声 note 物化为 VoicePhonemeLayoutNote，交 SDK 的 VoicePhonemeLayout.Resolve 统一派生 ——
+        // —— 定位：每发声 note 物化为 PhonemeLayoutNote，交 SDK 的 PhonemeLayout.Resolve 统一派生 ——
         //   核起点 = 音符头；标称音素 = 钉死值（note.Phonemes）或 dur 模型预测（自由 note）；权重核 1 / 辅音 0；
         //   FillEnd = 下一发声 note 起点（跨延音符 / 空隙）或末 note 满末——令元音铺到下一发声 note、音素帧时间线连续。
         //   Resolve 内部「核起点=音符头、前置往左累积、核填到 FillEnd」+ 跨 note 两阶去重叠（元音先让、辅音簇等比压），
         //   故钉死长辅音越界自动压缩、自由 / 钉死混排边界协同一致，且与宿主显示同源（WYSIWYG）。
-        var layoutNotes = new List<VoicePhonemeLayoutNote>();
+        var layoutNotes = new List<PhonemeLayoutNote>();
         var layoutNoteIndex = new List<int>();          // layoutNotes[ln] → snapshot note 下标
         for (int i = 0; i < notes.Count; i++)
         {
@@ -101,12 +101,12 @@ public static class DiffSingerPhonemizer
             int baseFlat = notePhIndex[i];
             var ph = notes[i].Phonemes;
             bool isPinned = pinned[i];
-            var items = new VoicePhoneme[count];
+            var items = new SynthesizedPhoneme[count];
             for (int k = 0; k < count; k++)
             {
                 string sym = flatSymbols[baseFlat + k];
                 bool usePin = isPinned && k < ph.Count;
-                items[k] = new VoicePhoneme
+                items[k] = new SynthesizedPhoneme
                 {
                     Symbol = sym,
                     Duration = usePin ? ph[k].Duration : durationFrames[baseFlat + k] * frameSec,
@@ -114,7 +114,7 @@ public static class DiffSingerPhonemizer
                     IsLead = usePin ? ph[k].IsLead : k < leadCounts[i],
                 };
             }
-            layoutNotes.Add(new VoicePhonemeLayoutNote
+            layoutNotes.Add(new PhonemeLayoutNote
             {
                 FillStart = notes[i].StartTime,
                 FillEnd = NextSoundingStart(notes, noteSymbolCount, i),
@@ -123,7 +123,7 @@ public static class DiffSingerPhonemizer
             layoutNoteIndex.Add(i);
         }
 
-        var resolved = VoicePhonemeLayout.Resolve(layoutNotes);
+        var resolved = PhonemeLayout.Resolve(layoutNotes);
 
         var result = new List<PhonemeSpan>(nTokens);
         for (int ln = 0; ln < layoutNotes.Count; ln++)
@@ -180,10 +180,23 @@ public static class DiffSingerPhonemizer
     {
         pinned = note.Phonemes.Count > 0;
         IEnumerable<string> raw = pinned
-            ? note.Phonemes.Select(p => p.Symbol)
+            ? note.Phonemes.Select(p => ResolvePinnedSymbol(dur, p, lang))
             : dur.G2P(note.Lyric ?? string.Empty, lang);
         var symbols = raw.Where(s => dur.IsKnownSymbol(s) && dur.TryPhoneme(s, out _)).ToArray();
         return symbols.Length > 0 ? symbols : new[] { Pause };
+    }
+
+    // 钉死音素符号还原：音素符号保持干净（无 lang/ 前缀），语种来自 per-phoneme「language」属性（空 = 跟随 note）。
+    //   忠实 OpenUtau ValidatePhoneme 次序：先试裸符号（命中语言无关符号如 SP/AP，或兼容历史带前缀数据），
+    //   再试 <lang>/<符号> 还原嵌入表键；都不中交由上层 IsKnownSymbol 过滤 / [SP] 兜底。
+    static string ResolvePinnedSymbol(DiffSingerPredictor dur, VoiceSynthesisPhonemeSnapshot ph, string noteLang)
+    {
+        var sym = ph.Symbol;
+        if (dur.TryPhoneme(sym, out _)) return sym;
+        var lang = ph.Properties.GetString(DiffSingerDeclarations.KeyLanguage, string.Empty);
+        if (string.IsNullOrEmpty(lang)) lang = noteLang;
+        var prefixed = $"{lang}/{sym}";
+        return dur.TryPhoneme(prefixed, out _) ? prefixed : sym;
     }
 
     static int FramesBetween(double t1, double t2, double frameSec)

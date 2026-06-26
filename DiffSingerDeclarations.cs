@@ -169,6 +169,28 @@ public static class DiffSingerDeclarations
         return new ObjectConfig { Properties = properties };
     }
 
+    // per-phoneme 属性面板（仅多语言声库）：每个钉死音素一个「语言」下拉，覆盖该音素的语种。
+    //   音素符号本身保持干净（无 lang/ 前缀）；语种走本属性，合成时按「语种 + 干净符号」还原嵌入表键。
+    //   默认空 = 跟随 note 语言（G2P 音素的语种本就 == note 语种，故默认与之一致）；显式选某语种 = 强制。
+    public static ObjectConfig BuildPhonemeConfig(VoicebankConfig config)
+    {
+        var props = new OrderedMap<PropertyKey, IControllerConfig>();
+        props.Add((KeyLanguage, L.Tr("Language")), new ComboBoxConfig
+        {
+            Options = PhonemeLanguageOptions(config.Languages),
+            DefaultOption = PropertyValue.Create(string.Empty),   // "" = 跟随 note
+        });
+        return new ObjectConfig { Properties = props };
+    }
+
+    static List<ComboBoxOption> PhonemeLanguageOptions(IReadOnlyList<string> languages)
+    {
+        var options = new List<ComboBoxOption> { new(PropertyValue.Create(string.Empty), L.Tr("(follow note)")) };
+        foreach (var lang in languages)
+            options.Add(lang);   // 隐式转换：string → ComboBoxOption（值即显示文本）
+        return options;
+    }
+
     public static bool HasLanguageChoice(VoicebankConfig config) => config.UseLanguageId && config.Languages.Count > 1;
 
     static ComboBoxConfig LanguageCombo(VoicebankConfig config, string defaultValue) => new()

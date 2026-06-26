@@ -72,6 +72,16 @@ public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSet
     public ObjectConfig GetNotePropertyConfig(IVoiceSynthesisNotePropertyContext context)
         => ConfigFor(context.Part.VoiceId) is { } c ? DiffSingerDeclarations.BuildNoteConfig(c, context) : EmptyConfig;
 
+    // per-phoneme 属性声明：返回与「各 note 音素扁平展开」索引对齐的 config 列表（空列表 = 均无属性）。
+    //   多语言声库给每个音素暴露「语言」下拉（覆盖该音素语种、符号保持干净）；单语言库无此项、返回空。
+    public IReadOnlyList<ObjectConfig> GetPhonemePropertyConfigs(IVoiceSynthesisNotePropertyContext context)
+    {
+        if (ConfigFor(context.Part.VoiceId) is not { } c || !DiffSingerDeclarations.HasLanguageChoice(c))
+            return [];
+        var phonemeConfig = DiffSingerDeclarations.BuildPhonemeConfig(c);
+        return context.Notes.SelectMany(n => n.Phonemes).Select(_ => phonemeConfig).ToList();
+    }
+
     // 选中 part 去重后的已知声库集（未知 voiceId 过滤掉）：逐库出声明、再取交集。
     IEnumerable<VoicebankConfig> SelectedConfigs(IVoiceSynthesisPartPropertyContext context)
         => context.Parts.Select(p => ConfigFor(p.VoiceId)).OfType<VoicebankConfig>();
