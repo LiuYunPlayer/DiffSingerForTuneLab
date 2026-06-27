@@ -21,7 +21,7 @@ public static class DiffSingerPitch
     public static float[]? Predict(
         DiffSingerPredictor? v, IReadOnlyList<PhonemeSpan> phones,
         IReadOnlyList<VoiceSynthesisNoteSnapshot> notes, int[] phDur,
-        double renderStart, double frameSec, DiffSingerSpeakerMix mix, VoicebankConfig cfg, int steps, bool tensorCache)
+        double renderStart, double frameSec, DiffSingerSpeakerMix mix, VoicebankConfig cfg, int steps, int[] seedPerFrame, bool tensorCache)
     {
         if (v is null || !v.HasModel("pitch") || phones.Count == 0 || notes.Count == 0)
             return null;
@@ -94,6 +94,8 @@ public static class DiffSingerPitch
         if (model.InputMetadata.ContainsKey("note_rest"))
             inputs.Add(NamedOnnxValue.CreateFromTensor("note_rest",
                 new DenseTensor<bool>(noteRest, new[] { 1, noteRest.Length })));
+
+        DiffSingerNoise.AddNoise(inputs, model, seedPerFrame, DiffSingerNoise.StagePitch, totalFrames);
 
         var outputs = DiffSingerTensorCache.Run(model, v.ModelHash("pitch"), inputs, tensorCache);
         return outputs.First().AsTensor<float>().ToArray();

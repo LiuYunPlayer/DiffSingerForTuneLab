@@ -172,6 +172,8 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         string partLang = snapshot.PartProperties.GetString(KeyLanguage, mConfig.Languages.Count > 0 ? mConfig.Languages[0] : string.Empty);
         string speaker = snapshot.PartProperties.GetString(KeySpeaker, mConfig.Speakers.Count > 0 ? mConfig.Speakers[0] : string.Empty);
         var noteLang = notes.Select(nt => nt.Properties.GetString(KeyLanguage, partLang)).ToArray();
+        // acoustic 扩散噪声种子（标量 part 属性；模型无 noise 口则被忽略）。pitch/variance 的 seed 走自动化轨（下方逐帧采样）。
+        int seedAcoustic = snapshot.PartProperties.GetInt(KeySeedAcoustic, 0);
 
         // —— Phonemizer：歌词 → 音素时间线（绝对秒、含前置辅音越界）——
         var durPred = models.GetPredictor("dsdur");
@@ -202,6 +204,22 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
                 mixTracks.Add((suffix, mixAuto.Evaluator.Evaluate(frameTimes)));
         var speakerMix = DiffSingerSpeakerMix.Create(Suffix(speaker), mixTracks, nFrames);
 
+        // pitch / variance 的 seed 自动化轨 → 逐帧 seed（连续轨基线 0；clamp + 四舍五入成整数）。
+        //   平线 = 全局 take；画区段 = 该区独立 take（时间维 × 值维）。无轨/未画 → 全 0。
+        int[] SampleSeedCurve(string key)
+        {
+            var seeds = new int[nFrames];
+            if (snapshot.Automations.TryGetValue(key, out var seedAuto))
+            {
+                var v = seedAuto.Evaluator.Evaluate(frameTimes);
+                for (int f = 0; f < nFrames; f++)
+                    seeds[f] = double.IsNaN(v[f]) ? 0 : (int)Math.Round(Math.Clamp(v[f], 0, SeedCurveMax));
+            }
+            return seeds;
+        }
+        var seedPitchCurve = SampleSeedCurve(KeySeedPitch);
+        var seedVarianceCurve = SampleSeedCurve(KeySeedVariance);
+
         // tokens/languages：声学表，前后加 SP。
         var tokens = new long[nTokens];
         var langs = new long[nTokens];
@@ -229,7 +247,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         //   用户已画处（Pitch 非 NaN）用户值覆盖；NaN 自由区用预测轮廓（无 dspitch ⇒ 仍用矩形 framePitch）；PITD/vibrato 叠加在上。
         var predictedPitch = DiffSingerPitch.Predict(
             models.GetPredictor("dspitch"), phones, notes, durations,
-            renderStart, frameSec, speakerMix, mConfig, mSamplingSteps, mTensorCache);
+            renderStart, frameSec, speakerMix, mConfig, mSamplingSteps, seedPitchCurve, mTensorCache);
         progress?.Report(0.28);
         if (cancellation.IsCancellationRequested)
             return null;
@@ -257,7 +275,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         // —— variance 预测（基线；下方与用户 delta 合成喂声学、纯预测产回显）——
         var varCurves = DiffSingerVariance.Predict(
             models.GetPredictor("dsvariance"), phones.Select(p => p.Symbol).ToList(),
-            durations, semis, speakerMix, mConfig, mSamplingSteps, mTensorCache);
+            durations, semis, speakerMix, mConfig, mSamplingSteps, seedVarianceCurve, mTensorCache);
         progress?.Report(0.45);
         if (cancellation.IsCancellationRequested)
             return null;
@@ -316,6 +334,9 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
             while (1000 % speedup != 0 && speedup > 1) speedup--;
             inputs.Add(NamedOnnxValue.CreateFromTensor("speedup", new DenseTensor<long>(new[] { speedup }, new[] { 1 })));
         }
+
+        // 扩散噪声（按 seed 确定性生成）：仅当声学模型有 noise 口时喂入 → 可复现；否则退回内部随机。
+        DiffSingerNoise.AddNoise(inputs, ac, seedAcoustic, DiffSingerNoise.StageAcoustic, nFrames);
 
         var melOut = DiffSingerTensorCache.Run(ac, models.AcousticHash, inputs, mTensorCache);
         var mel = melOut.First(v => v.Name == "mel").AsTensor<float>();

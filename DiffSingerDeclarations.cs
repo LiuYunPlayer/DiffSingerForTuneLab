@@ -24,6 +24,13 @@ public static class DiffSingerDeclarations
     public const string KeySpeed = "speed";
     public const string KeySpeaker = "speaker";
     public const string KeyLanguage = "language";
+    // 随机种子：喂各扩散模型噪声 → 同 seed 可复现、改 seed 重摇。
+    //   pitch / variance 做成 seed **自动化轨**（逐帧 = 时间维×值维 → 区域独立 take：平线=全局、画段=局部）；
+    //   acoustic 噪声全局不局部化（感受野 ~1s），故留 **标量** part 属性（单一 timbre take）+🎲。
+    public const string KeySeedPitch = "seed_pitch";        // 自动化轨 key
+    public const string KeySeedVariance = "seed_variance";  // 自动化轨 key
+    public const string KeySeedAcoustic = "seed_acoustic";  // part 标量属性 key
+    public const double SeedCurveMax = 65536;               // seed 轨量程 [0, 65536]（≤2⁵³ 无损；取值多到 🎲 几乎不重样、又不过大以致拖动失去意义。2 的幂仅为顺眼，无功能意义）
     public const string KeyMix = "speaker_mix";  // part 属性：说话人混合变长键控容器（ExtensibleObjectConfig），条目键 = suffix
     public const string KeyMixPrefix = "mix:";   // 说话人混合自动化轨 key 前缀：mix:<suffix>
 
@@ -78,6 +85,12 @@ public static class DiffSingerDeclarations
             map.Add((KeyGender, L.Tr("Gender")), Continuous("#E5A573", GenderBaseline, GenderMin, GenderMax));
         if (config.UseSpeedEmbed)
             map.Add((KeySpeed, L.Tr("Speed")), Continuous("#73B5E5", SpeedBaseline, SpeedMin, SpeedMax));
+
+        // pitch / variance 的 seed 轨（连续、基线 0、量程 [0,SeedCurveMax]）：插件逐帧采样→每帧 seed→位置寻址噪声。
+        //   平线 = 全局 take（整体拖动换一条），画区段 = 该区独立 take（时间维 × 值维 = 二维 retake）。
+        //   值本身不可读（只代表"哪条 take"，不同即不同）；acoustic 不在此（全局，走标量 part 属性）。
+        map.Add((KeySeedPitch, L.Tr("Pitch seed")), Continuous("#9E9E9E", 0, 0, SeedCurveMax, randomizable: true));
+        map.Add((KeySeedVariance, L.Tr("Variance seed")), Continuous("#9E9E9E", 0, 0, SeedCurveMax, randomizable: true));
         return map;
     }
 
@@ -117,6 +130,10 @@ public static class DiffSingerDeclarations
     public static ObjectConfig BuildPartConfig(VoicebankConfig config, IVoiceSynthesisPartPropertyContext context)
     {
         var properties = new OrderedMap<PropertyKey, IControllerConfig>();
+
+        // 音色（acoustic）随机种子：标量 + 🎲。acoustic 全局不局部化，单一 take 即可。
+        //   pitch / variance 的 seed 是自动化轨（见 BuildFixedAutomationConfigs），不在此 part 面板。
+        properties.Add((KeySeedAcoustic, L.Tr("Timbre seed")), SeedSlider());
 
         if (config.Speakers.Count > 1)
         {
@@ -253,11 +270,22 @@ public static class DiffSingerDeclarations
         Color = color,
     };
 
-    static AutomationConfig Continuous(string color, double baseline, double min, double max) => new()
+    // 种子滑块：整数大量程 + 🎲（宿主在滑条右侧给随机入口，量程内重取 → 一键换 take）。
+    static SliderConfig SeedSlider() => new()
+    {
+        DefaultValue = 0,
+        MinValue = 0,
+        MaxValue = int.MaxValue,
+        IsInteger = true,
+        Randomizable = true,
+    };
+
+    static AutomationConfig Continuous(string color, double baseline, double min, double max, bool randomizable = false) => new()
     {
         DefaultValue = baseline,
         MinValue = min,
         MaxValue = max,
         Color = color,
+        Randomizable = randomizable,   // 仅 seed 轨置 true：🎲 重摇基线（未画区段=全局换 take，已画区段保持=pin）
     };
 }

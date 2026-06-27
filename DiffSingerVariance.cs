@@ -28,7 +28,7 @@ public static class DiffSingerVariance
     // symbols = body 音素（不含 head/tail）；phDur = padded 帧（len=symbols+2）；pitchSemis = totalFrames 半音曲线。
     public static VarianceCurves Predict(
         DiffSingerPredictor? v, IReadOnlyList<string> symbols, int[] phDur,
-        float[] pitchSemis, DiffSingerSpeakerMix mix, VoicebankConfig cfg, int steps, bool tensorCache)
+        float[] pitchSemis, DiffSingerSpeakerMix mix, VoicebankConfig cfg, int steps, int[] seedPerFrame, bool tensorCache)
     {
         if (v is null || !v.HasModel("variance") || symbols.Count == 0)
             return default;
@@ -98,6 +98,8 @@ public static class DiffSingerVariance
             inputs.Add(NamedOnnxValue.CreateFromTensor("spk_embed",
                 new DenseTensor<float>(spk, new[] { 1, totalFrames, hidden })));
         }
+
+        DiffSingerNoise.AddNoise(inputs, model, seedPerFrame, DiffSingerNoise.StageVariance, totalFrames);
 
         var outputs = DiffSingerTensorCache.Run(model, v.ModelHash("variance"), inputs, tensorCache);
         float[]? Out(bool predict, string name)
