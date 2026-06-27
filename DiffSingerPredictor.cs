@@ -161,11 +161,10 @@ public sealed class DiffSingerPredictor : IDisposable
         => new DeserializerBuilder().Build().Deserialize<Dictionary<string, int>>(File.ReadAllText(path))
            ?? new Dictionary<string, int>();
 
+    // 会话经退役机制在推理锁内释放（杜绝与在飞 Run 并发释放，根治关闭 / 换设备时的 AccessViolation）。
     public void Dispose()
     {
-        Linguistic.Dispose();
-        foreach (var m in mModels.Values)
-            m.Dispose();
+        DiffSingerTensorCache.RetireAndDispose(new[] { Linguistic }.Concat(mModels.Values));
         mModels.Clear();
     }
 }

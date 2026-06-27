@@ -100,8 +100,8 @@ public sealed class DiffSingerModelCache : IDisposable
         {
             foreach (var v in mVoices.Values)
                 v.Dispose();   // 释放声学 + 懒加载的预测器（声码器为缓存共享、单独释放）
-            foreach (var entry in mVocoders.Values)
-                entry.Session.Dispose();
+            // 声码器会话经退役机制在推理锁内释放（杜绝与在飞 Run 并发释放）。
+            DiffSingerTensorCache.RetireAndDispose(mVocoders.Values.Select(entry => entry.Session));
             mVoices.Clear();
             mVocoders.Clear();
         }
@@ -204,9 +204,10 @@ public sealed class VoiceModels : IDisposable
     }
 
     // 释放声学 + 懒加载的预测器；声码器为缓存共享引用，由缓存单独释放（不在此 Dispose）。
+    //   会话经退役机制在推理锁内释放（杜绝与在飞 Run 并发释放）；预测器自退役其会话。
     public void Dispose()
     {
-        Acoustic.Dispose();
+        DiffSingerTensorCache.RetireAndDispose(new[] { Acoustic });
         lock (mPredictorLock)
         {
             foreach (var p in mPredictors.Values)

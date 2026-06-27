@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Hashing;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Text;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
@@ -54,11 +55,35 @@ public sealed class DiffSingerTensorCache
     //   换取「无论 provider / 会话数 / 模型束都正确」的简单性。锁只罩 Run 本身，缓存 Load/Save 等磁盘 IO 在锁外。
     static readonly object sRunLock = new();
 
+    // 已退役会话登记：随模型缓存释放的会话在 sRunLock 内先登记于此，令其后任何 Run 干净抛出 ObjectDisposedException，
+    //   而非把已释放的原生句柄喂进 model.Run（→ AccessViolationException）。根治关闭 / 换执行设备时的并发释放崩溃。
+    //   用 ConditionalWeakTable 持弱引用：会话被缓存解引用后条目随 GC 回收，不泄漏；按会话实例隔离，
+    //   故换设备新建的会话天然不在表内、不受影响。value 仅作存在性标记。
+    static readonly ConditionalWeakTable<InferenceSession, object> sRetired = new();
+    static readonly object sRetiredMarker = new();
+
     static IDisposableReadOnlyCollection<DisposableNamedOnnxValue> RunSerialized(
         InferenceSession model, IReadOnlyCollection<NamedOnnxValue> inputs)
     {
         lock (sRunLock)
+        {
+            if (sRetired.TryGetValue(model, out _))
+                throw new ObjectDisposedException(nameof(InferenceSession), "DiffSinger：模型会话已随缓存释放，推理取消。");
             return model.Run(inputs);
+        }
+    }
+
+    // 在全局推理锁内退役并释放一组会话：持锁即保证当前无 Run 在飞（Run 全程持同一把锁），故释放不会与在飞推理并发
+    //   触发 use-after-free；释放前先登记退役，杜绝多级管线在本次释放后还想跑下一阶段时触碰已释放会话。
+    //   供模型束 / 预测器 / 缓存释放各自的会话时调用——分批各取一次锁即可（跨批的 Run 仍受同锁串行保护）。
+    public static void RetireAndDispose(IEnumerable<InferenceSession> sessions)
+    {
+        lock (sRunLock)
+            foreach (var session in sessions)
+            {
+                sRetired.AddOrUpdate(session, sRetiredMarker);
+                session.Dispose();
+            }
     }
 
     // 跑一个模型并经缓存：命中直接返回缓存输出；未命中则 Run + Save。返回的张量均为托管 DenseTensor（脱离原生内存，可在调用处延后读取）。
