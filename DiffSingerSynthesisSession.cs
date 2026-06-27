@@ -32,10 +32,9 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
     readonly OrderedMap<PropertyKey, AutomationConfig> mReadbackConfigs;
 
     // —— 调度状态（数据线程；按 note 间隙分块，账本式托管失效与产物）——
-    readonly IDisposable mNotesSubscription;
+    readonly IActionEvent<IVoiceSynthesisNote> mNoteFieldModified;   // 「任一 note 任一字段变」聚合事件（宿主 WhenAnyItem，成员增删自动接线/退订）
     readonly List<ISynthesisAutomation> mSubscribedAutomations = new();   // 已订阅 RangeModified 的固定轨（variance/gender/speed，恒定，Dispose 退订）
     readonly Dictionary<string, ISynthesisAutomation> mMixSubscriptions = new();   // 已订阅的说话人混合轨（动态，key=mix:suffix，随 part 属性增减）
-    readonly Dictionary<IVoiceSynthesisNote, Action> mNoteHandlers = new();
     readonly List<Piece> mPieces = new();
     bool mNeedResegment;
 
@@ -54,13 +53,21 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         mReadbackConfigs = BuildReadbackConfigs(config);
 
         // 变更接线（handler 只做廉价标脏；重活延迟到 Committed 重分块）——见 §5.9。
-        mNotesSubscription = NotifiableExtensions.WhenAny(context.Notes, SubscribeNote, UnsubscribeNote);
-        context.Notes.ItemAdded += OnNotesStructureChanged;
-        context.Notes.ItemRemoved += OnNotesStructureChanged;
-        context.PartProperties.Modified += MarkAllDirtyAndResegment;
-        context.Pitch.RangeModified += OnRangeModified;
-        context.PitchDeviation.RangeModified += OnRangeModified;
-        context.Committed += OnCommitted;
+        //   note 字段变更：宿主 WhenAnyItem 把「每个现有/未来成员的这几个属性事件」聚合成一个带成员标识的事件，
+        //   成员增删时自动接线/退订（取代旧的手工 SubscribeNote/UnsubscribeNote 簿记）。
+        mNoteFieldModified = context.Notes.WhenAnyItem(
+            n => n.StartTime.Modified,
+            n => n.EndTime.Modified,
+            n => n.Pitch.Modified,
+            n => n.Lyric.Modified,
+            n => n.Phonemes.Modified,
+            n => n.Properties.Modified);
+        mNoteFieldModified.Subscribe(OnNoteModified);
+        context.Notes.MembershipModified.Subscribe(OnNotesStructureChanged);   // 成员增删聚合信号 → 重分块
+        context.PartProperties.Modified.Subscribe(MarkAllDirtyAndResegment);
+        context.Pitch.RangeModified.Subscribe(OnRangeModified);
+        context.PitchDeviation.RangeModified.Subscribe(OnRangeModified);
+        context.Committed.Subscribe(OnCommitted);
 
         // 固定轨（variance / gender / speed）区间编辑订阅：SDK 把声明上移到引擎后，宿主在「建会话之前」即
         //   RefreshDeclarations 填好 Voice.AutomationConfigs（见 MidiPart 时序），故构造期 context.Automations 已含这些轨、直接订阅。
@@ -68,7 +75,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         foreach (var key in BuildFixedAutomationConfigs(config).Keys)
             if (context.Automations.TryGetValue(key.Id, out var automation))
             {
-                automation.RangeModified += OnRangeModified;
+                automation.RangeModified.Subscribe(OnRangeModified);
                 mSubscribedAutomations.Add(automation);
             }
 
@@ -113,9 +120,9 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         piece.Dirty = false;
         piece.Synthesizing = true;
         piece.Progress = 0;
-        StatusChanged?.Invoke();
+        mStatusChanged.Invoke();
 
-        var report = new Progress<double>(p => { piece.Progress = p; StatusChanged?.Invoke(); });
+        var report = new Progress<double>(p => { piece.Progress = p; mStatusChanged.Invoke(); });
         try
         {
             // offload：worker 只读冻结快照跑 ONNX（绝不碰活视图）；模型懒加载经引擎级缓存（首载触发原生加载）。
@@ -542,32 +549,36 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
 
     // 更新信号按产物分离（SDK 契约）。本会话的产物三者同源——piece 完成 / 失败 / 重分块时一起变，故 NotifyProducts 一并 fire；
     //   高频的进度（StatusChanged，逐 tick）单独 fire、不带动产物重读。
-    public event Action? SynthesizedPhonemesChanged;
-    public event Action? SynthesizedParametersChanged;
-    public event Action? SynthesizedPitchChanged;
-    public event Action? StatusChanged;
+    // 出方向产物/状态事件（SDK 已统一为 IActionEvent）：各以宿主 ActionEvent 具体类做后备，对外暴露只读订阅面、自身 Invoke。
+    public IActionEvent SynthesizedPhonemesChanged => mSynthesizedPhonemesChanged;
+    public IActionEvent SynthesizedParametersChanged => mSynthesizedParametersChanged;
+    public IActionEvent SynthesizedPitchChanged => mSynthesizedPitchChanged;
+    public IActionEvent StatusChanged => mStatusChanged;
+    readonly ActionEvent mSynthesizedPhonemesChanged = new();
+    readonly ActionEvent mSynthesizedParametersChanged = new();
+    readonly ActionEvent mSynthesizedPitchChanged = new();
+    readonly ActionEvent mStatusChanged = new();
 
     void NotifyProducts()
     {
-        SynthesizedPhonemesChanged?.Invoke();
-        SynthesizedParametersChanged?.Invoke();
-        SynthesizedPitchChanged?.Invoke();
-        StatusChanged?.Invoke();
+        mSynthesizedPhonemesChanged.Invoke();
+        mSynthesizedParametersChanged.Invoke();
+        mSynthesizedPitchChanged.Invoke();
+        mStatusChanged.Invoke();
     }
 
     public void Dispose()
     {
-        mNotesSubscription.Dispose();
-        mContext.Notes.ItemAdded -= OnNotesStructureChanged;
-        mContext.Notes.ItemRemoved -= OnNotesStructureChanged;
-        mContext.PartProperties.Modified -= MarkAllDirtyAndResegment;
-        mContext.Pitch.RangeModified -= OnRangeModified;
-        mContext.PitchDeviation.RangeModified -= OnRangeModified;
+        mNoteFieldModified.Unsubscribe(OnNoteModified);
+        mContext.Notes.MembershipModified.Unsubscribe(OnNotesStructureChanged);
+        mContext.PartProperties.Modified.Unsubscribe(MarkAllDirtyAndResegment);
+        mContext.Pitch.RangeModified.Unsubscribe(OnRangeModified);
+        mContext.PitchDeviation.RangeModified.Unsubscribe(OnRangeModified);
         foreach (var automation in mSubscribedAutomations)
-            automation.RangeModified -= OnRangeModified;
+            automation.RangeModified.Unsubscribe(OnRangeModified);
         foreach (var automation in mMixSubscriptions.Values)
-            automation.RangeModified -= OnRangeModified;
-        mContext.Committed -= OnCommitted;
+            automation.RangeModified.Unsubscribe(OnRangeModified);
+        mContext.Committed.Unsubscribe(OnCommitted);
         foreach (var piece in mPieces)
             piece.Segment?.Dispose();
         mPieces.Clear();
@@ -629,36 +640,15 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         NotifyProducts();
     }
 
-    void SubscribeNote(IVoiceSynthesisNote note)
+    // 任一 note 的任一可订阅字段变更（WhenAnyItem 携带触发的成员）：精确标脏含该 note 的块。
+    void OnNoteModified(IVoiceSynthesisNote note)
     {
-        void Handler()
-        {
-            foreach (var piece in mPieces)
-                if (piece.Notes.Contains(note)) { piece.Dirty = true; piece.Failed = false; }
-            mNeedResegment = true;
-        }
-        mNoteHandlers[note] = Handler;
-        note.StartTime.Modified += Handler;
-        note.EndTime.Modified += Handler;
-        note.Pitch.Modified += Handler;
-        note.Lyric.Modified += Handler;
-        note.Phonemes.Modified += Handler;
-        note.Properties.Modified += Handler;
+        foreach (var piece in mPieces)
+            if (piece.Notes.Contains(note)) { piece.Dirty = true; piece.Failed = false; }
+        mNeedResegment = true;
     }
 
-    void UnsubscribeNote(IVoiceSynthesisNote note)
-    {
-        if (!mNoteHandlers.Remove(note, out var handler))
-            return;
-        note.StartTime.Modified -= handler;
-        note.EndTime.Modified -= handler;
-        note.Pitch.Modified -= handler;
-        note.Lyric.Modified -= handler;
-        note.Phonemes.Modified -= handler;
-        note.Properties.Modified -= handler;
-    }
-
-    void OnNotesStructureChanged(IVoiceSynthesisNote note) => mNeedResegment = true;
+    void OnNotesStructureChanged() => mNeedResegment = true;
 
     void MarkAllDirtyAndResegment()
     {
@@ -680,12 +670,12 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
             bool subscribed = mMixSubscriptions.ContainsKey(key);
             if (live && !subscribed)
             {
-                automation!.RangeModified += OnRangeModified;
+                automation!.RangeModified.Subscribe(OnRangeModified);
                 mMixSubscriptions[key] = automation;
             }
             else if (!live && subscribed)
             {
-                mMixSubscriptions[key].RangeModified -= OnRangeModified;
+                mMixSubscriptions[key].RangeModified.Unsubscribe(OnRangeModified);
                 mMixSubscriptions.Remove(key);
             }
         }
@@ -706,7 +696,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
             piece.Dirty = true;
             piece.Failed = false;
         }
-        StatusChanged?.Invoke();
+        mStatusChanged.Invoke();
     }
 
     sealed record RenderResult(float[] Audio, double StartTime, int SampleRate,
