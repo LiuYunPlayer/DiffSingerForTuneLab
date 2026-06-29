@@ -179,8 +179,6 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         string partLang = snapshot.PartProperties.GetString(KeyLanguage, mConfig.Languages.Count > 0 ? mConfig.Languages[0] : string.Empty);
         string speaker = snapshot.PartProperties.GetString(KeySpeaker, mConfig.Speakers.Count > 0 ? mConfig.Speakers[0] : string.Empty);
         var noteLang = notes.Select(nt => nt.Properties.GetString(KeyLanguage, partLang)).ToArray();
-        // acoustic 扩散噪声种子（标量 part 属性；模型无 noise 口则被忽略）。pitch/variance 的 seed 走自动化轨（下方逐帧采样）。
-        int seedAcoustic = snapshot.PartProperties.GetInt(KeySeedAcoustic, 0);
 
         // —— Phonemizer：歌词 → 音素时间线（绝对秒、含前置辅音越界）——
         var durPred = models.GetPredictor("dsdur");
@@ -226,6 +224,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         }
         var seedPitchCurve = SampleSeedCurve(KeySeedPitch);
         var seedVarianceCurve = SampleSeedCurve(KeySeedVariance);
+        var seedAcousticCurve = SampleSeedCurve(KeySeedAcoustic);
 
         // tokens/languages：声学表，前后加 SP。
         var tokens = new long[nTokens];
@@ -287,13 +286,13 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         if (cancellation.IsCancellationRequested)
             return null;
 
-        // —— 声学输入（按 InputMetadata 条件构造）——
+        // —— 声学条件输入（按 InputMetadata 条件构造；不含 retake/gt_mel/noise，那三个在下方按重摇逻辑追加）——
         var ac = models.Acoustic;
-        var inputs = new List<NamedOnnxValue>();
+        var cond = new List<NamedOnnxValue>();
         void AddL(string name, long[] data, int[] dims)
-        { if (ac.InputMetadata.ContainsKey(name)) inputs.Add(NamedOnnxValue.CreateFromTensor(name, new DenseTensor<long>(data, dims))); }
+        { if (ac.InputMetadata.ContainsKey(name)) cond.Add(NamedOnnxValue.CreateFromTensor(name, new DenseTensor<long>(data, dims))); }
         void AddF(string name, float[] data, int[] dims)
-        { if (ac.InputMetadata.ContainsKey(name)) inputs.Add(NamedOnnxValue.CreateFromTensor(name, new DenseTensor<float>(data, dims))); }
+        { if (ac.InputMetadata.ContainsKey(name)) cond.Add(NamedOnnxValue.CreateFromTensor(name, new DenseTensor<float>(data, dims))); }
 
         AddL("tokens", tokens, new[] { 1, nTokens });
         AddL("languages", langs, new[] { 1, nTokens });
@@ -326,27 +325,85 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         if (ac.InputMetadata.ContainsKey("spk_embed"))
         {
             var spk = speakerMix.ToEmbedding(models.GetSpeakerEmbeddingBySuffix, hidden);
-            inputs.Add(NamedOnnxValue.CreateFromTensor("spk_embed", new DenseTensor<float>(spk, new[] { 1, nFrames, hidden })));
+            cond.Add(NamedOnnxValue.CreateFromTensor("spk_embed", new DenseTensor<float>(spk, new[] { 1, nFrames, hidden })));
         }
         if (mConfig.UseContinuousAcceleration)
         {
             if (ac.InputMetadata.ContainsKey("depth") && mConfig.UseVariableDepth)
-                inputs.Add(NamedOnnxValue.CreateFromTensor("depth", new DenseTensor<float>(new[] { (float)models.MaxDepth }, new[] { 1 })));
+                cond.Add(NamedOnnxValue.CreateFromTensor("depth", new DenseTensor<float>(new[] { (float)models.MaxDepth }, new[] { 1 })));
             if (ac.InputMetadata.ContainsKey("steps"))
-                inputs.Add(NamedOnnxValue.CreateFromTensor("steps", new DenseTensor<long>(new[] { (long)mSamplingSteps }, new[] { 1 })));
+                cond.Add(NamedOnnxValue.CreateFromTensor("steps", new DenseTensor<long>(new[] { (long)mSamplingSteps }, new[] { 1 })));
         }
         else if (ac.InputMetadata.ContainsKey("speedup"))
         {
             long speedup = Math.Max(1, 1000 / Math.Max(1, mSamplingSteps));
             while (1000 % speedup != 0 && speedup > 1) speedup--;
-            inputs.Add(NamedOnnxValue.CreateFromTensor("speedup", new DenseTensor<long>(new[] { speedup }, new[] { 1 })));
+            cond.Add(NamedOnnxValue.CreateFromTensor("speedup", new DenseTensor<long>(new[] { speedup }, new[] { 1 })));
         }
 
-        // 扩散噪声（按 seed 确定性生成）：仅当声学模型有 noise 口时喂入 → 可复现；否则退回内部随机。
-        DiffSingerNoise.AddNoise(inputs, ac, seedAcoustic, DiffSingerNoise.StageAcoustic, nFrames);
+        // —— note 级 acoustic retake（软条件，canonical take-0 参照；无记忆、关开工程可复现）——
+        //   seed 轨逐帧：seed≠0 的帧重摇(retake=true)、seed=0 的帧保留(复刻 take-0 参照)。
+        //   · 非混合（全保留 or 全重摇）→ 单趟：retake 全 true、gt_mel 全 0、噪声按 seed 轨
+        //     （retake 全 true 时 gt_mel 被模型乘 0 屏蔽，故结果只取决于 seed 轨噪声，与历史/参照无关 → 一致可复现）。
+        //   · 混合 → 先算 take-0 参照（retake 全 true、gt_mel 全 0、seed=0 噪声；输入恒定 → 张量缓存只算一次），
+        //     再正式趟（retake=逐帧、gt_mel=参照、噪声按 seed 轨）。参照由 seed=0 确定性重算，不记忆上次 mel。
+        //   扩散噪声仅当模型有 noise 口时喂入（fork 外置噪声）；retake/gt_mel 仅当模型有这俩口（训练 use_acoustic_retake）。
+        Tensor<float> RunAcoustic(List<NamedOnnxValue> ins)
+            => DiffSingerTensorCache.Run(ac, models.AcousticHash, ins, mTensorCache)
+                .First(v => v.Name == "mel").AsTensor<float>();
 
-        var melOut = DiffSingerTensorCache.Run(ac, models.AcousticHash, inputs, mTensorCache);
-        var mel = melOut.First(v => v.Name == "mel").AsTensor<float>();
+        Tensor<float> mel;
+        if (!(ac.InputMetadata.ContainsKey("retake") && ac.InputMetadata.ContainsKey("gt_mel")))
+        {
+            // stock / 仅噪声模型：无 retake 口，按 seed 轨喂噪声直接单趟（无 noise 口则退回内部随机）。
+            var ins = new List<NamedOnnxValue>(cond);
+            DiffSingerNoise.AddNoise(ins, ac, seedAcousticCurve, DiffSingerNoise.StageAcoustic, nFrames);
+            mel = RunAcoustic(ins);
+        }
+        else
+        {
+            int melBins = ac.InputMetadata["gt_mel"].Dimensions[2];
+            var retakeMask = new bool[nFrames];
+            bool anyKeep = false, anyReroll = false;
+            for (int f = 0; f < nFrames; f++)
+            {
+                bool rr = seedAcousticCurve[f] != 0;   // seed≠0 ⇒ 重摇该帧
+                retakeMask[f] = rr;
+                anyReroll |= rr;
+                anyKeep |= !rr;
+            }
+            var allTrue = new bool[nFrames];
+            Array.Fill(allTrue, true);
+            var zeroMel = new float[nFrames * melBins];
+
+            void AddRetake(List<NamedOnnxValue> dst, bool[] mask, float[] gtMel)
+            {
+                dst.Add(NamedOnnxValue.CreateFromTensor("retake", new DenseTensor<bool>(mask, new[] { 1, nFrames })));
+                dst.Add(NamedOnnxValue.CreateFromTensor("gt_mel", new DenseTensor<float>(gtMel, new[] { 1, nFrames, melBins })));
+            }
+
+            if (!(anyKeep && anyReroll))
+            {
+                // 非混合：单趟。retake 全 true、gt_mel 全 0、噪声按 seed 轨（seed 全 0 即 take-0）。
+                var ins = new List<NamedOnnxValue>(cond);
+                AddRetake(ins, allTrue, zeroMel);
+                DiffSingerNoise.AddNoise(ins, ac, seedAcousticCurve, DiffSingerNoise.StageAcoustic, nFrames);
+                mel = RunAcoustic(ins);
+            }
+            else
+            {
+                // 混合：take-0 参照（seed=0 噪声，输入恒定可缓存）→ 正式趟（gt_mel=参照、噪声按 seed 轨）。
+                var refIns = new List<NamedOnnxValue>(cond);
+                AddRetake(refIns, allTrue, zeroMel);
+                DiffSingerNoise.AddNoise(refIns, ac, 0, DiffSingerNoise.StageAcoustic, nFrames);
+                var refMel = RunAcoustic(refIns).ToArray();
+
+                var ins = new List<NamedOnnxValue>(cond);
+                AddRetake(ins, retakeMask, refMel);
+                DiffSingerNoise.AddNoise(ins, ac, seedAcousticCurve, DiffSingerNoise.StageAcoustic, nFrames);
+                mel = RunAcoustic(ins);
+            }
+        }
         progress?.Report(0.75);
         if (cancellation.IsCancellationRequested)
             return null;

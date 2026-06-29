@@ -55,8 +55,83 @@ if (args.Contains("--dur"))
 if (args.Contains("--dump-only"))
     return 0;
 
+if (args.Contains("--retake"))
+{
+    RetakeTest(voiceRoot, acousticCfg, acousticPath);
+    return 0;
+}
+
 Synthesize(voiceRoot, acousticCfg, acousticPath, vocoderPath, hopSize, sampleRate, outWav);
 return 0;
+
+// note 级 retake 的 DML 忠实复现：用插件同款 NuGet OnnxRuntime.DirectML 跑声学，喂 retake/gt_mel
+// （+ depth/steps 按插件 [1] 形状），定位插件里 /fs2/Sub_1 之类的 DML 运行时错。
+static void RetakeTest(string voiceRoot, Dictionary<string, object?> cfg, string acousticPath)
+{
+    Console.WriteLine("\n======== RETAKE DML TEST ========");
+    var yaml = new DeserializerBuilder().Build();
+    var phonemes = yaml.Deserialize<Dictionary<string, int>>(File.ReadAllText(ResolvePath(voiceRoot, cfg, "phonemes")));
+    var languages = yaml.Deserialize<Dictionary<string, int>>(File.ReadAllText(ResolvePath(voiceRoot, cfg, "languages")));
+    using var ac = Open(acousticPath);
+    Console.WriteLine("  -- Acoustic inputs --");
+    foreach (var (name, meta) in ac.InputMetadata)
+        Console.WriteLine($"    {name}: {Describe(meta)}");
+
+    int melBins = ac.InputMetadata["gt_mel"].Dimensions[2];
+    var nd = ac.InputMetadata["noise"].Dimensions;   // [1, feats, outDims, -1]
+    int feats = nd[1], outDims = nd[2];
+    int F = 120;
+    long[] tokens = { phonemes["SP"], phonemes.GetValueOrDefault("zh/a", 1), phonemes["SP"] };
+    long[] langs = { languages["zh"], languages["zh"], languages["zh"] };
+    long[] durations = { 8, F - 16, 8 };
+
+    foreach (var (label, mask) in new (string, bool[])[]
+    {
+        ("retake 全 true（非混合）", Enumerable.Repeat(true, F).ToArray()),
+        ("retake 混合（后半 true）", Enumerable.Range(0, F).Select(i => i >= F / 2).ToArray()),
+    })
+    {
+        var feeds = new List<NamedOnnxValue>
+        {
+            NvL("tokens", tokens, 1, 3), NvL("languages", langs, 1, 3), NvL("durations", durations, 1, 3),
+            NvF("f0", Fill(F, 300f), 1, F),
+            NamedOnnxValue.CreateFromTensor("retake", new DenseTensor<bool>(mask, new[] { 1, F })),
+            NamedOnnxValue.CreateFromTensor("gt_mel", new DenseTensor<float>(new float[F * melBins], new[] { 1, F, melBins })),
+            NamedOnnxValue.CreateFromTensor("depth", new DenseTensor<float>(new[] { 0.6f }, new[] { 1 })),
+            NamedOnnxValue.CreateFromTensor("steps", new DenseTensor<long>(new[] { 10L }, new[] { 1 })),
+            NamedOnnxValue.CreateFromTensor("noise", new DenseTensor<float>(new float[feats * outDims * F], new[] { 1, feats, outDims, F })),
+        };
+        try
+        {
+            using var r = ac.Run(feeds);
+            var mel = r.First(v => v.Name == "mel").AsTensor<float>();
+            Console.WriteLine($"  {label}: OK mel [{string.Join(",", mel.Dimensions.ToArray())}]");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  {label}: FAIL -> {ex.Message}");
+        }
+    }
+
+    // —— 无缓存逐 bit 确定性：同一会话、相同输入跑两遍，比 max|run1-run2| ——
+    Console.WriteLine("  -- 确定性（同输入跑两遍，无缓存）--");
+    var detFeeds = new List<NamedOnnxValue>
+    {
+        NvL("tokens", tokens, 1, 3), NvL("languages", langs, 1, 3), NvL("durations", durations, 1, 3),
+        NvF("f0", Fill(F, 300f), 1, F),
+        NamedOnnxValue.CreateFromTensor("retake", new DenseTensor<bool>(Enumerable.Repeat(true, F).ToArray(), new[] { 1, F })),
+        NamedOnnxValue.CreateFromTensor("gt_mel", new DenseTensor<float>(new float[F * melBins], new[] { 1, F, melBins })),
+        NamedOnnxValue.CreateFromTensor("depth", new DenseTensor<float>(new[] { 0.6f }, new[] { 1 })),
+        NamedOnnxValue.CreateFromTensor("steps", new DenseTensor<long>(new[] { 10L }, new[] { 1 })),
+        NamedOnnxValue.CreateFromTensor("noise", new DenseTensor<float>(new float[feats * outDims * F], new[] { 1, feats, outDims, F })),
+    };
+    float[] Run1() { using var r = ac.Run(detFeeds); return r.First(v => v.Name == "mel").AsTensor<float>().ToArray(); }
+    var a = Run1(); var b = Run1();
+    double maxDiff = 0; for (int i = 0; i < a.Length; i++) maxDiff = Math.Max(maxDiff, Math.Abs(a[i] - b[i]));
+    Console.WriteLine($"  DML 两遍 max|diff| = {maxDiff:G17}  ({(maxDiff == 0 ? "逐 bit 一致" : "非逐 bit")})");
+    // 注：同进程内再建第二个 CPU session 会触发 onnxruntime-DirectML 原生 AccessViolation（已知冲突），
+    //   故 CPU 对照/跨 EP 比对需另起进程，这里不做。
+}
 
 static string? ArgOrEnv(string[] args, int idx, string env)
     => idx < args.Length ? args[idx] : Environment.GetEnvironmentVariable(env);
