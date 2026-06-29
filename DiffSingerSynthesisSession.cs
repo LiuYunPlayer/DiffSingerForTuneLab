@@ -224,16 +224,17 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
                 mixTracks.Add((suffix, mixAuto.Evaluator.Evaluate(frameTimes)));
         var speakerMix = DiffSingerSpeakerMix.Create(Suffix(speaker), mixTracks, nFrames);
 
-        // pitch / variance 的 seed 自动化轨 → 逐帧 seed（连续轨基线 0；clamp + 四舍五入成整数）。
-        //   平线 = 全局 take；画区段 = 该区独立 take（时间维 × 值维）。无轨/未画 → 全 0。
-        int[] SampleSeedCurve(string key)
+        // pitch / variance 的 seed 自动化轨 → 逐帧 seed：归一化 [0,1] 放大到 uint32（哈希白化，刻度不影响质量）。
+        //   平线 = 全局 take；画区段 = 该区独立 take（时间维 × 值维）。无轨/未画/NaN → 0（= 保留 take-0）。
+        //   只有精确 v=0 映成 seed 0；任何画上去的 v>0 都映成非零 → 触发该帧重摇（acoustic retake mask 命门）。
+        uint[] SampleSeedCurve(string key)
         {
-            var seeds = new int[nFrames];
+            var seeds = new uint[nFrames];
             if (snapshot.Automations.TryGetValue(key, out var seedAuto))
             {
                 var v = seedAuto.Evaluator.Evaluate(frameTimes);
                 for (int f = 0; f < nFrames; f++)
-                    seeds[f] = double.IsNaN(v[f]) ? 0 : (int)Math.Round(Math.Clamp(v[f], 0, SeedCurveMax));
+                    seeds[f] = double.IsNaN(v[f]) ? 0u : (uint)Math.Round(Math.Clamp(v[f], 0, SeedCurveMax) * uint.MaxValue);
             }
             return seeds;
         }
@@ -410,7 +411,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
                 // 混合：take-0 参照（seed=0 噪声，输入恒定可缓存）→ 正式趟（gt_mel=参照、噪声按 seed 轨）。
                 var refIns = new List<NamedOnnxValue>(cond);
                 AddRetake(refIns, allTrue, zeroMel);
-                DiffSingerNoise.AddNoise(refIns, ac, 0, DiffSingerNoise.StageAcoustic, nFrames);
+                DiffSingerNoise.AddNoise(refIns, ac, 0u, DiffSingerNoise.StageAcoustic, nFrames);
                 var refMel = RunAcoustic(refIns).ToArray();
 
                 var ins = new List<NamedOnnxValue>(cond);
@@ -528,15 +529,16 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
 
     static string? NullIfEmpty(string s) => string.IsNullOrEmpty(s) ? null : s;
 
+    // gender 归一化 [-1,1]（旧 [-100,100] 的 /100 已并入刻度）：正 = formant 下移；缩放由声库增广范围 KeyShift* 定。
     static Func<double, double> GenderConvert(VoicebankConfig config)
     {
-        double posScale = config.KeyShiftMax == 0 ? 0 : 12 / config.KeyShiftMax / 100;
-        double negScale = config.KeyShiftMin == 0 ? 0 : -12 / config.KeyShiftMin / 100;
+        double posScale = config.KeyShiftMax == 0 ? 0 : 12 / config.KeyShiftMax;
+        double negScale = config.KeyShiftMin == 0 ? 0 : -12 / config.KeyShiftMin;
         return x => x < 0 ? -x * posScale : -x * negScale;
     }
 
-    // VELC convert（OpenUtau DiffSingerRenderer）：对数标度，100 = 原速，每 +100 速度 ×2。
-    static double SpeedConvert(double x) => Math.Pow(2, (x - 100) / 100);
+    // VELC convert（OpenUtau DiffSingerRenderer）：对数标度，speed 归一化后 1 = 原速，每 +1 速度 ×2。
+    static double SpeedConvert(double x) => Math.Pow(2, x - 1);
 
     // 回显段：纯预测值（不含用户编辑），clamp 到声学值域，逐帧 (全局秒, 值)。
     static List<Point> BuildReadbackSegment(VarianceSpec spec, float[] predicted, double[] frameTimes, int n)

@@ -28,7 +28,7 @@ public static class DiffSingerVariance
     // symbols = body 音素（不含 head/tail）；phDur = padded 帧（len=symbols+2）；pitchSemis = totalFrames 半音曲线。
     public static VarianceCurves Predict(
         DiffSingerPredictor? v, IReadOnlyList<string> symbols, int[] phDur,
-        float[] pitchSemis, DiffSingerSpeakerMix mix, VoicebankConfig cfg, int steps, int[] seedPerFrame, bool tensorCache)
+        float[] pitchSemis, DiffSingerSpeakerMix mix, VoicebankConfig cfg, int steps, uint[] seedPerFrame, bool tensorCache)
     {
         if (v is null || !v.HasModel("variance") || symbols.Count == 0)
             return default;

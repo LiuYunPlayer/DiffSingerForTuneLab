@@ -29,12 +29,15 @@ public static class DiffSingerDeclarations
     public const string KeySeedPitch = "seed_pitch";
     public const string KeySeedVariance = "seed_variance";
     public const string KeySeedAcoustic = "seed_acoustic";
-    public const double SeedCurveMax = 65536;
+    // seed 轨归一化为 [0,1]（最通用刻度，别的 retake 引擎天然兼容、撞键也不越界）；
+    //   合成期 round(v·uint.MaxValue) 放大到 uint32 喂位置寻址哈希（哈希白化 → 刻度不影响噪声质量，见 DiffSingerNoise）。
+    public const double SeedCurveMax = 1;
     public const string KeyMix = "speaker_mix";    // part 属性：说话人混合变长键控容器，条目键 = suffix
     public const string KeyMixPrefix = "mix:";     // 说话人混合自动化轨 key 前缀：mix:<suffix>
 
-    public const double GenderBaseline = 0, GenderMin = -100, GenderMax = 100;
-    public const double SpeedBaseline = 100, SpeedMin = 0, SpeedMax = 200;
+    // 归一化刻度：gender 中性 0、量程 [-1,1]；speed 中性 1（=原速）、量程 [0,2]（百分比小数化）。
+    public const double GenderBaseline = 0, GenderMin = -1, GenderMax = 1;
+    public const double SpeedBaseline = 1, SpeedMin = 0, SpeedMax = 2;
 
     public readonly record struct VarianceSpec(
         string Key, string Display, string Color,
@@ -43,12 +46,15 @@ public static class DiffSingerDeclarations
         double AcousticMin, double AcousticMax,
         Func<float, float, float> Delta);
 
+    // 编辑轨（delta 语义）归一化到小数：energy/breath/tension 中性 0、量程 [-1,1]；voicing 中性 1、量程 [0,1]。
+    //   Delta(x=预测声学值, y=用户归一化值) 系数随之 ×100：y=1 等价旧 y=100（energy/breath ±12dB、voicing ±12dB、tension ±5）。
+    //   AcousticMin/Max 为回显轨的真实声学单位（dB）值域，保持不变。
     public static readonly VarianceSpec[] Variances =
     {
-        new("energy",      "Energy",      "#E573A5", c => c.UseEnergyEmbed,      c => c.PredictEnergy,      -100, 100,   0, -96, 0, (x, y) => x + y * 12 / 100),
-        new("breathiness", "Breathiness", "#73E5C2", c => c.UseBreathinessEmbed, c => c.PredictBreathiness, -100, 100,   0, -96, 0, (x, y) => x + y * 12 / 100),
-        new("voicing",     "Voicing",     "#C2E573", c => c.UseVoicingEmbed,     c => c.PredictVoicing,        0, 100, 100, -96, 0, (x, y) => x + (y - 100) * 12 / 100),
-        new("tension",     "Tension",     "#A573E5", c => c.UseTensionEmbed,     c => c.PredictTension,     -100, 100,   0, -10, 10, (x, y) => x + y / 20),
+        new("energy",      "Energy",      "#E573A5", c => c.UseEnergyEmbed,      c => c.PredictEnergy,      -1, 1, 0, -96, 0, (x, y) => x + y * 12),
+        new("breathiness", "Breathiness", "#73E5C2", c => c.UseBreathinessEmbed, c => c.PredictBreathiness, -1, 1, 0, -96, 0, (x, y) => x + y * 12),
+        new("voicing",     "Voicing",     "#C2E573", c => c.UseVoicingEmbed,     c => c.PredictVoicing,      0, 1, 1, -96, 0, (x, y) => x + (y - 1) * 12),
+        new("tension",     "Tension",     "#A573E5", c => c.UseTensionEmbed,     c => c.PredictTension,     -1, 1, 0, -10, 10, (x, y) => x + y * 5),
     };
 
     // manifest retake 三位（legacy → 全 false ⇒ 不暴露任何 seed 轨）。
@@ -61,7 +67,7 @@ public static class DiffSingerDeclarations
         var map = BuildFixedAutomationConfigs(pc.Config, RetakeOf(pc.Resolved));
         var set = SpeakerSet.Compute(pc.Resolved);
         foreach (var (suffix, display, color) in SelectedMixTracks(set, partProperties))
-            map.Add((KeyMixPrefix + suffix, display), Continuous(color, 0, 0, 100));
+            map.Add((KeyMixPrefix + suffix, display), Continuous(color, 0, 0, 1));   // 混合权重归一化 [0,1]（0=不混入）
         return map;
     }
 

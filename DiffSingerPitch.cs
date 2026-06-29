@@ -21,7 +21,7 @@ public static class DiffSingerPitch
     public static float[]? Predict(
         DiffSingerPredictor? v, IReadOnlyList<PhonemeSpan> phones,
         IReadOnlyList<VoiceSynthesisNoteSnapshot> notes, int[] phDur,
-        double renderStart, double frameSec, DiffSingerSpeakerMix mix, VoicebankConfig cfg, int steps, int[] seedPerFrame, bool tensorCache)
+        double renderStart, double frameSec, DiffSingerSpeakerMix mix, VoicebankConfig cfg, int steps, uint[] seedPerFrame, bool tensorCache)
     {
         if (v is null || !v.HasModel("pitch") || phones.Count == 0 || notes.Count == 0)
             return null;

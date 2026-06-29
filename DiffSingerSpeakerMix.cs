@@ -21,8 +21,8 @@ public sealed class DiffSingerSpeakerMix
         FrameCount = frameCount;
     }
 
-    // 构造逐帧权重：默认 suffix 必有一席；各 mix 轨逐帧值（[0,100]，NaN 自由区视作 0）按 ×0.01 累积到对应 suffix；
-    //   逐帧标准化（Σ>1 归一化，否则默认 suffix 补 1-Σ）。忠实对齐 OpenUtau 的 standardization 段。
+    // 构造逐帧权重：默认 suffix 必有一席；各 mix 轨逐帧值（归一化 [0,1]，NaN 自由区视作 0）累积到对应 suffix；
+    //   逐帧标准化（Σ>1 归一化，否则默认 suffix 补 1-Σ）。忠实对齐 OpenUtau 的 standardization 段（其 [0,100] 在此已归一）。
     public static DiffSingerSpeakerMix Create(
         string defaultSuffix, IReadOnlyList<(string Suffix, double[] Sampled)> tracks, int nFrames)
     {
@@ -41,7 +41,7 @@ public sealed class DiffSingerSpeakerMix
             for (int f = 0; f < nFrames; f++)
             {
                 double v = f < sampled.Length ? sampled[f] : double.NaN;
-                if (!double.IsNaN(v)) w[f] += (float)(v * 0.01);
+                if (!double.IsNaN(v)) w[f] += (float)v;
             }
         }
 

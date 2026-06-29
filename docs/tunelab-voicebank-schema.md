@@ -364,3 +364,55 @@ voices:
 | [DiffSingerDeclarations.cs](../DiffSingerDeclarations.cs) `BuildPartConfig` | speaker 下拉 + 混音容器 + 语言 | 新增 **model 下拉 + version 下拉** part 属性；混音候选按 §9 收窄到选中 (model,version) |
 | `BuildFixedAutomationConfigs` | 三条 seed 轨无条件暴露 | 按 `retake.*` 位 gating |
 | `VoicebankConfig` / 新增 `TunelabManifest` | 仅解析 dsconfig | dsconfig 仍出 DSP/模型契约；新增类解析 tunelab.yaml 作者层（id/name+i18n/version/released/retake/voices/languages），两者不重叠合并 |
+
+## 14. part 属性 / 自动化轨字段存储约定（跨引擎复用契约）
+
+> 与上文 manifest（作者写的 `tunelab.yaml`）无关——这里规定的是**插件写进工程 part 的属性 / 自动化轨字段**的存储刻度与命名契约。
+
+### 14.1 为什么要规范
+
+TuneLab 在切换引擎 / 音源时，**不清空 part 里已存的属性与 automation 曲线**。新引擎若声明了同 `key` 的字段，旧数据会被**静默复用**并按新引擎的量程/语义重新解读。要么复用是**正确的 feature**，要么是**脏数据**——取决于字段刻度是否规范。
+
+因此两条核心纪律：
+
+1. **key = 不可变契约。** 一个 key 的完整契约 = `(量程, 基线, 极性, 单位, 语义)`。**一旦发布即冻结**；任何不兼容变更 → **换新 key（或加版本号）**，绝不静默重定义旧 key。
+2. **贴合公共认知、能复用就复用。** 用生态标准名（gender/energy/breathiness/voicing/tension，对齐 ACE Studio / ACEP）与归一化刻度，让别的引擎复用同 key 时**值在量程内、不报错**。
+
+### 14.2 归一化刻度：百分比一律改小数
+
+`1.0 = 原样 / 满刻度`，是最通用的归一化单位。统一后的心智模型：
+
+- **乘性 / 百分比参数**：`1.0 = 原样`。
+- **加性 / 中性参数**：`0 = 中性`。
+
+| key | 类型 | 量程 | 基线 | 单位含义 | 合成期换算（消费点） |
+|---|---|---|---|---|---|
+| `gender` | 加性 | `[-1, 1]` | `0` | ±1 = formant 增广满程；正=下移 | `GenderConvert`：`±1`→`12/KeyShift*` |
+| `speed` | 乘性(对数) | `[0, 2]` | `1` | 1=原速，每 +1 速度 ×2 | `SpeedConvert`：`2^(x-1)` |
+| `energy` | 加性 delta | `[-1, 1]` | `0` | 1.0 = +12 dB 偏移 | `Delta: x + y*12` → clamp `[-96,0]`dB |
+| `breathiness` | 加性 delta | `[-1, 1]` | `0` | 1.0 = +12 dB 偏移 | `Delta: x + y*12` → clamp `[-96,0]`dB |
+| `voicing` | 加性 delta | `[0, 1]` | `1` | 1=不变，0 = −12 dB | `Delta: x + (y-1)*12` → clamp `[-96,0]`dB |
+| `tension` | 加性 delta | `[-1, 1]` | `0` | 1.0 = +5（声学单位） | `Delta: x + y*5` → clamp `[-10,10]` |
+| `mix:<suffix>` | 比例 | `[0, 1]` | `0` | 0=不混入；逐帧标准化(Σ>1 归一) | 直接累积（[DiffSingerSpeakerMix.cs](../DiffSingerSpeakerMix.cs)） |
+| `seed_pitch`/`seed_variance`/`seed_acoustic` | 标称 | `[0, 1]` | `0` | 见 §14.3 | `round(v·uint.MaxValue)`→uint32 哈希 |
+
+> 反例：`speed` **不要**归一到 `[0,1]`——百分比倍率（1=原速）本身是更强的公共认知。归一化只对无物理单位或可任意定标的量做。
+
+### 14.3 seed：标称值（nominal），不是幅度（magnitude）
+
+seed 是"哪一个 take"的**身份令牌**，没有大小语义（seed 0.4 不比 0.3"更大"），故：
+
+- **量程 `[0,1]`**：最通用刻度，撞键也不越界；别的 retake 引擎天然兼容、不报错（但不保证产同一 take——哈希实现不同）。
+- 合成期 `round(Clamp(v,0,1)·uint.MaxValue)` 放大到 uint32 喂**位置寻址哈希**（[DiffSingerNoise.cs](../DiffSingerNoise.cs)）。哈希白化 ⇒ **刻度不影响噪声质量/分散度**，4 亿+ take、随机几乎不碰撞。
+- **只有精确 `v=0` 映成 seed 0 = 保留 take-0**；任何画上去的 `v>0` 都映成非零 → 触发该帧重摇（acoustic retake mask 命门，[DiffSingerSynthesisSession.cs](../DiffSingerSynthesisSession.cs#L385)）。
+
+### 14.4 回显轨：真实声学单位，不参与本契约
+
+variance 回显轨（`SynthesizedParameters`）是**纯预测、绝对值、真实 dB**（energy/breath/voicing `[-96,0]`、tension `[-10,10]`），与编辑轨的归一化 delta **不同质、不强行同单位**。理由：回显**不存进 part**、每次合成现算 → **零跨引擎复用风险**；且 dB 本就是公共单位。该 dB 值域同时被合成期 clamp 复用。
+
+### 14.5 离散字符串字段
+
+同样按 key 静默复用（值为字符串）：
+
+- `language`：**建议**声库制作方用 ISO 639 / BCP-47 码（`zh`/`ja`/`en`）。插件作为桥**无法强制**，只能在 schema 建议 +（可选）加载时对非 ISO 形态打 warning。**不做**别名映射表（那是自造标准）。
+- `model` / `version` / `speaker`：受 ComboBox options 校验，查无回落默认 sentinel（`""`）——这类**受校验离散值天然安全**，不会因复用产生脏值。
