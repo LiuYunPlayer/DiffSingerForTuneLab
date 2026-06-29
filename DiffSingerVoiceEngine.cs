@@ -69,7 +69,7 @@ public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSet
     public ObjectConfig GetPartPropertyConfig(IVoiceSynthesisPartPropertyContext context)
     {
         var merged = context.Parts.Select(p => p.PartProperties).Merge();
-        return new ObjectConfig { Properties = CommonItems(SelectedContexts(context).Select(pc => DiffSingerDeclarations.BuildPartConfig(pc, merged).Properties)) };
+        return ObjectConfig.Create(CommonItems(SelectedContexts(context).Select(pc => DiffSingerDeclarations.BuildPartConfig(pc, merged).Properties)));
     }
 
     public ObjectConfig GetNotePropertyConfig(IVoiceSynthesisNotePropertyContext context)
@@ -142,18 +142,15 @@ public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSet
         {
             {
                 (KeyVoicebankDirs, L.Tr("Voicebank directories (separate with ;)")),
-                new TextBoxConfig { DefaultValue = "" }
+                TextBoxConfig.Create()
             },
             {
                 (KeyExecutionProvider, L.Tr("Execution device")),
-                new ComboBoxConfig
+                ComboBoxConfig.Create(new List<ComboBoxItem>
                 {
-                    Options = new List<ComboBoxOption>
-                    {
-                        new("directml", L.Tr("GPU (DirectML)")),
-                        new("cpu", L.Tr("CPU")),
-                    },
-                }
+                    new(PropertyValue.Create("directml"), L.Tr("GPU (DirectML)")),
+                    new(PropertyValue.Create("cpu"), L.Tr("CPU")),
+                })
             },
             {
                 (KeySamplingSteps, L.Tr("Sampling steps")),
@@ -161,14 +158,14 @@ public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSet
             },
             {
                 (KeyTensorCache, L.Tr("Tensor cache")),
-                new CheckBoxConfig { DefaultValue = true }
+                CheckBoxConfig.Create(true)
             },
             {
                 (KeyCacheMaxSizeMb, L.Tr("Cache size limit (MB, 0 = unlimited)")),
                 SliderConfig.Integer(4096, 0, 102400)
             },
         };
-        return new ObjectConfig { Properties = properties };
+        return ObjectConfig.Create(properties);
     }
 
     public void ApplySettings(PropertyObject settings)
@@ -209,7 +206,7 @@ public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSet
     volatile VoiceRegistry mRegistry = VoiceRegistry.Empty;
 
     readonly Dictionary<string, VoicebankConfig> mConfigCache = new(StringComparer.OrdinalIgnoreCase);
-    static readonly ObjectConfig EmptyConfig = new() { Properties = new OrderedMap<PropertyKey, IControllerConfig>() };
+    static readonly ObjectConfig EmptyConfig = ObjectConfig.Create(new OrderedMap<PropertyKey, IControllerConfig>());
 
     DiffSingerModelCache? mModelCache;
     string mProviderInUse = string.Empty;

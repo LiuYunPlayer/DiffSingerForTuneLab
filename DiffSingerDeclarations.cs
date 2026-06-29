@@ -131,21 +131,17 @@ public static class DiffSingerDeclarations
         // 模型下拉（含此 voice 的模型 >1 时）：默认 = released 最新（浮动）。
         if (registry.ModelOptions(pc.VoiceId) is { } modelOptions)
         {
-            properties.Add((KeyModel, L.Tr("Model")), new ComboBoxConfig
-            {
-                Options = modelOptions.Select(o => new ComboBoxOption(PropertyValue.Create(o.Value), o.Display)).ToList(),
-                DefaultOption = PropertyValue.Create(string.Empty),   // "" = 最新 sentinel（浮动跟随最新模型）
-            });
+            properties.Add((KeyModel, L.Tr("Model")), ComboBoxConfig
+                .Create(modelOptions.Select(o => new ComboBoxItem(PropertyValue.Create(o.Value), o.Display)).ToList())
+                .WithDefault(PropertyValue.Create(string.Empty)));   // "" = 最新 sentinel（浮动跟随最新模型）
         }
         // 版本下拉（当前选中模型版本 >1 时）：首项 "" = 最新（跟随）。
         string? selectedModel = mergedProps.GetString(KeyModel, string.Empty) is { Length: > 0 } sm ? sm : null;
         if (registry.VersionOptions(pc.VoiceId, selectedModel) is { } versionOptions)
         {
-            properties.Add((KeyVersion, L.Tr("Version")), new ComboBoxConfig
-            {
-                Options = versionOptions.Select(o => new ComboBoxOption(PropertyValue.Create(o.Value), o.Display)).ToList(),
-                DefaultOption = PropertyValue.Create(string.Empty),
-            });
+            properties.Add((KeyVersion, L.Tr("Version")), ComboBoxConfig
+                .Create(versionOptions.Select(o => new ComboBoxItem(PropertyValue.Create(o.Value), o.Display)).ToList())
+                .WithDefault(PropertyValue.Create(string.Empty)));
         }
 
         var set = SpeakerSet.Compute(pc.Resolved);
@@ -157,7 +153,7 @@ public static class DiffSingerDeclarations
         if (HasLanguageChoice(pc))
             properties.Add((KeyLanguage, L.Tr("Language")), LanguageCombo(EffectiveLanguages(pc), DefaultLanguageId(pc.Config, pc.Resolved)));
 
-        return new ObjectConfig { Properties = properties };
+        return ObjectConfig.Create(properties);
     }
 
     // 说话人混合容器：Properties = 当前已选（present 键）；AddableElements = 候选（除默认）。条目皆纯 presence。
@@ -174,10 +170,10 @@ public static class DiffSingerDeclarations
                 props.Add((opt.Suffix, opt.Display), EmptyEntry());
             addable.Add(new AddableKey((opt.Suffix, opt.Display), EmptyEntry()));
         }
-        return new ExtensibleObjectConfig { Properties = props, AddableElements = addable };
+        return ExtensibleObjectConfig.Create(props, addable);
     }
 
-    static ObjectConfig EmptyEntry() => new() { Properties = new OrderedMap<PropertyKey, IControllerConfig>() };
+    static ObjectConfig EmptyEntry() => ObjectConfig.Create(new OrderedMap<PropertyKey, IControllerConfig>());
 
     // note 级面板：多语言暴露 per-note 语言覆盖；默认值取 part 当前默认语言。
     public static ObjectConfig BuildNoteConfig(PartContext pc, IVoiceSynthesisNotePropertyContext context)
@@ -188,18 +184,18 @@ public static class DiffSingerDeclarations
             var partDefault = context.Part.PartProperties.GetString(KeyLanguage, DefaultLanguageId(pc.Config, pc.Resolved));
             properties.Add((KeyLanguage, L.Tr("Language")), LanguageCombo(EffectiveLanguages(pc), partDefault));
         }
-        return new ObjectConfig { Properties = properties };
+        return ObjectConfig.Create(properties);
     }
 
     // per-phoneme 语言：每个钉死音素一个语言下拉，覆盖该音素语种；默认空 = 跟随 note。
     public static ObjectConfig BuildPhonemeConfig(PartContext pc)
     {
-        var options = new List<ComboBoxOption> { new(PropertyValue.Create(string.Empty), L.Tr("(follow note)")) };
+        var options = new List<ComboBoxItem> { new(PropertyValue.Create(string.Empty), L.Tr("(follow note)")) };
         foreach (var (id, display) in EffectiveLanguages(pc))
-            options.Add(new ComboBoxOption(PropertyValue.Create(id), display));
+            options.Add(new ComboBoxItem(PropertyValue.Create(id), display));
         var props = new OrderedMap<PropertyKey, IControllerConfig>();
-        props.Add((KeyLanguage, L.Tr("Language")), new ComboBoxConfig { Options = options, DefaultOption = PropertyValue.Create(string.Empty) });
-        return new ObjectConfig { Properties = props };
+        props.Add((KeyLanguage, L.Tr("Language")), ComboBoxConfig.Create(options).WithDefault(PropertyValue.Create(string.Empty)));
+        return ObjectConfig.Create(props);
     }
 
     public static bool HasLanguageChoice(PartContext pc)
@@ -236,11 +232,10 @@ public static class DiffSingerDeclarations
 
     static string? HostLang => TuneLabContext.Global.Language;
 
-    static ComboBoxConfig LanguageCombo(List<(string Id, string Display)> langs, string defaultValue) => new()
-    {
-        Options = langs.Select(l => new ComboBoxOption(PropertyValue.Create(l.Id), l.Display)).ToList(),
-        DefaultOption = PropertyValue.Create(defaultValue),
-    };
+    static ComboBoxConfig LanguageCombo(List<(string Id, string Display)> langs, string defaultValue)
+        => ComboBoxConfig
+            .Create(langs.Select(l => new ComboBoxItem(PropertyValue.Create(l.Id), l.Display)).ToList())
+            .WithDefault(PropertyValue.Create(defaultValue));
 
 
     // 说话人混合轨 (key=mix:<suffix>, suffix)：每候选一条；同 suffix 去重。会话据此订阅 + 渲染期解析。
@@ -275,22 +270,13 @@ public static class DiffSingerDeclarations
         "#4DD0E1", "#4DB6AC", "#81C784", "#DCE775", "#FFD54F", "#FFB74D",
     };
 
-    static AutomationConfig Piecewise(string color, double min, double max) => new()
-    {
-        DefaultValue = double.NaN,
-        MinValue = min,
-        MaxValue = max,
-        Color = color,
-    };
+    // 分段轨：不调 WithDefault → DefaultValue 保持 NaN（= 分段、无基线）。
+    static AutomationConfig Piecewise(string color, double min, double max)
+        => AutomationConfig.Create(min, max).WithColor(color);
 
-    static AutomationConfig Continuous(string color, double baseline, double min, double max, bool randomizable = false) => new()
-    {
-        DefaultValue = baseline,
-        MinValue = min,
-        MaxValue = max,
-        Color = color,
-        Randomizable = randomizable,
-    };
+    // 连续轨：WithDefault 给实数基线 → 连续；按需 WithRandomizable。
+    static AutomationConfig Continuous(string color, double baseline, double min, double max, bool randomizable = false)
+        => AutomationConfig.Create(min, max).WithDefault(baseline).WithColor(color).WithRandomizable(randomizable);
 }
 
 // 一个 part 当前的“可用说话人集合”：驱动默认说话人、混音候选/轨、嵌入解析。
