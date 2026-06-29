@@ -34,8 +34,9 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
 
     // —— 调度状态（数据线程；按 note 间隙分块，账本式托管失效与产物）——
     readonly IActionEvent<IVoiceSynthesisNote> mNoteFieldModified;   // 「任一 note 任一字段变」聚合事件（宿主 WhenAnyItem，成员增删自动接线/退订）
-    readonly List<ISynthesisAutomation> mSubscribedAutomations = new();   // 已订阅 RangeModified 的固定轨（variance/gender/speed，恒定，Dispose 退订）
-    readonly Dictionary<string, ISynthesisAutomation> mMixSubscriptions = new();   // 已订阅的说话人混合轨（动态，key=mix:suffix，随 part 属性增减）
+    // 已订阅 RangeModified 的全部自动化轨（key → automation）。固定轨(variance/gender/speed)、seed、混音轨**皆**随
+    //   解析包(model/version)能力与 part 属性变化而增减，故统一幂等 re-sync——见 SyncAutomationSubscriptions。
+    readonly Dictionary<string, ISynthesisAutomation> mSubscriptions = new();
     readonly List<Piece> mPieces = new();
     bool mNeedResegment;
 
@@ -73,20 +74,10 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         context.PitchDeviation.RangeModified.Subscribe(OnRangeModified);
         context.Committed.Subscribe(OnCommitted);
 
-        // 固定轨（variance / gender / speed）区间编辑订阅：SDK 把声明上移到引擎后，宿主在「建会话之前」即
-        //   RefreshDeclarations 填好 Voice.AutomationConfigs（见 MidiPart 时序），故构造期 context.Automations 已含这些轨、直接订阅。
-        //   这些轨与 part 属性无关、恒定，构造期订一次即可。
-        if (pc != null)
-            foreach (var key in BuildFixedAutomationConfigs(pc.Config, RetakeOf(pc.Resolved)).Keys)
-                if (context.Automations.TryGetValue(key.Id, out var automation))
-                {
-                    automation.RangeModified.Subscribe(OnRangeModified);
-                    mSubscribedAutomations.Add(automation);
-                }
-
-        // 说话人混合轨是动态集（随 part 属性 speaker_mix 容器增减）：构造期同步一次（覆盖重开工程时已选的），
-        //   之后由 part 属性变更（MarkAllDirtyAndResegment）补/退订——见 SyncMixSubscriptions。
-        SyncMixSubscriptions();
+        // 区间编辑失效订阅：固定轨(variance/gender/speed，按能力 gating)、seed 轨(按 retake gating)、混音轨(按 part 属性)
+        //   皆随解析包(model/version)与 part 属性增减，故统一幂等 re-sync——构造期订一次，part 属性变再同步。
+        //   SDK 把声明上移到引擎后，宿主在「建会话之前」即 RefreshDeclarations 填好 context.Automations（见 MidiPart 时序）。
+        SyncAutomationSubscriptions();
 
         mNeedResegment = true;
     }
@@ -660,9 +651,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         mContext.PartProperties.Modified.Unsubscribe(MarkAllDirtyAndResegment);
         mContext.Pitch.RangeModified.Unsubscribe(OnRangeModified);
         mContext.PitchDeviation.RangeModified.Unsubscribe(OnRangeModified);
-        foreach (var automation in mSubscribedAutomations)
-            automation.RangeModified.Unsubscribe(OnRangeModified);
-        foreach (var automation in mMixSubscriptions.Values)
+        foreach (var automation in mSubscriptions.Values)
             automation.RangeModified.Unsubscribe(OnRangeModified);
         mContext.Committed.Unsubscribe(OnCommitted);
         foreach (var piece in mPieces)
@@ -740,33 +729,42 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
     {
         foreach (var piece in mPieces) { piece.Dirty = true; piece.Failed = false; }
         mNeedResegment = true;
-        // part 属性变更可能增删了说话人混合轨：补订新出现的、退订已消失的，使后续画曲线（RangeModified）能标脏。
+        // part 属性变更（含 model/version 切换）可能增删了固定/seed/混音轨：补订新出现的、退订已消失的，使后续画曲线能标脏。
         //   时序安全：宿主 OnPartPropertiesModified（part 构造期订阅）先于本会话 handler（会话构造期订阅）执行，
-        //   它已 RebuildAutomationConfigs 填好 Voice.AutomationConfigs，故此刻 context.Automations 已含已选轨。
-        SyncMixSubscriptions();
+        //   它已 RebuildAutomationConfigs 填好 Voice.AutomationConfigs，故此刻 context.Automations 已反映新解析包的轨集。
+        SyncAutomationSubscriptions();
     }
 
-    // 同步说话人混合轨订阅到当前 part 属性已选集：遍历全量去重 speaker 表（无需枚举 part 属性，live 视图也不支持），
-    //   逐个查 Automations map——命中（= 已声明 = 已选）且未订则订、不命中且已订则退。幂等，可反复调。
-    void SyncMixSubscriptions()
+    // 同步「区间编辑失效」订阅到当前应有的轨集：固定轨(variance/gender/speed，按解析包能力 gating)、seed 轨(按 retake
+    //   gating)、说话人混合轨(按 part 属性选择)——三类都随 model/version 与 part 属性变化而增删。统一幂等 re-sync：
+    //   只订阅宿主当前已声明(live)的轨（gating 掉的轨不在 context.Automations 里、无从订阅，故必须按出现/消失增删，
+    //   而非构造期一次性订全），故 OnRangeModified 收到的恒是有效轨、无需再判条件。可反复调。
+    void SyncAutomationSubscriptions()
     {
         if (mResolve(PropsOf(mContext.PartProperties)) is not { } pc)
             return;
-        foreach (var (key, _) in MixTrackKeys(pc.Resolved))   // key = mix:<suffix>
-        {
-            bool live = mContext.Automations.TryGetValue(key, out var automation);
-            bool subscribed = mMixSubscriptions.ContainsKey(key);
-            if (live && !subscribed)
+
+        // 当前应订的轨集 = 固定轨(已 gating) ∪ 全量候选混音轨；混音候选里未选中的不会 live，下方按 live 过滤。
+        var desired = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var key in BuildFixedAutomationConfigs(pc.Config, RetakeOf(pc.Resolved)).Keys)
+            desired.Add(key.Id);
+        foreach (var (key, _) in MixTrackKeys(pc.Resolved))
+            desired.Add(key);
+
+        // 补订：应有且宿主已声明(live)、尚未订阅的。
+        foreach (var key in desired)
+            if (!mSubscriptions.ContainsKey(key) && mContext.Automations.TryGetValue(key, out var automation))
             {
-                automation!.RangeModified.Subscribe(OnRangeModified);
-                mMixSubscriptions[key] = automation;
+                automation.RangeModified.Subscribe(OnRangeModified);
+                mSubscriptions[key] = automation;
             }
-            else if (!live && subscribed)
+        // 退订：已订阅但不再应有（gating 掉）、或宿主已撤下该轨(混音被取消选择)的。
+        foreach (var key in mSubscriptions.Keys.ToList())
+            if (!desired.Contains(key) || !mContext.Automations.ContainsKey(key))
             {
-                mMixSubscriptions[key].RangeModified.Unsubscribe(OnRangeModified);
-                mMixSubscriptions.Remove(key);
+                mSubscriptions[key].RangeModified.Unsubscribe(OnRangeModified);
+                mSubscriptions.Remove(key);
             }
-        }
     }
 
     void OnCommitted()
