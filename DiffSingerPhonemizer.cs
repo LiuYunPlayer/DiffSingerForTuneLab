@@ -228,18 +228,23 @@ public static class DiffSingerPhonemizer
         var encDense = new DenseTensor<float>(enc.ToArray(), enc.Dimensions.ToArray());
         var maskDense = new DenseTensor<bool>(mask.ToArray(), mask.Dimensions.ToArray());
 
-        float[] emb = dur.GetEmbedding(speaker);
-        var spk = new float[nTokens * hidden];
-        for (int i = 0; i < nTokens; i++) Array.Copy(emb, 0, spk, i * hidden, hidden);
-
         var durModel = dur.Model("dur");
         var durInputs = new List<NamedOnnxValue>
         {
             NamedOnnxValue.CreateFromTensor("encoder_out", encDense),
             NamedOnnxValue.CreateFromTensor("x_masks", maskDense),
             Nv("ph_midi", phMidi.Select(x => (long)x).ToArray(), nTokens),
-            NamedOnnxValue.CreateFromTensor("spk_embed", new DenseTensor<float>(spk, new[] { 1, nTokens, hidden })),
         };
+        // spk_embed 仅当 dur 模型声明该口时喂入（单说话人模型无此口）——
+        //   与 DiffSingerPitch / DiffSingerVariance 一致；否则向 ORT 喂未声明输入会抛 Invalid Feed Input Name。
+        if (durModel.InputMetadata.ContainsKey("spk_embed"))
+        {
+            float[] emb = dur.GetEmbedding(speaker);
+            var spk = new float[nTokens * hidden];
+            for (int i = 0; i < nTokens; i++) Array.Copy(emb, 0, spk, i * hidden, hidden);
+            durInputs.Add(NamedOnnxValue.CreateFromTensor("spk_embed",
+                new DenseTensor<float>(spk, new[] { 1, nTokens, hidden })));
+        }
         var durOut = DiffSingerTensorCache.Run(durModel, dur.ModelHash("dur"), durInputs, tensorCache);
         return durOut.First(v => v.Name == "ph_dur_pred").AsTensor<float>().Select(x => (double)x).ToArray();
     }
