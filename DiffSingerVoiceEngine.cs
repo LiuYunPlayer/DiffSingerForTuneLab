@@ -157,7 +157,7 @@ public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSet
             },
             {
                 (KeySamplingSteps, L.Tr("Sampling steps")),
-                new SliderConfig { DefaultValue = 20, MinValue = 1, MaxValue = 1000, IsInteger = true }
+                SliderConfig.Integer(20, 1, 1000)
             },
             {
                 (KeyTensorCache, L.Tr("Tensor cache")),
@@ -165,7 +165,7 @@ public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSet
             },
             {
                 (KeyCacheMaxSizeMb, L.Tr("Cache size limit (MB, 0 = unlimited)")),
-                new SliderConfig { DefaultValue = 4096, MinValue = 0, MaxValue = 102400, IsInteger = true }
+                SliderConfig.Integer(4096, 0, 102400)
             },
         };
         return new ObjectConfig { Properties = properties };
