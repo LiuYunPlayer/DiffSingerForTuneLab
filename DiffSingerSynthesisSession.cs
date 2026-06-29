@@ -19,9 +19,10 @@ namespace DiffSingerForTuneLab;
 // 调度、6 级推理管线、产物发布。轨 key 与 variance/gender/speed 规格复用 DiffSingerDeclarations（using static 引入）。
 public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
 {
-    readonly VoicebankConfig mConfig;
     readonly IVoiceSynthesisContext mContext;
     readonly string mVoiceId;
+    readonly Func<ResolveProps, PartContext?> mResolve;   // (model/version 选择) → 解析到具体物理包能力集；运行时支持换 model/version
+    readonly VoicebankConfig? mConfig;   // 构造期解析包（驱动固定轨订阅/回显轨集合）；运行时 Render 按 part 属性另行解析
     readonly DiffSingerModelCache mModelCache;
     readonly int mSamplingSteps;
     readonly bool mTensorCache;        // 张量缓存总开关（引擎设置 tensor_cache）
@@ -38,19 +39,22 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
     readonly List<Piece> mPieces = new();
     bool mNeedResegment;
 
-    public DiffSingerSynthesisSession(VoicebankConfig config, IVoiceSynthesisContext context,
-        string voiceId, DiffSingerModelCache modelCache, int samplingSteps, bool tensorCache, int cacheMaxSizeMb)
+    public DiffSingerSynthesisSession(string voiceId, IVoiceSynthesisContext context,
+        Func<ResolveProps, PartContext?> resolve, DiffSingerModelCache modelCache,
+        int samplingSteps, bool tensorCache, int cacheMaxSizeMb)
     {
-        mConfig = config;
-        mContext = context;
         mVoiceId = voiceId;
+        mContext = context;
+        mResolve = resolve;
         mModelCache = modelCache;
         mSamplingSteps = samplingSteps;
         mTensorCache = tensorCache;
         mCacheMaxSizeMb = cacheMaxSizeMb;
 
-        // 声明派生物据声库能力集算一次（与引擎声明同一套 DiffSingerDeclarations，单一真相源）。
-        mReadbackConfigs = BuildReadbackConfigs(config);
+        // 构造期解析一次（驱动固定轨订阅与回显轨集合）；运行时 Render 按 part 属性另行解析、支持 model/version 切换。
+        var pc = resolve(PropsOf(context.PartProperties));
+        mConfig = pc?.Config;
+        mReadbackConfigs = pc != null ? BuildReadbackConfigs(pc.Config) : new OrderedMap<PropertyKey, AutomationConfig>();
 
         // 变更接线（handler 只做廉价标脏；重活延迟到 Committed 重分块）——见 §5.9。
         //   note 字段变更：宿主 WhenAnyItem 把「每个现有/未来成员的这几个属性事件」聚合成一个带成员标识的事件，
@@ -72,12 +76,13 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         // 固定轨（variance / gender / speed）区间编辑订阅：SDK 把声明上移到引擎后，宿主在「建会话之前」即
         //   RefreshDeclarations 填好 Voice.AutomationConfigs（见 MidiPart 时序），故构造期 context.Automations 已含这些轨、直接订阅。
         //   这些轨与 part 属性无关、恒定，构造期订一次即可。
-        foreach (var key in BuildFixedAutomationConfigs(config).Keys)
-            if (context.Automations.TryGetValue(key.Id, out var automation))
-            {
-                automation.RangeModified.Subscribe(OnRangeModified);
-                mSubscribedAutomations.Add(automation);
-            }
+        if (pc != null)
+            foreach (var key in BuildFixedAutomationConfigs(pc.Config, RetakeOf(pc.Resolved)).Keys)
+                if (context.Automations.TryGetValue(key.Id, out var automation))
+                {
+                    automation.RangeModified.Subscribe(OnRangeModified);
+                    mSubscribedAutomations.Add(automation);
+                }
 
         // 说话人混合轨是动态集（随 part 属性 speaker_mix 容器增减）：构造期同步一次（覆盖重开工程时已选的），
         //   之后由 part 属性变更（MarkAllDirtyAndResegment）补/退订——见 SyncMixSubscriptions。
@@ -171,13 +176,23 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         if (notes.Count == 0 || cancellation.IsCancellationRequested)
             return null;
 
-        var models = mModelCache.GetOrLoad(mVoiceId, mConfig);
+        // 运行时解析：按 part 属性（model/version）定到具体物理包，支持会话存续期内换 model/version。
+        if (mResolve(PropsOf(snapshot.PartProperties)) is not { } pc)
+            return null;
+        var config = pc.Config;
+        var resolved = pc.Resolved;
+
+        var models = mModelCache.GetOrLoad(config);
         int hop = models.HopSize, sr = models.SampleRate, hidden = models.HiddenSize;
         double frameSec = (double)hop / sr;
         int head = DiffSingerFrames.HeadFrames;
 
-        string partLang = snapshot.PartProperties.GetString(KeyLanguage, mConfig.Languages.Count > 0 ? mConfig.Languages[0] : string.Empty);
-        string speaker = snapshot.PartProperties.GetString(KeySpeaker, mConfig.Speakers.Count > 0 ? mConfig.Speakers[0] : string.Empty);
+        var speakerSet = SpeakerSet.Compute(resolved);
+        string partLang = snapshot.PartProperties.GetString(KeyLanguage, DefaultLanguageId(config, resolved));
+        // 合成用说话人（嵌入解析）= 当前 voice 在该包的 dsconfig 后缀（单说话人模型为空串、模型无 spk_embed 时不喂）。
+        string speaker = !string.IsNullOrEmpty(resolved.VoiceSpeaker)
+            ? resolved.VoiceSpeaker
+            : (config.Speakers.Count > 0 ? config.Speakers[0] : string.Empty);
         var noteLang = notes.Select(nt => nt.Properties.GetString(KeyLanguage, partLang)).ToArray();
 
         // —— Phonemizer：歌词 → 音素时间线（绝对秒、含前置辅音越界）——
@@ -204,7 +219,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         var frameTimes = new double[nFrames];
         for (int f = 0; f < nFrames; f++) frameTimes[f] = renderStart + (f + 0.5) * frameSec;
         var mixTracks = new List<(string Suffix, double[] Sampled)>();
-        foreach (var (key, suffix) in SpeakerMixTracks(mConfig))
+        foreach (var (key, suffix) in SpeakerMixTracks(speakerSet))
             if (snapshot.Automations.TryGetValue(key, out var mixAuto))
                 mixTracks.Add((suffix, mixAuto.Evaluator.Evaluate(frameTimes)));
         var speakerMix = DiffSingerSpeakerMix.Create(Suffix(speaker), mixTracks, nFrames);
@@ -253,7 +268,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         //   用户已画处（Pitch 非 NaN）用户值覆盖；NaN 自由区用预测轮廓（无 dspitch ⇒ 仍用矩形 framePitch）；PITD/vibrato 叠加在上。
         var predictedPitch = DiffSingerPitch.Predict(
             models.GetPredictor("dspitch"), phones, notes, durations,
-            renderStart, frameSec, speakerMix, mConfig, mSamplingSteps, seedPitchCurve, mTensorCache);
+            renderStart, frameSec, speakerMix, config, mSamplingSteps, seedPitchCurve, mTensorCache);
         progress?.Report(0.28);
         if (cancellation.IsCancellationRequested)
             return null;
@@ -281,7 +296,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         // —— variance 预测（基线；下方与用户 delta 合成喂声学、纯预测产回显）——
         var varCurves = DiffSingerVariance.Predict(
             models.GetPredictor("dsvariance"), phones.Select(p => p.Symbol).ToList(),
-            durations, semis, speakerMix, mConfig, mSamplingSteps, seedVarianceCurve, mTensorCache);
+            durations, semis, speakerMix, config, mSamplingSteps, seedVarianceCurve, mTensorCache);
         progress?.Report(0.45);
         if (cancellation.IsCancellationRequested)
             return null;
@@ -313,13 +328,13 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
             if (ac.InputMetadata.ContainsKey(spec.Key))
                 AddF(spec.Key, CombineVariance(spec, predicted, user, nFrames), new[] { 1, nFrames });
 
-            if (spec.Use(mConfig) && spec.Predict(mConfig) && predicted != null)
+            if (spec.Use(config) && spec.Predict(config) && predicted != null)
                 varReadback[spec.Key] = BuildReadbackSegment(spec, predicted, frameTimes, nFrames);
         }
 
         // —— gender / velocity：纯用户曲线（无方差器基线），按帧 convert 喂声学（忠实移植 OpenUtau GENC/VELC）——
         //   无轨 / NaN 自由区 → 中性 → convert 得中性 embed（gender 0、velocity 1）；OpenUtau 不 clamp（UI 量程已界定）。
-        AddF("gender", BuildCurveInput(snapshot, KeyGender, GenderBaseline, GenderConvert(), frameTimes, nFrames), new[] { 1, nFrames });
+        AddF("gender", BuildCurveInput(snapshot, KeyGender, GenderBaseline, GenderConvert(config), frameTimes, nFrames), new[] { 1, nFrames });
         AddF("velocity", BuildCurveInput(snapshot, KeySpeed, SpeedBaseline, SpeedConvert, frameTimes, nFrames), new[] { 1, nFrames });
 
         if (ac.InputMetadata.ContainsKey("spk_embed"))
@@ -327,9 +342,9 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
             var spk = speakerMix.ToEmbedding(models.GetSpeakerEmbeddingBySuffix, hidden);
             cond.Add(NamedOnnxValue.CreateFromTensor("spk_embed", new DenseTensor<float>(spk, new[] { 1, nFrames, hidden })));
         }
-        if (mConfig.UseContinuousAcceleration)
+        if (config.UseContinuousAcceleration)
         {
-            if (ac.InputMetadata.ContainsKey("depth") && mConfig.UseVariableDepth)
+            if (ac.InputMetadata.ContainsKey("depth") && config.UseVariableDepth)
                 cond.Add(NamedOnnxValue.CreateFromTensor("depth", new DenseTensor<float>(new[] { (float)models.MaxDepth }, new[] { 1 })));
             if (ac.InputMetadata.ContainsKey("steps"))
                 cond.Add(NamedOnnxValue.CreateFromTensor("steps", new DenseTensor<long>(new[] { (long)mSamplingSteps }, new[] { 1 })));
@@ -501,10 +516,22 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
 
     // GENC convert（OpenUtau DiffSingerRenderer）：正 = formant 下移；缩放由声库增广范围 KeyShift*（=range）定。
     //   range 某端为 0 ⇒ 该方向 scale=0（不移位）。闭包按当前声库现算（每会话固定）。
-    Func<double, double> GenderConvert()
+    // 从 part 属性抽出 model/version 选择（解析入参）。两种属性形态：快照 PropertyObject（Render）与实时只读外观（构造/订阅）。
+    static ResolveProps PropsOf(PropertyObject p)
+        => new(NullIfEmpty(p.GetString(KeyModel, string.Empty)), NullIfEmpty(p.GetString(KeyVersion, string.Empty)));
+
+    static ResolveProps PropsOf(IReadOnlyNotifiablePropertyObject p)
+        => new(NullIfEmpty(LiveString(p, KeyModel)), NullIfEmpty(LiveString(p, KeyVersion)));
+
+    static string LiveString(IReadOnlyNotifiablePropertyObject p, string key)
+        => p.GetValue(key, PropertyValue.Create(string.Empty)).ToString(out var s) ? s : string.Empty;
+
+    static string? NullIfEmpty(string s) => string.IsNullOrEmpty(s) ? null : s;
+
+    static Func<double, double> GenderConvert(VoicebankConfig config)
     {
-        double posScale = mConfig.KeyShiftMax == 0 ? 0 : 12 / mConfig.KeyShiftMax / 100;
-        double negScale = mConfig.KeyShiftMin == 0 ? 0 : -12 / mConfig.KeyShiftMin / 100;
+        double posScale = config.KeyShiftMax == 0 ? 0 : 12 / config.KeyShiftMax / 100;
+        double negScale = config.KeyShiftMin == 0 ? 0 : -12 / config.KeyShiftMin / 100;
         return x => x < 0 ? -x * posScale : -x * negScale;
     }
 
@@ -721,7 +748,9 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
     //   逐个查 Automations map——命中（= 已声明 = 已选）且未订则订、不命中且已订则退。幂等，可反复调。
     void SyncMixSubscriptions()
     {
-        foreach (var (key, _) in SpeakerMixTracks(mConfig))   // key = mix:<suffix>
+        if (mResolve(PropsOf(mContext.PartProperties)) is not { } pc)
+            return;
+        foreach (var (key, _) in MixTrackKeys(pc.Resolved))   // key = mix:<suffix>
         {
             bool live = mContext.Automations.TryGetValue(key, out var automation);
             bool subscribed = mMixSubscriptions.ContainsKey(key);

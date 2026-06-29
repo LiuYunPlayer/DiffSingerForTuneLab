@@ -33,11 +33,12 @@ public sealed class DiffSingerModelCache : IDisposable
     // 声码器根目录约定：插件用户数据根下、与声库 Voices 目录并列的 Vocoders 目录；声学 dsconfig 的 vocoder 字段即子目录名。
     public static string VocodersDirectory => Path.Combine(DiffSingerDeclarations.UserDataRoot, "Vocoders");
 
-    public VoiceModels GetOrLoad(string voiceId, VoicebankConfig config)
+    // 按物理模型包目录（config.RootPath）缓存——同一 voice 选不同 model/version = 不同物理包 = 各自缓存、不重复加载。
+    public VoiceModels GetOrLoad(VoicebankConfig config)
     {
         lock (mLock)
         {
-            if (mVoices.TryGetValue(voiceId, out var cached))
+            if (mVoices.TryGetValue(config.RootPath, out var cached))
                 return cached;
 
             var acousticPath = Path.Combine(config.RootPath, config.AcousticFileName);
@@ -46,7 +47,7 @@ public sealed class DiffSingerModelCache : IDisposable
             var (vocoder, vocoderHash) = GetOrLoadVocoder(config.VocoderName);
             // 预测器（dsdur/dspitch/dsvariance）懒加载共用本缓存的会话加载器（含 DML→CPU 回退）。
             var models = new VoiceModels(config, acoustic, acousticHash, vocoder, vocoderHash, LoadSession, mLogger);
-            mVoices[voiceId] = models;
+            mVoices[config.RootPath] = models;
             return models;
         }
     }
