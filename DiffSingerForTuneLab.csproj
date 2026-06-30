@@ -32,6 +32,15 @@
   <!-- manifest 随输出，宿主据此免反射即知插件提供什么。 -->
   <ItemGroup>
     <Content Include="description.json" CopyToOutputDirectory="PreserveNewest" />
+    <!-- 移植/捆绑第三方（OpenUtau MIT）的署名，随包分发。 -->
+    <Content Include="THIRD-PARTY-NOTICES.md" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- G2P 算法引擎的语言包（移植自 OpenUtau，MIT；各含 dict.txt + phones.txt + g2p.onnx）。
+       嵌入插件程序集，运行时经 G2pPack.LoadEmbeddedPack 按 LogicalName 读取。 -->
+  <ItemGroup>
+    <EmbeddedResource Include="G2p\Data\g2p-arpabet-plus.zip" LogicalName="DiffSingerForTuneLab.G2p.Data.g2p-arpabet-plus.zip" />
+    <EmbeddedResource Include="G2p\Data\g2p-ko.zip" LogicalName="DiffSingerForTuneLab.G2p.Data.g2p-ko.zip" />
   </ItemGroup>
   <!-- 私有依赖：随包分发、进本插件专属 ALC。
        · YamlDotNet 解析声库的 dsconfig / character / dsdict。

@@ -5,6 +5,8 @@ using System.Linq;
 using Microsoft.ML.OnnxRuntime;
 using YamlDotNet.Serialization;
 
+using DiffSingerForTuneLab.G2p;
+
 namespace DiffSingerForTuneLab;
 
 // 一个 DiffSinger 预测器子目录（dsdur / dspitch / dsvariance）的已加载束：
@@ -24,7 +26,7 @@ public sealed class DiffSingerPredictor : IDisposable
     readonly int mHidden;
     readonly Dictionary<string, InferenceSession> mModels = new(StringComparer.Ordinal);
     readonly Dictionary<string, float[]> mEmbCache = new(StringComparer.Ordinal);
-    readonly Dictionary<string, Dictionary<string, string[]>> mEntryCache = new(StringComparer.Ordinal);
+    readonly Dictionary<string, IG2p?> mG2pChains = new(StringComparer.Ordinal);  // lang → G2P 兜底链（词典 ⊕ 算法 remap），懒构建缓存
     readonly Dictionary<string, string> mSymbolTypes = new(StringComparer.Ordinal);  // symbol → type（合并 dsdict）
     readonly object mLock = new();
 
@@ -86,14 +88,13 @@ public sealed class DiffSingerPredictor : IDisposable
             : throw new InvalidOperationException($"音素 \"{symbol}\" 不在 {Path.GetFileName(mDir)} 的音素表中");
     public long LangId(string lang) => mLanguages.TryGetValue(lang, out var id) ? id : 0;
 
-    // —— G2P：按语言查 dsdict-{lang}.yaml 词条（grapheme→带前缀音素），exact 后小写回退 ——
+    // —— G2P：按语言懒构建兜底链（词典 → 算法引擎 remap），exact 后小写回退（忠实 OpenUtau GetSymbols）——
     public string[] G2P(string lyric, string lang)
     {
-        var entries = GetEntries(lang);
+        var chain = ResolveChain(lang);
+        if (chain == null) return Array.Empty<string>();
         var key = lyric.Trim();
-        if (entries.TryGetValue(key, out var phs)) return phs;
-        if (entries.TryGetValue(key.ToLowerInvariant(), out phs)) return phs;
-        return Array.Empty<string>();
+        return chain.Query(key) ?? chain.Query(key.ToLowerInvariant()) ?? Array.Empty<string>();
     }
 
     // 说话人逐元素嵌入（.emb = HiddenSize 个 float32 LE）：按声学说话人后缀（如 "Miku"）关联本预测器同后缀条目，
@@ -119,28 +120,109 @@ public sealed class DiffSingerPredictor : IDisposable
         }
     }
 
-    // —— 词典加载 ——
-    Dictionary<string, string[]> GetEntries(string lang)
+    // —— G2P 兜底链构建（懒，按 lang 缓存）——
+    //   链 = G2pFallbacks([ 声库词典层, 算法引擎 remap 层 ])：词典命中作者精修词优先，OOV 落算法引擎。
+    //   tunelab.yaml 的 g2p 覆盖经 langEngineOverride 传入（缺省 null = 走内置默认绑定）。
+    IG2p? ResolveChain(string lang)
     {
         lock (mLock)
         {
-            if (mEntryCache.TryGetValue(lang, out var cached))
+            if (mG2pChains.TryGetValue(lang, out var cached))
                 return cached;
-
-            var map = new Dictionary<string, string[]>(StringComparer.Ordinal);
-            foreach (var file in new[] { $"dsdict-{lang}.yaml", $"dsdict-zh-{lang}.yaml", "dsdict.yaml" })
-            {
-                var path = Path.Combine(mDir, file);
-                if (!File.Exists(path)) continue;
-                var root = DeserializeDsDict(path);
-                foreach (var e in root.entries)
-                    if (!string.IsNullOrEmpty(e.grapheme))
-                        map[e.grapheme] = e.phonemes.ToArray();
-                break;
-            }
-            mEntryCache[lang] = map;
-            return map;
+            var chain = BuildChain(lang);
+            mG2pChains[lang] = chain;
+            return chain;
         }
+    }
+
+    IG2p? BuildChain(string lang)
+    {
+        var dictData = LoadDsDictFile(lang);
+        var layers = new List<IG2p>();
+
+        // 1) 词典层：dsdict 的 symbols(类型) + entries(grapheme→声库音素) + SP/AP。先声明符号再加词条（否则词条里未声明符号被丢）。
+        var builder = G2pDictionary.NewBuilder();
+        foreach (var s in dictData.symbols)
+            if (!string.IsNullOrEmpty(s.symbol))
+                builder.AddSymbol(s.symbol.Trim(), s.type ?? string.Empty);
+        builder.AddSymbol("SP", true);
+        builder.AddSymbol("AP", true);
+        foreach (var e in dictData.entries)
+            if (!string.IsNullOrEmpty(e.grapheme))
+                builder.AddEntry(e.grapheme, e.phonemes);
+        layers.Add(builder.Build());
+
+        // 类型表 augment：把 dsdict 声明的符号类型（归一化为 vowel/glide/consonant）补进预测器类型表，
+        //   供 phonemizer 的 IsVowel/IsGlide 分组使用（现有 LoadSymbolTypes 只读合并 dsdict.yaml，多语言库的 per-lang 符号靠这里补）。
+        foreach (var s in dictData.symbols)
+            if (!string.IsNullOrEmpty(s.symbol))
+                AddSymbolTypeIfAbsent(s.symbol.Trim(), NormalizeType(s.type));
+
+        // 2) 算法引擎 + remap 层（按语言绑定；无绑定 = 纯词典）。
+        var desc = G2pEngines.ForLanguage(lang);
+        if (desc != null)
+        {
+            var engine = desc.Create();
+            var replacements = dictData.replacementsDict();           // dsdict 显式覆盖（最高优先）
+            var phonemeSymbols = new Dictionary<string, bool>(StringComparer.Ordinal); // 声库符号 → isVowel
+            var glide = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var ph in desc.Vowels.Concat(desc.Consonants))
+            {
+                // 规范符号 ph → 声库符号 resolved：dsdict 覆盖 > 前缀版存在 > 裸版存在 > 默认前缀。
+                //   这条 bare/prefix 回退是「让单语(裸符号)与多语言(前缀)库都能用」的关键，比 OpenUtau 无条件前缀更稳。
+                string resolved;
+                if (replacements.TryGetValue(ph, out var explicitTo))
+                    resolved = explicitTo;
+                else
+                {
+                    resolved = ResolveRemapTarget(ph, lang);
+                    replacements[ph] = resolved;                      // 写回供 G2pRemapper.Query 改写
+                }
+                bool isVowel = engine.IsVowel(ph);
+                bool isGlide = engine.IsGlide(ph);
+                phonemeSymbols[resolved] = isVowel;
+                if (isGlide) glide.Add(resolved);
+                AddSymbolTypeIfAbsent(resolved, isVowel ? "vowel" : isGlide ? "glide" : "consonant");
+            }
+            layers.Add(new G2pRemapper(engine, phonemeSymbols, replacements, glide));
+        }
+
+        return layers.Count > 0 ? new G2pFallbacks(layers.ToArray()) : null;
+    }
+
+    // 规范符号 → 声库音素表里实际存在的符号：优先 <lang>/<ph>（多语言库），其次裸 <ph>（单语库），都无则默认带前缀。
+    string ResolveRemapTarget(string ph, string lang)
+    {
+        if (!string.IsNullOrEmpty(lang) && mPhonemes.ContainsKey(lang + "/" + ph))
+            return lang + "/" + ph;
+        if (mPhonemes.ContainsKey(ph))
+            return ph;
+        return string.IsNullOrEmpty(lang) ? ph : lang + "/" + ph;
+    }
+
+    void AddSymbolTypeIfAbsent(string symbol, string type)
+    {
+        if (!mSymbolTypes.ContainsKey(symbol))
+            mSymbolTypes[symbol] = type;
+    }
+
+    // 归一化到预测器类型表词表（IsVowel 认 "vowel"、IsGlide 认 "glide"）：OpenUtau/包用 semivowel/liquid 表滑音。
+    static string NormalizeType(string? type) => type switch
+    {
+        "vowel" => "vowel",
+        "semivowel" or "liquid" or "glide" => "glide",
+        _ => "consonant",
+    };
+
+    // 按 dsdict-{lang}.yaml → dsdict-zh-{lang}.yaml → dsdict.yaml 顺序取首个存在的词典文件。
+    DsDictFile LoadDsDictFile(string lang)
+    {
+        foreach (var file in new[] { $"dsdict-{lang}.yaml", $"dsdict-zh-{lang}.yaml", "dsdict.yaml" })
+        {
+            var path = Path.Combine(mDir, file);
+            if (File.Exists(path)) return DeserializeDsDict(path);
+        }
+        return new DsDictFile();
     }
 
     void LoadSymbolTypes(string dsdictPath)
@@ -169,11 +251,23 @@ public sealed class DiffSingerPredictor : IDisposable
     }
 }
 
-// dsdict-{lang}.yaml / dsdict.yaml 结构：entries: -{grapheme, phonemes:[...]}；symbols: -{symbol, type}。
+// dsdict-{lang}.yaml / dsdict.yaml 结构：entries: -{grapheme, phonemes:[...]}；symbols: -{symbol, type}；
+//   replacements: -{from, to}（规范符号→声库符号的逐项覆盖，OpenUtau DiffSingerG2pDictionaryData 同款；读、不改）。
 sealed class DsDictFile
 {
     public List<DsDictEntry> entries { get; set; } = new();
     public List<DsDictSymbol> symbols { get; set; } = new();
+    public List<DsDictReplacement> replacements { get; set; } = new();
+
+    public Dictionary<string, string> replacementsDict()
+    {
+        var dict = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var r in replacements)
+            if (!string.IsNullOrEmpty(r.from))
+                dict[r.from] = r.to;
+        return dict;
+    }
 }
 sealed class DsDictEntry { public string grapheme { get; set; } = ""; public List<string> phonemes { get; set; } = new(); }
 sealed class DsDictSymbol { public string symbol { get; set; } = ""; public string type { get; set; } = ""; }
+sealed class DsDictReplacement { public string from { get; set; } = ""; public string to { get; set; } = ""; }
