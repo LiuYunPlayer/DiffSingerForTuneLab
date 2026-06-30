@@ -144,14 +144,14 @@ public static class DiffSingerDeclarations
                 .WithDefault(PropertyValue.Create(string.Empty)));
         }
 
-        var set = SpeakerSet.Compute(pc.Resolved);
-
-        // 说话人混合容器：候选 = 同包暴露 voice 中除当前 voice 外的（legacy 即旧 speaker 下拉里的其他人）。
-        if (set.Options.Any(o => o.Suffix != set.DefaultSuffix))
-            properties.Add((KeyMix, L.Tr("Speaker mix")), BuildSpeakerMixConfig(set, mergedProps));
-
+        // 默认语言：多语言切换属高频操作，排在进阶的混音容器之上。
         if (HasLanguageChoice(pc))
             properties.Add((KeyLanguage, L.Tr("Language")), LanguageCombo(EffectiveLanguages(pc), DefaultLanguageId(pc.Config, pc.Resolved)));
+
+        // 说话人混合容器：候选 = 同包暴露 voice 中除当前 voice 外的（legacy 即旧 speaker 下拉里的其他人）。
+        var set = SpeakerSet.Compute(pc.Resolved);
+        if (set.Options.Any(o => o.Suffix != set.DefaultSuffix))
+            properties.Add((KeyMix, L.Tr("Speaker mix")), BuildSpeakerMixConfig(set, mergedProps));
 
         return ObjectConfig.Create(properties);
     }
