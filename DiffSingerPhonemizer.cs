@@ -22,6 +22,10 @@ public static class DiffSingerPhonemizer
 {
     const string Pause = "SP";
     const double PaddingSec = 0.5;   // 短语首辅音前导空间（OpenUtau padding=500ms）
+    // 插件约定：note 歌词写 "+" 表示「当前多音节词的下一个音节从本 note 起」（OpenUtau 同款记号）。
+    //   宿主不建模它（IsContinuation 只认纯延音 "-"），故由本层识别该歌词记号——这与「不自行匹配延续记号」不冲突，
+    //   延续仍只读宿主 IsContinuation；"+" 是宿主未覆盖的拆音节功能，只能插件层解释。
+    const string SyllableAdvance = "+";
 
     sealed class Group
     {
@@ -39,36 +43,83 @@ public static class DiffSingerPhonemizer
             return new List<PhonemeSpan>();
         double frameSec = (double)hop / sampleRate;
 
-        // —— 构建短语组：首组(前导 SP) + 各 note 的元音对齐分组 + 尾哨兵 ——
-        var groups = new List<Group> { new(-1, notes[0].Pitch) { } };
+        // —— 构建短语组：首组(前导 SP) + 各「音节 note」(词首 + 每个 "+") 的元音对齐分组 + 尾哨兵 ——
+        //   词模型：常规歌词 note 起一个新词，G2P 出全部音节；其后的 "+" 各取下一音节、"-" 为纯延音(melisma)。
+        //   每个音节 note 与今天单 note 走完全相同的处理（onset 前移、韵核成组、FillEnd 铺元音）；
+        //   音节与 "+" 数量不匹配的边界处理见下方分配逻辑。
+        var groups = new List<Group> { new(-1, notes[0].Pitch) };
         groups[0].Phonemes.Add(Pause);
         var notePhIndex = new List<int> { 1 };          // 各 note 在展平序列中的起始下标（含前导 SP 占 0）
-        var noteSymbolCount = new int[notes.Count];     // 每 note 的音素数（onset+韵核）
+        var noteSymbolCount = new int[notes.Count];     // 每 note 的音素数（onset+韵核）；延音/空 note 为 0
         var leadCounts = new int[notes.Count];          // 每 note 的前置辅音数（ProcessWord 的前置组大小）：定 IsLead
         var pinned = new bool[notes.Count];
 
-        for (int i = 0; i < notes.Count; i++)
+        // 把一个 note 的音素串并入 groups：onset 前移并入前组、韵核成组于本 note 起点；登记 count/lead/phIndex。
+        void EmitNote(int idx, string[] symbols, bool isPinned)
         {
-            var note = notes[i];
+            pinned[idx] = isPinned;
+            noteSymbolCount[idx] = symbols.Length;
+            var wordGroups = ProcessWord(dur, notes[idx], symbols);
+            leadCounts[idx] = wordGroups[0].Phonemes.Count;
+            groups[^1].Phonemes.AddRange(wordGroups[0].Phonemes);
+            groups.AddRange(wordGroups.Skip(1));
+            notePhIndex.Add(notePhIndex[^1] + symbols.Length);
+        }
+        // 延音 note（count=0）：不产音素、不建组，前一发声 note 的元音经 FillEnd 铺过它。
+        void EmitMelisma(int idx)
+        {
+            pinned[idx] = false;
+            noteSymbolCount[idx] = 0;
+            notePhIndex.Add(notePhIndex[^1]);
+        }
 
-            // 延音符（宿主 IsContinuation 标志）：不产音素、不建组——前一发声 note 的元音经 FillEnd 铺过它。
-            //   notePhIndex 记空区间。首 note 即延续则无前可沿，退化为常规 G2P。
-            if (i > 0 && note.IsContinuation)
+        int wi = 0;
+        while (wi < notes.Count)
+        {
+            // 防御：句首孤儿延音（宿主断链后 IsContinuation 应为 false，正常不会到这）。
+            if (wi > 0 && notes[wi].IsContinuation) { EmitMelisma(wi); wi++; continue; }
+
+            // 词起点：取词首 note 的音素串（钉死=note.Phonemes 符号；否则 G2P 整词）。
+            string[] leadSymbols = GetSymbols(dur, notes[wi], noteLang[wi], out bool isPinned);
+            bool leadIsPlus = IsSyllableAdvance(notes[wi]);   // 句首孤儿 "+"（无前词）
+
+            // 收集本词所有 note（词首 + 其后的 "+"/"-"，到下一个常规歌词为止）。音节槽 = 词首 + 各 "+"。
+            int end = wi + 1;
+            var slots = new List<int> { wi };
+            while (end < notes.Count && (notes[end].IsContinuation || IsSyllableAdvance(notes[end])))
             {
-                pinned[i] = false;
-                noteSymbolCount[i] = 0;
-                notePhIndex.Add(notePhIndex[^1]);
-                continue;
+                if (IsSyllableAdvance(notes[end])) slots.Add(end);
+                end++;
             }
 
-            string[] symbols = GetSymbols(dur, note, noteLang[i], out pinned[i]);
-            noteSymbolCount[i] = symbols.Length;
+            // 拆音节：仅常规 G2P 词（非钉死、非孤儿 "+"）才拆；否则整串作单音节。
+            var segments = (isPinned || leadIsPlus)
+                ? new List<string[]> { leadSymbols }
+                : SplitSyllables(dur, leadSymbols);
 
-            var wordGroups = ProcessWord(dur, note, symbols);
-            leadCounts[i] = wordGroups[0].Phonemes.Count;           // 前置辅音（onset）数：归本 note，标 IsLead
-            groups[^1].Phonemes.AddRange(wordGroups[0].Phonemes);   // 前置辅音并入前一组（侵入前一 note 尾）
-            groups.AddRange(wordGroups.Skip(1));                    // 韵核组（起点=note 起点）
-            notePhIndex.Add(notePhIndex[^1] + symbols.Length);
+            // 分配 segment → 音节槽：前 N-1 槽各取一段（不足留空 → 多余 "+"）；末槽收下余下全部（音节多于槽时堆末槽）。
+            int n = slots.Count, sCount = segments.Count;
+            var slotSymbols = new string[n][];
+            for (int k = 0; k < n; k++)
+                slotSymbols[k] = k < n - 1
+                    ? (k < sCount ? segments[k] : Array.Empty<string>())
+                    : (k < sCount ? segments.Skip(k).SelectMany(x => x).ToArray() : Array.Empty<string>());
+
+            // 按 note-index 顺序发射词内每个 note：音节槽 → 该段；空段=多余 "+"（无音节可领）→ 当不认识的歌词发 SP；
+            //   "-" → 宿主延音(melisma)。不能让多余 "+" 靠 melisma——乘客只由宿主 IsContinuation("-") 判定，
+            //   宿主会把前一音节元音钳在 "+" 前一音符内、不铺到 "+" 上，故 "+" 无内容时直接发 SP。
+            int slotCursor = 0;
+            for (int k = wi; k < end; k++)
+            {
+                if (slotCursor < n && k == slots[slotCursor])
+                {
+                    var syms = slotSymbols[slotCursor];
+                    EmitNote(k, syms.Length > 0 ? syms : new[] { Pause }, isPinned && slotCursor == 0);
+                    slotCursor++;
+                }
+                else EmitMelisma(k);
+            }
+            wi = end;
         }
 
         var last = notes[^1];
@@ -173,6 +224,40 @@ public static class DiffSingerPhonemizer
             wordGroups[^1].Phonemes.Add(symbols[i]);
         }
         return wordGroups;
+    }
+
+    // note 是否拆音节推进记号 "+"（插件约定，见 SyllableAdvance）。延音("-")由宿主 IsContinuation 认，与此互斥。
+    static bool IsSyllableAdvance(VoiceSynthesisNoteSnapshot note)
+        => !note.IsContinuation && note.Lyric.Trim() == SyllableAdvance;
+
+    // 把一个词的音素串按元音起点切成音节段（与 ProcessWord 同款 isStart：含 consonant-glide-vowel 滑音起拍特例）。
+    //   段 0 含词首前置辅音（[0, 第二个起点)）；其后每段 = [起点k, 起点k+1)。无元音 → 整串作一段。
+    //   每段交回 EmitNote→ProcessWord 时会再各自做 onset/韵核切分，故段内前置辅音仍正确前移。
+    static List<string[]> SplitSyllables(DiffSingerPredictor dur, string[] symbols)
+    {
+        if (symbols.Length == 0) return new List<string[]> { symbols };
+        var isVowel = symbols.Select(dur.IsVowel).ToArray();
+        var isGlide = symbols.Select(dur.IsGlide).ToArray();
+        var isStart = new bool[symbols.Length];
+        if (isVowel.All(b => !b)) isStart[0] = true;
+        for (int i = 0; i < symbols.Length; i++)
+        {
+            if (!isVowel[i]) continue;
+            if (i >= 2 && isGlide[i - 1] && !isVowel[i - 2]) isStart[i - 1] = true;
+            else isStart[i] = true;
+        }
+        var starts = new List<int>();
+        for (int i = 0; i < symbols.Length; i++) if (isStart[i]) starts.Add(i);
+        if (starts.Count == 0) return new List<string[]> { symbols };
+
+        var segs = new List<string[]>();
+        for (int k = 0; k < starts.Count; k++)
+        {
+            int from = k == 0 ? 0 : starts[k];                              // 段 0 含词首 onset
+            int to = k + 1 < starts.Count ? starts[k + 1] : symbols.Length;
+            segs.Add(symbols[from..to]);
+        }
+        return segs;
     }
 
     // 取音素符号串：钉死=用 note.Phonemes 符号；否则 G2P。过滤到「类型已定义 且 dur 表可 tokenize」；空则 [SP]。
