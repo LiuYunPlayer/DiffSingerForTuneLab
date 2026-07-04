@@ -17,14 +17,14 @@ public readonly record struct PhonemeSpan(string Symbol, double StartTime, doubl
 //   · word_div=各组音素数、word_dur=相邻组（note 起点）间帧数 → linguistic(词模式) + dur → 每音素标称帧。
 // 最终定位不再自己做对齐 / 钉死布局：把每发声 note 的标称音素（钉死值或 dur 预测）+ 几何（核起点 / FillEnd）
 // 交宿主 SDK 的 PhonemeLayout.Resolve 统一派生 + 跨 note 去重叠——与宿主显示同源（WYSIWYG），钉死长辅音
-// 越界自动压缩。在 TuneLab 绝对秒域工作（note 边界即秒）。延音符由宿主 VoiceSynthesisNoteSnapshot.IsContinuation 标志判定。
+// 越界自动压缩。在 TuneLab 绝对秒域工作（note 边界即秒）。延音符由本插件自判（判定权归引擎的 SDK 契约）：
+// live 域权威在 DiffSingerSynthesisSession.IsContinuation，快照域由 ComputeContinuation 以同语义自判（见彼处等价论证）。
 public static class DiffSingerPhonemizer
 {
     const string Pause = "SP";
     const double PaddingSec = 0.5;   // 短语首辅音前导空间（OpenUtau padding=500ms）
     // 插件约定：note 歌词写 "+" 表示「当前多音节词的下一个音节从本 note 起」（OpenUtau 同款记号）。
-    //   宿主不建模它（IsContinuation 只认纯延音 "-"），故由本层识别该歌词记号——这与「不自行匹配延续记号」不冲突，
-    //   延续仍只读宿主 IsContinuation；"+" 是宿主未覆盖的拆音节功能，只能插件层解释。
+    //   "+" 是发声 note（自带音节、恒非延续）；纯延音 "-" 走延音判定（ComputeContinuation），两者互斥。
     const string SyllableAdvance = "+";
 
     sealed class Group
@@ -73,11 +73,13 @@ public static class DiffSingerPhonemizer
             notePhIndex.Add(notePhIndex[^1]);
         }
 
+        // 快照域延音判定（与 session live 判定同语义；孤儿 "-"——块首/断链——为 false，落词头路径发 SP）。
+        var isCont = ComputeContinuation(notes);
+
         int wi = 0;
         while (wi < notes.Count)
         {
-            // 防御：句首孤儿延音（宿主断链后 IsContinuation 应为 false，正常不会到这）。
-            if (wi > 0 && notes[wi].IsContinuation) { EmitMelisma(wi); wi++; continue; }
+            if (isCont[wi]) { EmitMelisma(wi); wi++; continue; }
 
             // 词起点：取词首 note 的音素串（钉死=note.Phonemes 符号；否则 G2P 整词）。
             string[] leadSymbols = GetSymbols(dur, notes[wi], noteLang[wi], out bool isPinned);
@@ -86,7 +88,7 @@ public static class DiffSingerPhonemizer
             // 收集本词所有 note（词首 + 其后的 "+"/"-"，到下一个常规歌词为止）。音节槽 = 词首 + 各 "+"。
             int end = wi + 1;
             var slots = new List<int> { wi };
-            while (end < notes.Count && (notes[end].IsContinuation || IsSyllableAdvance(notes[end])))
+            while (end < notes.Count && (isCont[end] || IsSyllableAdvance(notes[end])))
             {
                 if (IsSyllableAdvance(notes[end])) slots.Add(end);
                 end++;
@@ -106,8 +108,9 @@ public static class DiffSingerPhonemizer
                     : (k < sCount ? segments.Skip(k).SelectMany(x => x).ToArray() : Array.Empty<string>());
 
             // 按 note-index 顺序发射词内每个 note：音节槽 → 该段；空段=多余 "+"（无音节可领）→ 当不认识的歌词发 SP；
-            //   "-" → 宿主延音(melisma)。不能让多余 "+" 靠 melisma——乘客只由宿主 IsContinuation("-") 判定，
-            //   宿主会把前一音节元音钳在 "+" 前一音符内、不铺到 "+" 上，故 "+" 无内容时直接发 SP。
+            //   "-" → 延音(melisma)。多余 "+" 不走 melisma：判定权虽已归本插件，但 "+" 判延续须以「音节耗尽」
+            //   为条件——那要在判定期跑 G2P 数音节（live 域同步可行但与本层词分配逻辑必须逐 case 一致），
+            //   留待与判定联动的独立变更（化石翻案），当前保持 SP 与判定（"+" 恒非延续）严格一对一。
             int slotCursor = 0;
             for (int k = wi; k < end; k++)
             {
@@ -226,9 +229,28 @@ public static class DiffSingerPhonemizer
         return wordGroups;
     }
 
-    // note 是否拆音节推进记号 "+"（插件约定，见 SyllableAdvance）。延音("-")由宿主 IsContinuation 认，与此互斥。
+    // note 是否拆音节推进记号 "+"（插件约定，见 SyllableAdvance）。与延音("-")记号天然互斥，无需守卫。
     static bool IsSyllableAdvance(VoiceSynthesisNoteSnapshot note)
-        => !note.IsContinuation && note.Lyric.Trim() == SyllableAdvance;
+        => note.Lyric?.Trim() == SyllableAdvance;
+
+    // 快照域延音判定：与 DiffSingerSynthesisSession.IsContinuation 同语义（"-" ∧ 严格相接链回溯到内容 note；
+    //   只看歌词与位置、不看钉死——钉死随 "-" 休眠，理由见彼处注释），改一处必改两处。
+    //   等价论证：本会话按 note 间隙严格分块 ⇒ 链不跨块，块内自判与 live 判定逐 note 相同
+    //   （块首 "-" 必因块边界空隙断链 → 孤儿，live 域同样为孤儿）。
+    //   前向归纳：isCont[i] = 相接(i-1,i) ∧ 记号(i) ∧ (i-1 是内容 note ∨ isCont[i-1])。
+    static bool[] ComputeContinuation(IReadOnlyList<VoiceSynthesisNoteSnapshot> notes)
+    {
+        var isCont = new bool[notes.Count];
+        for (int i = 1; i < notes.Count; i++)
+        {
+            if (!DiffSingerSynthesisSession.IsContinuationMarker(notes[i].Lyric))
+                continue;
+            if (notes[i - 1].EndTime < notes[i].StartTime)
+                continue;                                   // 空隙断链（严格比较，同 live 判定）→ 孤儿
+            isCont[i] = isCont[i - 1] || !DiffSingerSynthesisSession.IsContinuationMarker(notes[i - 1].Lyric);
+        }
+        return isCont;
+    }
 
     // 把一个词的音素串按元音起点切成音节段（与 ProcessWord 同款 isStart：含 consonant-glide-vowel 滑音起拍特例）。
     //   段 0 含词首前置辅音（[0, 第二个起点)）；其后每段 = [起点k, 起点k+1)。无元音 → 整串作一段。

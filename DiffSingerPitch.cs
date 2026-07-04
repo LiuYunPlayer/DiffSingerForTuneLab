@@ -116,6 +116,12 @@ public static class DiffSingerPitch
         var midiList = new List<float>();
         var restList = new List<bool>();
 
+        // melisma ⟺ 无归属自己的音素（phonemizer 对发声 note 恒发至少一个符号、SP 兜底，故可由产物直接推导，
+        //   与 phonemize 的延音决策天然一对一，不引第二份判定）。
+        var hasOwnPhones = new bool[notes.Count];
+        foreach (var p in phones)
+            hasOwnPhones[p.NoteIndex] = true;
+
         // head padding（首 note 起点之前，含越界前置辅音的空间）。
         durSec.Add(Math.Max(0, notes[0].StartTime - renderStart));
         midiList.Add(notes[0].Pitch);
@@ -138,8 +144,8 @@ public static class DiffSingerPitch
             }
             durSec.Add(Math.Max(0, effectiveEnd - note.StartTime));
             midiList.Add(note.Pitch);
-            // 延音符（宿主 IsContinuation）：无自身音素，沿用前一个 note 的 rest 状态（前为发声 ⇒ 本帧也发声、携自身 MIDI 滑过去）。
-            if (note.IsContinuation)
+            // 延音符（melisma，由产物推导：无归属音素）：沿用前一个 note 的 rest 状态（前为发声 ⇒ 本帧也发声、携自身 MIDI 滑过去）。
+            if (!hasOwnPhones[i])
             {
                 restList.Add(restList[^1]);
             }

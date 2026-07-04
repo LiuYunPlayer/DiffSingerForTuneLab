@@ -85,6 +85,37 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
     // 新建 note 的默认歌词：中性占位，待词典 G2P 阶段按声库词典择一有效词细化。
     public string DefaultLyric => "a";
 
+    // 延音判定（SDK 唯一通道，宿主照单消费：显示布局/编辑手势同源读本值）。判定绑定本引擎合成行为——
+    //   phonemize 的快照域自判（DiffSingerPhonemizer.ComputeContinuation）与本函数同语义，改一处必改两处。
+    // 语义：歌词 "-"（trim 后）∧ 经不断裂相接链回溯到内容 note。**只看歌词与位置，不看钉死音素**——
+    //   与 SDK 参考语义的刻意偏离：钉死 `-` 的现实来源只有陈旧残留（乘客无音素可显示、UI 钉不了；
+    //   宿主改歌词也不清钉死），"la"(带钉死)→改词 "-" 时用户最新意图就是 melisma，钉死排除会让旧钉死
+    //   压过 "-" 编辑；忽略语义下钉死随 "-" 休眠不销毁、歌词改回即复活（无损可逆）。判定为延续的 note
+    //   宿主本就不读其音素数据，休眠钉死不可见不可闻，与宿主机制同向。
+    //   · 相接 = 前有效末 ≥ 后起，严格比较无容差（note 边界同源 tick 换算，相接即精确相等）——
+    //     与 Resegment 的严格间隙判据同构，故判定为延续的 note 恒与其链头同块，快照域自判等价。
+    //   · "+"（拆音节推进）是发声 note、恒非延续；空/未知歌词发 SP、也是内容 note。
+    public bool IsContinuation(IVoiceSynthesisNote note)
+    {
+        if (!IsContinuationMarker(note.Lyric.Value))
+            return false;
+        var cur = note;
+        while (true)
+        {
+            var prev = cur.Last;
+            if (prev == null)
+                return false;                                      // 链跑出开头、无内容 note → 孤儿
+            if (prev.EndTime.Value < cur.StartTime.Value)
+                return false;                                      // 空隙断链（严格比较）→ 孤儿
+            if (!IsContinuationMarker(prev.Lyric.Value))
+                return true;                                       // 回溯到内容 note（非记号歌词）→ 生效
+            cur = prev;
+        }
+    }
+
+    // 延音记号（本引擎约定，编辑器 "-" 录入约定的对应判定）。快照域自判共用。
+    internal static bool IsContinuationMarker(string? lyric) => lyric?.Trim() == "-";
+
     // —— 调度：窗内第一个脏块的纯值边界（peek 廉价、确定性）——
     public SynthesisRange? GetNextSegment(double startTime, double endTime)
         => FindNextDirtyPiece(startTime, endTime) is { } p ? new SynthesisRange(p.StartTime, p.EndTime) : null;
