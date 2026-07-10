@@ -7,13 +7,13 @@ using TuneLab.SDK;
 
 namespace DiffSingerForTuneLab;
 
-// 一个音素的解析结果（绝对秒、归属 note、是否韵核、是否前置辅音）。时间可越界 note（前置辅音落在 note 起点之前）。
-//   IsLead：音节核之前的引导辅音（onset），由 ProcessWord 的前置组判定；产物按时长模型回报时随之带出（§5.7）。
-public readonly record struct PhonemeSpan(string Symbol, double StartTime, double EndTime, int NoteIndex, bool IsVowel, bool IsLead = false);
+// 一个音素的解析结果（绝对秒、归属 note、是否韵核）。时间可越界 note（前置辅音落在 note 起点之前）。
+//   前后归属（拍前 / 拍后）不落每音素标志——由 note 级前置量 Preutterance（拍前发声量）派生（见 PhonemeLayout / SynthesizedSyllable）。
+public readonly record struct PhonemeSpan(string Symbol, double StartTime, double EndTime, int NoteIndex, bool IsVowel);
 
 // DiffSinger phonemizer：歌词 → 音素时间线。G2P / 分组 / dur 预测忠实移植 OpenUtau DiffSingerBasePhonemizer：
 //   · 短语首加前导 SP 组 + 500ms padding（给首辅音留空间），尾加哨兵；
-//   · 音素按元音对齐到 note 起点（consonant-glide-vowel 特例：滑音起拍）；onset 辅音归前一组、定 IsLead；
+//   · 音素按元音对齐到 note 起点（consonant-glide-vowel 特例：滑音起拍）；onset 辅音归前一组、计入 note 头前的前置量 Preutterance；
 //   · word_div=各组音素数、word_dur=相邻组（note 起点）间帧数 → linguistic(词模式) + dur → 每音素标称帧。
 // 最终定位不再自己做对齐 / 钉死布局：把每发声 note 的标称音素（钉死值或 dur 预测）+ 几何（核起点 / FillEnd）
 // 交宿主 SDK 的 PhonemeLayout.Resolve 统一派生 + 跨 note 去重叠——与宿主显示同源（WYSIWYG），钉死长辅音
@@ -51,7 +51,7 @@ public static class DiffSingerPhonemizer
         groups[0].Phonemes.Add(Pause);
         var notePhIndex = new List<int> { 1 };          // 各 note 在展平序列中的起始下标（含前导 SP 占 0）
         var noteSymbolCount = new int[notes.Count];     // 每 note 的音素数（onset+韵核）；延音/空 note 为 0
-        var leadCounts = new int[notes.Count];          // 每 note 的前置辅音数（ProcessWord 的前置组大小）：定 IsLead
+        var leadCounts = new int[notes.Count];          // 每 note 的前置辅音数（ProcessWord 的前置组大小）：定自由 note 的前置量 Preutterance
         var pinned = new bool[notes.Count];
 
         // 把一个 note 的音素串并入 groups：onset 前移并入前组、韵核成组于本 note 起点；登记 count/lead/phIndex。
@@ -165,13 +165,24 @@ public static class DiffSingerPhonemizer
                     Symbol = sym,
                     Duration = usePin ? ph[k].Duration : durationFrames[baseFlat + k] * frameSec,
                     StretchWeight = usePin ? ph[k].StretchWeight : (dur.IsVowel(sym) ? 1 : 0),
-                    IsLead = usePin ? ph[k].IsLead : k < leadCounts[i],
                 };
+            }
+            // 前置量（拍前发声量，秒）：钉死 note 用宿主随快照下发的 note 头前音素占位量（用户可控）；
+            //   自由 note 由音韵派生——前置辅音前缀（leadCounts）的标称时长之和（onset 落在 note 头之前）。
+            double preutter;
+            if (isPinned)
+                preutter = notes[i].Preutterance;
+            else
+            {
+                preutter = 0;
+                for (int k = 0; k < leadCounts[i] && k < count; k++)
+                    preutter += Math.Max(0, items[k].Duration);
             }
             layoutNotes.Add(new PhonemeLayoutNote
             {
                 FillStart = notes[i].StartTime,
                 FillEnd = NextSoundingStart(notes, noteSymbolCount, i),
+                Preutterance = preutter,
                 Phonemes = items,
             });
             layoutNoteIndex.Add(i);
@@ -188,7 +199,7 @@ public static class DiffSingerPhonemizer
             for (int k = 0; k < items.Count; k++)
             {
                 var it = items[k];
-                result.Add(new PhonemeSpan(it.Symbol, times[k].Start, times[k].End, noteIndex, dur.IsVowel(it.Symbol), it.IsLead));
+                result.Add(new PhonemeSpan(it.Symbol, times[k].Start, times[k].End, noteIndex, dur.IsVowel(it.Symbol)));
             }
         }
         return result;
