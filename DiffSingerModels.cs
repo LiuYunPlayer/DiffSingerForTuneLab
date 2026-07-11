@@ -12,7 +12,9 @@ namespace DiffSingerForTuneLab;
 // 引擎级模型缓存：按 voiceId 缓存声学模型束、按声码器名共享声码器会话。
 //   · 懒加载（首次合成时按需载入）、加锁串行化首载；载入后多会话共享同一会话，但 DirectML EP 的 Run
 //     是设备级不可并发（跨会话亦然），故所有推理 Run 进程级全局串行（见 DiffSingerTensorCache.Run）；
-//   · 执行设备由引擎设置决定：directml 失败（无 DX12/驱动）回退 CPU，回退在每个模型载入时判定并落地；
+//   · 执行设备是进程级同质承诺、不做进程内 DML→CPU 回退：onnxruntime-DirectML 单包内，同进程一旦碰过 DML EP，
+//     再建 CPU 会话（或反之）会触发原生 AccessViolation 直接崩进程。故 directml 失败即抛异常上冒、绝不就地建 CPU 会话；
+//     用户需改设置为 CPU 并重启（新进程从未碰 DML、纯 CPU 安全）。彻底隔离/自愈留给后续 MLRuntime.exe 子进程方案；
 //   · provider 变更 → 引擎弃旧缓存建新缓存（旧缓存 Dispose 释放原生会话）。
 // 原生 onnxruntime/DirectML 库随包进本插件 ALC（见 csproj 注释）；首次构造 InferenceSession 即触发原生加载，
 // 失败抛异常由宿主在调用边界 catch 标插件失败（§5.10）。
@@ -70,29 +72,35 @@ public sealed class DiffSingerModelCache : IDisposable
         return entry;
     }
 
-    // directml 优先、建会话失败回退 CPU（cpu 设置直接走 CPU）。
+    // 执行设备同质承诺，不做进程内回退（见类注释的 AccessViolation 约束）：
+    //   · cpu 设置：全程只建 CPU 会话，绝不碰 DML EP；
+    //   · directml 设置：建 DML 会话，失败即抛可读异常上冒（宿主按 §5.10 标合成失败），绝不就地回退 CPU。
     InferenceSession LoadSession(string modelPath)
     {
         var fileName = Path.GetFileName(modelPath);
-        if (mProvider != "cpu")
+        if (mProvider == "cpu")
         {
-            try
-            {
-                var options = new SessionOptions();
-                options.AppendExecutionProvider_DML(0);
-                var session = new InferenceSession(modelPath, options);
-                mLogger.Info($"DiffSinger：加载 {fileName} · DirectML");
-                return session;
-            }
-            catch (Exception ex)
-            {
-                mLogger.Warning($"DiffSinger：DirectML 加载 {fileName} 失败，回退 CPU：{ex.Message}");
-            }
+            var cpu = new InferenceSession(modelPath);
+            mLogger.Info($"DiffSinger：加载 {fileName} · CPU");
+            return cpu;
         }
 
-        var cpu = new InferenceSession(modelPath);
-        mLogger.Info($"DiffSinger：加载 {fileName} · CPU");
-        return cpu;
+        try
+        {
+            var options = new SessionOptions();
+            options.AppendExecutionProvider_DML(0);
+            var session = new InferenceSession(modelPath, options);
+            mLogger.Info($"DiffSinger：加载 {fileName} · DirectML");
+            return session;
+        }
+        catch (Exception ex)
+        {
+            // 全量异常入日志（含类型/HResult/inner/栈），供定位 DML 失败根因——是算子不支持还是设备层起不来。
+            mLogger.Error($"DiffSinger：DirectML 加载 {fileName} 失败：{ex}");
+            throw new InvalidOperationException(
+                $"DirectML 加载 {fileName} 失败，无法在同进程内安全回退 CPU。" +
+                $"请在插件设置里把「执行设备」改为 CPU 并重启 TuneLab。原始错误：{ex.Message}", ex);
+        }
     }
 
     public void Dispose()
