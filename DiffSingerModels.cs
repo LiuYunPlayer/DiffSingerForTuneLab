@@ -11,7 +11,7 @@ namespace DiffSingerForTuneLab;
 
 // 引擎级模型缓存：按 voiceId 缓存声学模型束、按声码器名共享声码器会话。
 //   · 懒加载（首次合成时按需载入）、加锁串行化首载；载入后多会话共享同一会话，但 DirectML EP 的 Run
-//     是设备级不可并发（跨会话亦然），故所有推理 Run 进程级全局串行（见 DiffSingerTensorCache.Run）；
+//     是设备级不可并发（跨会话亦然），故所有推理 Run 进程级全局串行（见 InProcessModelSession）；
 //   · 执行设备是进程级同质承诺、不做进程内 DML→CPU 回退：onnxruntime-DirectML 单包内，同进程一旦碰过 DML EP，
 //     再建 CPU 会话（或反之）会触发原生 AccessViolation 直接崩进程。故 directml 失败即抛异常上冒、绝不就地建 CPU 会话；
 //     用户需改设置为 CPU 并重启（新进程从未碰 DML、纯 CPU 安全）。彻底隔离/自愈留给后续 MLRuntime.exe 子进程方案；
@@ -24,16 +24,58 @@ public sealed class DiffSingerModelCache : IDisposable
     readonly ILogger mLogger;
     readonly object mLock = new();
     readonly Dictionary<string, VoiceModels> mVoices = new(StringComparer.Ordinal);
-    readonly Dictionary<string, (InferenceSession Session, ulong Hash)> mVocoders = new(StringComparer.Ordinal);
+    readonly Dictionary<string, (IModelSession Session, ulong Hash)> mVocoders = new(StringComparer.Ordinal);
 
-    public DiffSingerModelCache(string provider, ILogger logger)
+    // MLRuntime 路由：推理模式由设置决定（默认 subprocess——隔离子进程跑 ONNX，原生崩溃不拖垮宿主）：
+    //   · "subprocess"（默认）→ PipeTransport：spawn mlruntime/MLRuntime.exe；启动探测失败（杀软/权限）则退回进程内。
+    //   · "inprocess"          → mRuntimeClient=null，走 InProcessModelSession（进程内直跑，逃生模式）。
+    //   · env DIFFSINGER_RUNTIME_LOOPBACK=1（dev）→ LoopbackTransport：进程内 host、走完整 IPC 编解码链（测试用）。
+    //   非 null 的 mRuntimeClient 令 LoadSession 返回 RemoteModelSession。
+    readonly RuntimeClient? mRuntimeClient;
+
+    public DiffSingerModelCache(string provider, string runtimeMode, ILogger logger)
     {
         mProvider = provider;
         mLogger = logger;
+        if (Environment.GetEnvironmentVariable("DIFFSINGER_RUNTIME_LOOPBACK") == "1")
+        {
+            mRuntimeClient = new RuntimeClient(provider, p => new LoopbackTransport(new RuntimeHost(p)), canRespawn: false);
+            mLogger.Info("DiffSinger：MLRuntime loopback 模式（dev）");
+        }
+        else if (runtimeMode != "inprocess")   // 默认 subprocess
+        {
+            mRuntimeClient = TryCreateSubprocessClient(provider);
+        }
     }
 
-    // 声码器根目录约定：插件用户数据根下、与声库 Voices 目录并列的 Vocoders 目录；声学 dsconfig 的 vocoder 字段即子目录名。
+    // 建子进程客户端：先立即 spawn+连一个传输作启动探测——成功则以它为初始传输建弹性 client；
+    //   失败（exe 缺失/杀软拦截/权限/管道建不起）则记警告、返回 null 退回进程内（这是「起不来」非「崩」，退回救场）。
+    RuntimeClient? TryCreateSubprocessClient(string provider)
+    {
+        var dir = Path.GetDirectoryName(typeof(DiffSingerModelCache).Assembly.Location)!;
+        var exe = Path.Combine(dir, "mlruntime", "MLRuntime.exe");
+        Action<string> exeLog = line => mLogger.Info($"[MLRuntime] {line}");   // 子进程 stdout/stderr 转发
+        Func<string, IRuntimeTransport> factory = p => new PipeTransport(exe, p, exeLog);
+        try
+        {
+            var probe = factory(provider);   // 立即 spawn+连，探测子进程能否起来
+            mLogger.Info($"DiffSinger：MLRuntime 子进程模式（{exe}）");
+            return new RuntimeClient(provider, factory, canRespawn: true, line => mLogger.Info(line), probe);
+        }
+        catch (Exception ex)
+        {
+            mLogger.Warning($"DiffSinger：MLRuntime 子进程启动失败（{ex.Message}），本次退回进程内。可在插件设置的「推理模式」调整，或检查杀软/权限。");
+            return null;
+        }
+    }
+
+    // 默认声码器根：插件用户数据根下的 Vocoders 目录（与声库目录彼此独立，仅默认值恰好同在用户数据根下）；声学 dsconfig 的 vocoder 字段即子目录名。
+    // 作为可配置列表的默认播种项——用户可在设置里追加其他目录（如已有的声码器收藏位置），免去复制。
     public static string VocodersDirectory => Path.Combine(DiffSingerDeclarations.UserDataRoot, "Vocoders");
+
+    // 声码器搜索根（默认 + 用户追加，由引擎每次取会话前刷入）；按序取首个含 <vocoderName>/vocoder.yaml 的目录。
+    // 引用整体赋值原子、读取取一次快照即可；默认仅含固定目录，引擎未设置时行为与旧版一致。
+    public IReadOnlyList<string> VocoderRoots { get; set; } = new[] { VocodersDirectory };
 
     // 按物理模型包目录（config.RootPath）缓存——同一 voice 选不同 model/version = 不同物理包 = 各自缓存、不重复加载。
     public VoiceModels GetOrLoad(VoicebankConfig config)
@@ -54,12 +96,17 @@ public sealed class DiffSingerModelCache : IDisposable
         }
     }
 
-    (InferenceSession Session, ulong Hash) GetOrLoadVocoder(string vocoderName)
+    (IModelSession Session, ulong Hash) GetOrLoadVocoder(string vocoderName)
     {
         if (mVocoders.TryGetValue(vocoderName, out var cached))
             return cached;
 
-        var dir = Path.Combine(VocodersDirectory, vocoderName);
+        var dir = ResolveVocoderDir(vocoderName);
+        if (dir is null)
+            throw new InvalidOperationException(
+                $"未找到声码器 {vocoderName}：搜索的声码器目录下均无 {vocoderName}/vocoder.yaml。" +
+                $"（已搜索：{string.Join(" ; ", VocoderRoots)}）请把声码器放入其中之一，或在插件设置的「声码器目录」里追加其所在目录。");
+
         var yaml = new DeserializerBuilder().Build()
             .Deserialize<Dictionary<string, object?>>(File.ReadAllText(Path.Combine(dir, "vocoder.yaml")));
         var modelFile = yaml.TryGetValue("model", out var m) ? m?.ToString() : null;
@@ -72,17 +119,37 @@ public sealed class DiffSingerModelCache : IDisposable
         return entry;
     }
 
+    // 在 VocoderRoots 里按序找到首个含 <vocoderName>/vocoder.yaml 的目录；无则 null。
+    string? ResolveVocoderDir(string vocoderName)
+    {
+        foreach (var root in VocoderRoots)
+        {
+            if (string.IsNullOrWhiteSpace(root))
+                continue;
+            var dir = Path.Combine(root, vocoderName);
+            if (File.Exists(Path.Combine(dir, "vocoder.yaml")))
+                return dir;
+        }
+        return null;
+    }
+
     // 执行设备同质承诺，不做进程内回退（见类注释的 AccessViolation 约束）：
     //   · cpu 设置：全程只建 CPU 会话，绝不碰 DML EP；
     //   · directml 设置：建 DML 会话，失败即抛可读异常上冒（宿主按 §5.10 标合成失败），绝不就地回退 CPU。
-    InferenceSession LoadSession(string modelPath)
+    IModelSession LoadSession(string modelPath)
     {
         var fileName = Path.GetFileName(modelPath);
+        if (mRuntimeClient != null)   // loopback 验证模式：会话在 host 侧、经 IPC 派发
+        {
+            var remote = RemoteModelSession.Load(mRuntimeClient, modelPath);
+            mLogger.Info($"DiffSinger：加载 {fileName} · MLRuntime({mProvider})");
+            return remote;
+        }
         if (mProvider == "cpu")
         {
             var cpu = new InferenceSession(modelPath);
             mLogger.Info($"DiffSinger：加载 {fileName} · CPU");
-            return cpu;
+            return new InProcessModelSession(cpu);
         }
 
         try
@@ -91,7 +158,7 @@ public sealed class DiffSingerModelCache : IDisposable
             options.AppendExecutionProvider_DML(0);
             var session = new InferenceSession(modelPath, options);
             mLogger.Info($"DiffSinger：加载 {fileName} · DirectML");
-            return session;
+            return new InProcessModelSession(session);
         }
         catch (Exception ex)
         {
@@ -109,10 +176,13 @@ public sealed class DiffSingerModelCache : IDisposable
         {
             foreach (var v in mVoices.Values)
                 v.Dispose();   // 释放声学 + 懒加载的预测器（声码器为缓存共享、单独释放）
-            // 声码器会话经退役机制在推理锁内释放（杜绝与在飞 Run 并发释放）。
-            DiffSingerTensorCache.RetireAndDispose(mVocoders.Values.Select(entry => entry.Session));
+            // 声码器会话（会话自身在设备级锁内退役并释放，杜绝与在飞 Run 并发释放）。
+            foreach (var entry in mVocoders.Values)
+                entry.Session.Dispose();
             mVoices.Clear();
             mVocoders.Clear();
+            // loopback 模式：真实会话在 host 侧，释放 client 连带释放 host 及其所有会话（RemoteModelSession.Dispose 为空操作）。
+            mRuntimeClient?.Dispose();
         }
     }
 }
@@ -122,7 +192,7 @@ public sealed class VoiceModels : IDisposable
 {
     readonly VoicebankConfig mConfig;
     readonly ILogger mLogger;
-    readonly Func<string, InferenceSession> mLoad;
+    readonly Func<string, IModelSession> mLoad;
     readonly Dictionary<string, int> mPhonemes;
     readonly Dictionary<string, int> mLanguages;
     readonly Dictionary<string, float[]> mEmbCache = new(StringComparer.Ordinal);
@@ -131,8 +201,8 @@ public sealed class VoiceModels : IDisposable
     readonly Dictionary<string, DiffSingerPredictor?> mPredictors = new(StringComparer.Ordinal);
     readonly object mPredictorLock = new();
 
-    public InferenceSession Acoustic { get; }
-    public InferenceSession Vocoder { get; }
+    public IModelSession Acoustic { get; }
+    public IModelSession Vocoder { get; }
 
     // 张量缓存 identifier（模型 .onnx 文件内容哈希，加载时算一次）。
     public ulong AcousticHash { get; }
@@ -145,8 +215,8 @@ public sealed class VoiceModels : IDisposable
     public double MaxDepth => mConfig.MaxDepth;
     public IReadOnlyList<string> Speakers => mConfig.Speakers;
 
-    public VoiceModels(VoicebankConfig config, InferenceSession acoustic, ulong acousticHash,
-        InferenceSession vocoder, ulong vocoderHash, Func<string, InferenceSession> load, ILogger logger)
+    public VoiceModels(VoicebankConfig config, IModelSession acoustic, ulong acousticHash,
+        IModelSession vocoder, ulong vocoderHash, Func<string, IModelSession> load, ILogger logger)
     {
         mConfig = config;
         mLogger = logger;
@@ -216,7 +286,7 @@ public sealed class VoiceModels : IDisposable
     //   会话经退役机制在推理锁内释放（杜绝与在飞 Run 并发释放）；预测器自退役其会话。
     public void Dispose()
     {
-        DiffSingerTensorCache.RetireAndDispose(new[] { Acoustic });
+        Acoustic.Dispose();   // 会话自身在设备级锁内退役并释放
         lock (mPredictorLock)
         {
             foreach (var p in mPredictors.Values)

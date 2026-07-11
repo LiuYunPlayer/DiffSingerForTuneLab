@@ -17,4 +17,19 @@
     <PackageReference Include="YamlDotNet" Version="18.0.0" />
   </ItemGroup>
 
+  <!-- IPC 基准（bench-ipc 模式）：链接插件的运行时核心（零 TuneLab 依赖），直接对同一份输入跑
+       InProcessModelSession vs RemoteModelSession，量 IPC 开销。与 MLRuntime.exe 同法链接、不引整个插件工程。 -->
+  <ItemGroup>
+    <Compile Include="..\..\IModelSession.cs" Link="Core\IModelSession.cs" />
+    <Compile Include="..\..\TensorCodec.cs" Link="Core\TensorCodec.cs" />
+    <Compile Include="..\..\RuntimeProtocol.cs" Link="Core\RuntimeProtocol.cs" />
+    <Compile Include="..\..\RuntimeHost.cs" Link="Core\RuntimeHost.cs" />
+    <Compile Include="..\..\RuntimeTransport.cs" Link="Core\RuntimeTransport.cs" />
+    <Compile Include="..\..\RuntimeClient.cs" Link="Core\RuntimeClient.cs" />
+    <Compile Include="..\..\RemoteModelSession.cs" Link="Core\RemoteModelSession.cs" />
+    <Compile Include="..\..\PipeTransport.cs" Link="Core\PipeTransport.cs" />
+    <Compile Include="..\..\PipeFraming.cs" Link="Core\PipeFraming.cs" />
+    <Compile Include="..\..\JobObject.cs" Link="Core\JobObject.cs" />
+  </ItemGroup>
+
 </Project>

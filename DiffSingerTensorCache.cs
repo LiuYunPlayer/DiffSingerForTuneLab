@@ -3,10 +3,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Hashing;
 using System.Linq;
-using System.Runtime.CompilerServices;
 using System.Text;
 using Microsoft.ML.OnnxRuntime;
-using Microsoft.ML.OnnxRuntime.Tensors;
 using TuneLab.Foundation;
 using TuneLab.SDK;
 
@@ -39,7 +37,7 @@ public sealed class DiffSingerTensorCache
         {
             writer.Write(identifier);
             foreach (var onnxValue in inputs.OrderBy(v => v.Name, StringComparer.InvariantCulture))
-                SerializeNamedOnnxValue(writer, onnxValue);
+                TensorCodec.WriteValue(writer, onnxValue);
         }
 
         mHash = XxHash64.HashToUInt64(stream.ToArray());
@@ -47,82 +45,25 @@ public sealed class DiffSingerTensorCache
     }
 
     // —— 编排封装 ——
+    // 推理串行化 + 会话退役机制已内聚进 InProcessModelSession（设备级约束随「推理在哪跑」走）；
+    //   本类只管缓存编排与张量序列化，不再持有原生会话或全局锁。
 
-    // 推理串行化锁（进程级单锁）：DirectML EP 下 InferenceSession.Run() 不可并发——约束是设备级的，
-    //   不仅同一会话，同一 GPU 上不同会话并发 Run 也会崩/出错。宿主会为每条 part 各开合成会话，
-    //   且多会话经引擎级缓存共享声学/声码器会话，故必须跨会话全局串行（按会话实例上锁挡不住跨 voiceId 的并发）。
-    //   CPU EP 虽线程安全，但单次 Run 已用满 intra-op 线程池，并发 Run 只会过订阅线程；全局串行对其亦中性偏好，
-    //   换取「无论 provider / 会话数 / 模型束都正确」的简单性。锁只罩 Run 本身，缓存 Load/Save 等磁盘 IO 在锁外。
-    static readonly object sRunLock = new();
-
-    // 已退役会话登记：随模型缓存释放的会话在 sRunLock 内先登记于此，令其后任何 Run 干净抛出 ObjectDisposedException，
-    //   而非把已释放的原生句柄喂进 model.Run（→ AccessViolationException）。根治关闭 / 换执行设备时的并发释放崩溃。
-    //   用 ConditionalWeakTable 持弱引用：会话被缓存解引用后条目随 GC 回收，不泄漏；按会话实例隔离，
-    //   故换设备新建的会话天然不在表内、不受影响。value 仅作存在性标记。
-    static readonly ConditionalWeakTable<InferenceSession, object> sRetired = new();
-    static readonly object sRetiredMarker = new();
-
-    static IDisposableReadOnlyCollection<DisposableNamedOnnxValue> RunSerialized(
-        InferenceSession model, IReadOnlyCollection<NamedOnnxValue> inputs)
-    {
-        lock (sRunLock)
-        {
-            if (sRetired.TryGetValue(model, out _))
-                throw new ObjectDisposedException(nameof(InferenceSession), "DiffSinger：模型会话已随缓存释放，推理取消。");
-            return model.Run(inputs);
-        }
-    }
-
-    // 在全局推理锁内退役并释放一组会话：持锁即保证当前无 Run 在飞（Run 全程持同一把锁），故释放不会与在飞推理并发
-    //   触发 use-after-free；释放前先登记退役，杜绝多级管线在本次释放后还想跑下一阶段时触碰已释放会话。
-    //   供模型束 / 预测器 / 缓存释放各自的会话时调用——分批各取一次锁即可（跨批的 Run 仍受同锁串行保护）。
-    public static void RetireAndDispose(IEnumerable<InferenceSession> sessions)
-    {
-        lock (sRunLock)
-            foreach (var session in sessions)
-            {
-                sRetired.AddOrUpdate(session, sRetiredMarker);
-                session.Dispose();
-            }
-    }
-
-    // 跑一个模型并经缓存：命中直接返回缓存输出；未命中则 Run + Save。返回的张量均为托管 DenseTensor（脱离原生内存，可在调用处延后读取）。
-    //   enabled=false 时跳过磁盘缓存，但仍把原生输出深拷为托管返回（调用方约定可在 Run 作用域外读取输出）。
+    // 跑一个模型并经缓存：命中直接返回缓存输出；未命中则 Run + Save。model.Run 已返回脱离原生内存的托管张量。
+    //   enabled=false 时跳过磁盘缓存，直接返回 model.Run 的托管输出。
     public static IReadOnlyList<NamedOnnxValue> Run(
-        InferenceSession model, ulong identifier, IReadOnlyCollection<NamedOnnxValue> inputs, bool enabled)
+        IModelSession model, ulong identifier, IReadOnlyCollection<NamedOnnxValue> inputs, bool enabled)
     {
         if (!enabled)
-        {
-            using var raw = RunSerialized(model, inputs);
-            return Clone(raw);
-        }
+            return model.Run(inputs);
 
         var cache = new DiffSingerTensorCache(identifier, inputs);
         var loaded = cache.Load();
         if (loaded != null)
             return loaded;
 
-        using var run = RunSerialized(model, inputs);
-        var result = Clone(run);   // 先脱离原生内存，再落盘（Save 读托管张量即可）
+        var result = model.Run(inputs);
         cache.Save(result);
         return result;
-    }
-
-    // 把（可能由原生 OrtValue 支撑的）输出深拷为托管 DenseTensor，使其在原生集合 Dispose 后仍可安全读取。
-    //   复用序列化/反序列化的类型分支（往返一次内存流），零重复代码；相对扩散推理开销可忽略。
-    public static List<NamedOnnxValue> Clone(IEnumerable<NamedOnnxValue> values)
-    {
-        var list = new List<NamedOnnxValue>();
-        foreach (var v in values)
-        {
-            using var ms = new MemoryStream();
-            using (var w = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
-                SerializeNamedOnnxValue(w, v);
-            ms.Position = 0;
-            using var r = new BinaryReader(ms);
-            list.Add(DeserializeNamedOnnxValue(r));
-        }
-        return list;
     }
 
     // 模型 identifier：.onnx 文件内容的 XxHash64（流式、不整体载入内存）。加载时算一次缓存进字段，
@@ -175,9 +116,7 @@ public sealed class DiffSingerTensorCache
             {
                 if (reader.ReadString() != FormatHeader)
                     throw new InvalidDataException($"[TensorCache] 缓存文件头异常：{mFilename}。");
-                var count = reader.ReadInt32();
-                for (var i = 0; i < count; ++i)
-                    result.Add(DeserializeNamedOnnxValue(reader));
+                result = TensorCodec.ReadValues(reader);
             }
         }
         catch (Exception e)
@@ -208,105 +147,7 @@ public sealed class DiffSingerTensorCache
         using var stream = new FileStream(cachePath, FileMode.Create, FileAccess.Write);
         using var writer = new BinaryWriter(stream);
         writer.Write(FormatHeader);
-        writer.Write(outputs.Count);
-        foreach (var onnxValue in outputs)
-            SerializeNamedOnnxValue(writer, onnxValue);
+        TensorCodec.WriteValues(writer, outputs);
     }
 
-    static void SerializeNamedOnnxValue(BinaryWriter writer, NamedOnnxValue namedOnnxValue)
-    {
-        if (namedOnnxValue.ValueType != OnnxValueType.ONNX_TYPE_TENSOR)
-            throw new NotSupportedException(
-                $"[TensorCache] 仅支持张量类型 {OnnxValueType.ONNX_TYPE_TENSOR}，遇 {namedOnnxValue.ValueType}。");
-        writer.Write(namedOnnxValue.Name);
-        var tensorBase = (TensorBase)namedOnnxValue.Value;
-        var elementType = tensorBase.GetTypeInfo().ElementType;
-        writer.Write((int)elementType);
-        switch (elementType)
-        {
-            case TensorElementType.Float: SerializeTensor(writer, namedOnnxValue.AsTensor<float>()); break;
-            case TensorElementType.UInt8: SerializeTensor(writer, namedOnnxValue.AsTensor<byte>()); break;
-            case TensorElementType.Int8: SerializeTensor(writer, namedOnnxValue.AsTensor<sbyte>()); break;
-            case TensorElementType.UInt16: SerializeTensor(writer, namedOnnxValue.AsTensor<ushort>()); break;
-            case TensorElementType.Int16: SerializeTensor(writer, namedOnnxValue.AsTensor<short>()); break;
-            case TensorElementType.Int32: SerializeTensor(writer, namedOnnxValue.AsTensor<int>()); break;
-            case TensorElementType.Int64: SerializeTensor(writer, namedOnnxValue.AsTensor<long>()); break;
-            case TensorElementType.String: SerializeTensor(writer, namedOnnxValue.AsTensor<string>()); break;
-            case TensorElementType.Bool: SerializeTensor(writer, namedOnnxValue.AsTensor<bool>()); break;
-            case TensorElementType.Float16: SerializeTensor(writer, namedOnnxValue.AsTensor<Float16>()); break;
-            case TensorElementType.Double: SerializeTensor(writer, namedOnnxValue.AsTensor<double>()); break;
-            case TensorElementType.UInt32: SerializeTensor(writer, namedOnnxValue.AsTensor<uint>()); break;
-            case TensorElementType.UInt64: SerializeTensor(writer, namedOnnxValue.AsTensor<ulong>()); break;
-            case TensorElementType.BFloat16: SerializeTensor(writer, namedOnnxValue.AsTensor<BFloat16>()); break;
-            default:
-                throw new NotSupportedException($"[TensorCache] 不支持的张量元素类型：{elementType}。");
-        }
-    }
-
-    static void SerializeTensor<T>(BinaryWriter writer, Tensor<T> tensor)
-    {
-        if (tensor.IsReversedStride)
-            throw new NotSupportedException("[TensorCache] 不支持反序步幅张量。");
-        writer.Write(tensor.Rank);
-        foreach (var dim in tensor.Dimensions)
-            writer.Write(dim);
-        var size = (int)tensor.Length;
-        writer.Write(size);
-        if (typeof(T) == typeof(string))
-        {
-            foreach (var element in tensor.ToArray())
-                writer.Write(element?.ToString() ?? string.Empty);
-        }
-        else
-        {
-            var data = new byte[size * tensor.GetTypeInfo().TypeSize];
-            Buffer.BlockCopy(tensor.ToArray(), 0, data, 0, data.Length);
-            writer.Write(data);
-        }
-    }
-
-    static NamedOnnxValue DeserializeNamedOnnxValue(BinaryReader reader)
-    {
-        var name = reader.ReadString();
-        var dtype = (TensorElementType)reader.ReadInt32();
-        var rank = reader.ReadInt32();
-        int[] shape = new int[rank];
-        for (var i = 0; i < rank; ++i)
-            shape[i] = reader.ReadInt32();
-        var size = reader.ReadInt32();
-        switch (dtype)
-        {
-            case TensorElementType.Float: return NamedOnnxValue.CreateFromTensor(name, DeserializeTensor<float>(reader, size, sizeof(float), shape));
-            case TensorElementType.UInt8: return NamedOnnxValue.CreateFromTensor(name, DeserializeTensor<byte>(reader, size, sizeof(byte), shape));
-            case TensorElementType.Int8: return NamedOnnxValue.CreateFromTensor(name, DeserializeTensor<sbyte>(reader, size, sizeof(sbyte), shape));
-            case TensorElementType.UInt16: return NamedOnnxValue.CreateFromTensor(name, DeserializeTensor<ushort>(reader, size, sizeof(ushort), shape));
-            case TensorElementType.Int16: return NamedOnnxValue.CreateFromTensor(name, DeserializeTensor<short>(reader, size, sizeof(short), shape));
-            case TensorElementType.Int32: return NamedOnnxValue.CreateFromTensor(name, DeserializeTensor<int>(reader, size, sizeof(int), shape));
-            case TensorElementType.Int64: return NamedOnnxValue.CreateFromTensor(name, DeserializeTensor<long>(reader, size, sizeof(long), shape));
-            case TensorElementType.String:
-            {
-                Tensor<string> tensor = new DenseTensor<string>(size);
-                for (var i = 0; i < size; ++i)
-                    tensor[i] = reader.ReadString();
-                tensor = tensor.Reshape(shape);
-                return NamedOnnxValue.CreateFromTensor(name, tensor);
-            }
-            case TensorElementType.Bool: return NamedOnnxValue.CreateFromTensor(name, DeserializeTensor<bool>(reader, size, sizeof(bool), shape));
-            case TensorElementType.Float16: return NamedOnnxValue.CreateFromTensor(name, DeserializeTensor<Float16>(reader, size, sizeof(ushort), shape));
-            case TensorElementType.Double: return NamedOnnxValue.CreateFromTensor(name, DeserializeTensor<double>(reader, size, sizeof(double), shape));
-            case TensorElementType.UInt32: return NamedOnnxValue.CreateFromTensor(name, DeserializeTensor<uint>(reader, size, sizeof(uint), shape));
-            case TensorElementType.UInt64: return NamedOnnxValue.CreateFromTensor(name, DeserializeTensor<ulong>(reader, size, sizeof(ulong), shape));
-            case TensorElementType.BFloat16: return NamedOnnxValue.CreateFromTensor(name, DeserializeTensor<BFloat16>(reader, size, sizeof(ushort), shape));
-            default:
-                throw new NotSupportedException($"[TensorCache] 不支持的张量元素类型：{dtype}。");
-        }
-    }
-
-    static Tensor<T> DeserializeTensor<T>(BinaryReader reader, int size, int typeSize, ReadOnlySpan<int> shape)
-    {
-        var bytes = reader.ReadBytes(size * typeSize);
-        var data = new T[size];
-        Buffer.BlockCopy(bytes, 0, data, 0, bytes.Length);
-        return new DenseTensor<T>(data, shape);
-    }
 }

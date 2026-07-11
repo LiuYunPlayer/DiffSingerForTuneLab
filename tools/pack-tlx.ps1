@@ -13,6 +13,14 @@ $source = Join-Path $repo "bin/$Configuration/net8.0"
 $out = Join-Path $PSScriptRoot "tlx"
 
 dotnet build (Join-Path $repo "DiffSingerForTuneLab.csproj") -c $Configuration
+dotnet build (Join-Path $repo "MLRuntime/MLRuntime.csproj") -c $Configuration
+
+# MLRuntime.exe 子进程：暂存进插件输出的 mlruntime/ 子目录（自带 onnxruntime + runtimes/），随后一并打进 .tlx。
+$mlSource = Join-Path $repo "MLRuntime/bin/$Configuration/net8.0"
+$mlStage = Join-Path $source "mlruntime"
+if (Test-Path $mlStage) { Remove-Item $mlStage -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $mlStage | Out-Null
+Copy-Item -Path (Join-Path $mlSource "*") -Destination $mlStage -Recurse -Force
 
 # 从 manifest.json 取 id + version 命名产物
 $desc = Get-Content (Join-Path $source "manifest.json") -Raw | ConvertFrom-Json

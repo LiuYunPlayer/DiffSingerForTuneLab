@@ -328,9 +328,9 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         var ac = models.Acoustic;
         var cond = new List<NamedOnnxValue>();
         void AddL(string name, long[] data, int[] dims)
-        { if (ac.InputMetadata.ContainsKey(name)) cond.Add(NamedOnnxValue.CreateFromTensor(name, new DenseTensor<long>(data, dims))); }
+        { if (ac.HasInput(name)) cond.Add(NamedOnnxValue.CreateFromTensor(name, new DenseTensor<long>(data, dims))); }
         void AddF(string name, float[] data, int[] dims)
-        { if (ac.InputMetadata.ContainsKey(name)) cond.Add(NamedOnnxValue.CreateFromTensor(name, new DenseTensor<float>(data, dims))); }
+        { if (ac.HasInput(name)) cond.Add(NamedOnnxValue.CreateFromTensor(name, new DenseTensor<float>(data, dims))); }
 
         AddL("tokens", tokens, new[] { 1, nTokens });
         AddL("languages", langs, new[] { 1, nTokens });
@@ -348,7 +348,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
                 ? auto.Evaluator.Evaluate(frameTimes)
                 : null;
 
-            if (ac.InputMetadata.ContainsKey(spec.Key))
+            if (ac.HasInput(spec.Key))
                 AddF(spec.Key, CombineVariance(spec, predicted, user, nFrames), new[] { 1, nFrames });
 
             if (spec.Use(config) && spec.Predict(config) && predicted != null)
@@ -360,19 +360,19 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         AddF("gender", BuildCurveInput(snapshot, KeyGender, GenderBaseline, GenderConvert(config), frameTimes, nFrames), new[] { 1, nFrames });
         AddF("velocity", BuildCurveInput(snapshot, KeySpeed, SpeedBaseline, SpeedConvert, frameTimes, nFrames), new[] { 1, nFrames });
 
-        if (ac.InputMetadata.ContainsKey("spk_embed"))
+        if (ac.HasInput("spk_embed"))
         {
             var spk = speakerMix.ToEmbedding(models.GetSpeakerEmbeddingBySuffix, hidden);
             cond.Add(NamedOnnxValue.CreateFromTensor("spk_embed", new DenseTensor<float>(spk, new[] { 1, nFrames, hidden })));
         }
         if (config.UseContinuousAcceleration)
         {
-            if (ac.InputMetadata.ContainsKey("depth") && config.UseVariableDepth)
+            if (ac.HasInput("depth") && config.UseVariableDepth)
                 cond.Add(NamedOnnxValue.CreateFromTensor("depth", new DenseTensor<float>(new[] { (float)models.MaxDepth }, new[] { 1 })));
-            if (ac.InputMetadata.ContainsKey("steps"))
+            if (ac.HasInput("steps"))
                 cond.Add(NamedOnnxValue.CreateFromTensor("steps", new DenseTensor<long>(new[] { (long)mSamplingSteps }, new[] { 1 })));
         }
-        else if (ac.InputMetadata.ContainsKey("speedup"))
+        else if (ac.HasInput("speedup"))
         {
             long speedup = Math.Max(1, 1000 / Math.Max(1, mSamplingSteps));
             while (1000 % speedup != 0 && speedup > 1) speedup--;
@@ -391,7 +391,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
                 .First(v => v.Name == "mel").AsTensor<float>();
 
         Tensor<float> mel;
-        if (!(ac.InputMetadata.ContainsKey("retake") && ac.InputMetadata.ContainsKey("gt_mel")))
+        if (!(ac.HasInput("retake") && ac.HasInput("gt_mel")))
         {
             // stock / 仅噪声模型：无 retake 口，按 seed 轨喂噪声直接单趟（无 noise 口则退回内部随机）。
             var ins = new List<NamedOnnxValue>(cond);
@@ -400,7 +400,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         }
         else
         {
-            int melBins = ac.InputMetadata["gt_mel"].Dimensions[2];
+            int melBins = ac.InputShape("gt_mel")[2];
             var retakeMask = new bool[nFrames];
             bool anyKeep = false, anyReroll = false;
             for (int f = 0; f < nFrames; f++)
@@ -449,7 +449,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         // —— 声码器：mel (+ f0) → 波形 ——
         var voc = models.Vocoder;
         var vInputs = new List<NamedOnnxValue> { NamedOnnxValue.CreateFromTensor("mel", mel) };
-        if (voc.InputMetadata.ContainsKey("f0"))
+        if (voc.HasInput("f0"))
             vInputs.Add(NamedOnnxValue.CreateFromTensor("f0", new DenseTensor<float>(f0, new[] { 1, nFrames })));
         var wavOut = DiffSingerTensorCache.Run(voc, models.VocoderHash, vInputs, mTensorCache);
         var audio = wavOut.First(v => v.Name == "waveform").AsTensor<float>().ToArray();

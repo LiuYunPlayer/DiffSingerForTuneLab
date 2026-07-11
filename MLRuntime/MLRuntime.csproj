@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- MLRuntime.exe：独立进程跑 ONNX 推理，经命名管道被插件驱动，隔离 onnxruntime 原生崩溃于本进程。
+       随插件包分发（打进 mlruntime/ 子目录，自带 onnxruntime + runtimes/）。 -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>MLRuntime</AssemblyName>
+    <RootNamespace>DiffSingerForTuneLab</RootNamespace>
+    <!-- 原生库随 EnableDynamicLoading 输出到 runtimes/win-x64/native/（同插件，经 deps.json 解析，勿扁平化）。 -->
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <Platforms>x64</Platforms>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 与插件同一 onnxruntime 包（单包内含 DirectML EP 与 CPU EP）。 -->
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.DirectML" Version="1.20.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 与插件共享的可移植核（零 TuneLab 依赖）：链接编译进本 exe，不新增共享 DLL。 -->
+    <Compile Include="..\TensorCodec.cs" Link="Shared\TensorCodec.cs" />
+    <Compile Include="..\RuntimeProtocol.cs" Link="Shared\RuntimeProtocol.cs" />
+    <Compile Include="..\RuntimeHost.cs" Link="Shared\RuntimeHost.cs" />
+    <Compile Include="..\PipeFraming.cs" Link="Shared\PipeFraming.cs" />
+  </ItemGroup>
+
+</Project>

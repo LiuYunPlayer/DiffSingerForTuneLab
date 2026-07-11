@@ -1,7 +1,9 @@
+using System.Diagnostics;
 using System.Text;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using YamlDotNet.Serialization;
+using DiffSingerForTuneLab;   // 链接进来的运行时核心（IModelSession / InProcessModelSession / RemoteModelSession / …）
 
 // dev-only 冒烟测试：对真实声学/声码器模型敲定 ONNX 张量 I/O、验证 DirectML、跑出第一声。
 // 用法（路径外部化，绝不硬编码敏感声库/角色名）：
@@ -58,6 +60,18 @@ if (args.Contains("--dump-only"))
 if (args.Contains("--retake"))
 {
     RetakeTest(voiceRoot, acousticCfg, acousticPath);
+    return 0;
+}
+
+if (args.Contains("--bench-ipc"))
+{
+    BenchIpc(voiceRoot, acousticCfg, acousticPath);
+    return 0;
+}
+
+if (args.Contains("--test-crash"))
+{
+    TestCrashRecovery(voiceRoot, acousticCfg, acousticPath);
     return 0;
 }
 
@@ -248,6 +262,170 @@ static void Synthesize(string voiceRoot, Dictionary<string, object?> cfg,
 
     WriteWav(outWav, waveform.ToArray(), sampleRate);
     Console.WriteLine($"  已写出: {outWav}");
+}
+
+// —— IPC 基准：同一份声学输入，分别经 InProcessModelSession（进程内直跑）与 RemoteModelSession（管道→MLRuntime.exe）
+//    各跑 N 遍，量 per-Run 耗时，隔离出「子进程比进程内多花多少」。子进程先跑、跑完即杀 MLRuntime，避免与随后的
+//    进程内 DML 会话并存于同一 GPU；两模式喂完全相同的一份 feeds。 ——
+static void BenchIpc(string voiceRoot, Dictionary<string, object?> cfg, string acousticPath)
+{
+    const int warmup = 2, iters = 8, F = 400;
+    const long steps = 20;
+    string mlExe = Environment.GetEnvironmentVariable("DIFFSINGER_MLRUNTIME_EXE")
+        ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "TuneLab", "Extensions", "diffsingerfortunelab", "mlruntime", "MLRuntime.exe");
+
+    Console.WriteLine($"\n======== IPC BENCH: acoustic  F={F} steps={steps} warmup={warmup} iters={iters} ========");
+    Console.WriteLine($"  模型: {Path.GetFileName(acousticPath)}");
+    Console.WriteLine($"  MLRuntime.exe: {mlExe}  存在={File.Exists(mlExe)}");
+
+    List<NamedOnnxValue> feeds;
+    using (var metaSession = Open(acousticPath))   // 只读元数据构造 feeds，构造完即释放
+        feeds = BuildAcousticFeeds(voiceRoot, cfg, metaSession, F, steps);
+
+    double[] sub;
+    {
+        using var client = new RuntimeClient("directml",
+            p => new PipeTransport(mlExe, p, l => Console.WriteLine($"    [MLRuntime] {l}")), canRespawn: true);
+        var s = RemoteModelSession.Load(client, acousticPath);
+        sub = TimeRuns(s, feeds, warmup, iters);
+    }
+
+    double[] inp;
+    {
+        using var session = Open(acousticPath);
+        var s = new InProcessModelSession(session);
+        inp = TimeRuns(s, feeds, warmup, iters);
+    }
+
+    Report("进程内 in-process", inp);
+    Report("子进程 subprocess", sub);
+    double mi = Median(inp), ms = Median(sub);
+    Console.WriteLine("\n  === 结论 ===");
+    Console.WriteLine($"  进程内 中位 {mi:F1} ms  |  子进程 中位 {ms:F1} ms");
+    Console.WriteLine($"  子进程额外开销 = {ms - mi:F1} ms/遍  ({(ms - mi) / mi * 100:F1}% 相对进程内)");
+}
+
+// —— 崩溃恢复注错验证：正常跑 → 外部杀 MLRuntime（模拟原生崩溃）→ 验「本次任务抛错」→ 验「下个任务自动重启并成功」。
+//    只杀本测试 spawn 的子进程（按启动前后 PID 差集，不误伤 TuneLab 的 MLRuntime）。 ——
+static void TestCrashRecovery(string voiceRoot, Dictionary<string, object?> cfg, string acousticPath)
+{
+    string mlExe = Environment.GetEnvironmentVariable("DIFFSINGER_MLRUNTIME_EXE")
+        ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "TuneLab", "Extensions", "diffsingerfortunelab", "mlruntime", "MLRuntime.exe");
+    Console.WriteLine("\n======== CRASH RECOVERY TEST ========");
+    Console.WriteLine($"  MLRuntime.exe: {mlExe}  存在={File.Exists(mlExe)}");
+
+    List<NamedOnnxValue> feeds;
+    using (var meta = Open(acousticPath))
+        feeds = BuildAcousticFeeds(voiceRoot, cfg, meta, 100, 10);
+
+    int MelLen(IReadOnlyList<NamedOnnxValue> r) => r.First(v => v.Name == "mel").AsTensor<float>().ToArray().Length;
+    List<Process> Spawned(HashSet<int> before) => Process.GetProcessesByName("MLRuntime").Where(p => !before.Contains(p.Id)).ToList();
+
+    var before = Process.GetProcessesByName("MLRuntime").Select(p => p.Id).ToHashSet();
+    using var client = new RuntimeClient("directml",
+        p => new PipeTransport(mlExe, p, l => Console.WriteLine($"    [MLRuntime] {l}")), canRespawn: true);
+    var s = RemoteModelSession.Load(client, acousticPath);
+
+    Console.WriteLine($"  [1] 首次 Run … mel={MelLen(s.Run(feeds))} 元素 ✓");
+
+    var mine = Spawned(before);
+    foreach (var p in mine) { p.Kill(); p.WaitForExit(3000); }
+    Console.WriteLine($"  [2] 已杀 MLRuntime PID {string.Join(",", mine.Select(p => p.Id))}（模拟原生崩溃）");
+
+    try { s.Run(feeds); Console.WriteLine("  [3] ✗ 预期本次任务抛错，但没有！"); }
+    catch (Exception ex) { Console.WriteLine($"  [3] ✓ 本次任务抛错（符合预期）：{ex.Message}"); }
+
+    Console.WriteLine($"  [4] 下个任务 Run … mel={MelLen(s.Run(feeds))} 元素 ✓（子进程已自动重启并重载）");
+    Console.WriteLine($"  重启后本测试的 MLRuntime PID {string.Join(",", Spawned(before).Select(p => p.Id))}（应不同于 [2] 被杀的）");
+}
+
+static double[] TimeRuns(IModelSession s, IReadOnlyCollection<NamedOnnxValue> feeds, int warmup, int iters)
+{
+    for (int i = 0; i < warmup; i++) { _ = s.Run(feeds); }
+    var t = new double[iters];
+    for (int i = 0; i < iters; i++)
+    {
+        var sw = Stopwatch.StartNew();
+        _ = s.Run(feeds);
+        sw.Stop();
+        t[i] = sw.Elapsed.TotalMilliseconds;
+    }
+    return t;
+}
+
+static void Report(string label, double[] t)
+{
+    Console.WriteLine($"\n  [{label}] 每遍(ms): {string.Join(", ", t.Select(x => x.ToString("F1")))}");
+    Console.WriteLine($"    中位={Median(t):F1}  均值={t.Average():F1}  min={t.Min():F1}  max={t.Max():F1}");
+}
+
+static double Median(double[] a)
+{
+    var b = a.OrderBy(x => x).ToArray();
+    int n = b.Length;
+    return n % 2 == 1 ? b[n / 2] : (b[n / 2 - 1] + b[n / 2]) / 2;
+}
+
+static List<NamedOnnxValue> BuildAcousticFeeds(string voiceRoot, Dictionary<string, object?> cfg, InferenceSession m, int F, long steps)
+{
+    var yaml = new DeserializerBuilder().Build();
+    var phonemes = yaml.Deserialize<Dictionary<string, int>>(File.ReadAllText(ResolvePath(voiceRoot, cfg, "phonemes")));
+    var languages = yaml.Deserialize<Dictionary<string, int>>(File.ReadAllText(ResolvePath(voiceRoot, cfg, "languages")));
+    int hidden = int.Parse(cfg["hidden_size"]!.ToString()!);
+
+    long[] tokens = { phonemes["SP"], phonemes.GetValueOrDefault("zh/a", 1), phonemes["SP"] };
+    long[] langs = { languages.GetValueOrDefault("zh", 0), languages.GetValueOrDefault("zh", 0), languages.GetValueOrDefault("zh", 0) };
+    long[] durations = { 8, F - 16, 8 };
+    int nTokens = 3, nFrames = F;
+
+    var feeds = new List<NamedOnnxValue>
+    {
+        NvL("tokens", tokens, 1, nTokens),
+        NvL("durations", durations, 1, nTokens),
+        NvF("f0", Fill(nFrames, 220f), 1, nFrames),
+    };
+    bool Has(string n) => m.InputMetadata.ContainsKey(n);
+    void OptF(string n, float v) { if (Has(n)) feeds.Add(NvF(n, Fill(nFrames, v), 1, nFrames)); }
+
+    if (Has("languages")) feeds.Add(NvL("languages", langs, 1, nTokens));
+    OptF("breathiness", 0); OptF("voicing", 0); OptF("tension", 0); OptF("energy", 0);
+    OptF("gender", 0); OptF("velocity", 1);
+
+    if (Has("spk_embed"))
+    {
+        string spk0 = ((List<object>)cfg["speakers"]!)[0].ToString()!;
+        var emb = ReadEmb(Path.Combine(voiceRoot, spk0 + ".emb"), hidden);
+        var spk = new float[nFrames * hidden];
+        for (int f = 0; f < nFrames; f++) Array.Copy(emb, 0, spk, f * hidden, hidden);
+        feeds.Add(NamedOnnxValue.CreateFromTensor("spk_embed", new DenseTensor<float>(spk, new[] { 1, nFrames, hidden })));
+    }
+    if (Has("depth"))
+    {
+        float depth = float.Parse(cfg.GetValueOrDefault("max_depth")?.ToString() ?? "1.0");
+        feeds.Add(NamedOnnxValue.CreateFromTensor("depth", new DenseTensor<float>(new[] { depth }, Array.Empty<int>())));
+    }
+    if (Has("steps"))
+        feeds.Add(NamedOnnxValue.CreateFromTensor("steps", new DenseTensor<long>(new[] { steps }, Array.Empty<int>())));
+    else if (Has("speedup"))
+        feeds.Add(NamedOnnxValue.CreateFromTensor("speedup", new DenseTensor<long>(new[] { Math.Max(1L, 1000 / steps) }, Array.Empty<int>())));
+
+    // 外置噪声 fork 模型的附加输入（stock 模型无这些口，跳过）。
+    if (Has("retake"))
+        feeds.Add(NamedOnnxValue.CreateFromTensor("retake", new DenseTensor<bool>(Enumerable.Repeat(true, nFrames).ToArray(), new[] { 1, nFrames })));
+    if (Has("gt_mel"))
+    {
+        int melBins = m.InputMetadata["gt_mel"].Dimensions[2];
+        feeds.Add(NamedOnnxValue.CreateFromTensor("gt_mel", new DenseTensor<float>(new float[nFrames * melBins], new[] { 1, nFrames, melBins })));
+    }
+    if (Has("noise"))
+    {
+        var nd = m.InputMetadata["noise"].Dimensions;
+        int feats = nd[1], outDims = nd[2];
+        feeds.Add(NamedOnnxValue.CreateFromTensor("noise", new DenseTensor<float>(new float[feats * outDims * nFrames], new[] { 1, feats, outDims, nFrames })));
+    }
+    return feeds;
 }
 
 // dur 链原型（dsdur: linguistic + dur）——敲定 ph_dur_pred 单位与按词整流。
