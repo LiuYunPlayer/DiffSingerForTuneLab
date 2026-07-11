@@ -18,6 +18,7 @@ namespace DiffSingerForTuneLab;
 public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSettings
 {
     const string KeyVoicebankDirs = "voicebank_dirs";
+    const string KeyVocoderDirs = "vocoder_dirs";
     const string KeyExecutionProvider = "execution_provider";
     const string KeySamplingSteps = "sampling_steps";
     const string KeyTensorCache = "tensor_cache";
@@ -132,6 +133,7 @@ public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSet
             mModelCache = new DiffSingerModelCache(provider, TuneLabContext.Global.GetLogger());
             mProviderInUse = provider;
         }
+        mModelCache.VocoderRoots = CollectVocoderRoots();   // 每次刷入：改「声码器目录」设置即时生效，无需重建缓存/重启
         return mModelCache;
     }
 
@@ -141,8 +143,12 @@ public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSet
         var properties = new OrderedMap<PropertyKey, IControllerConfig>
         {
             {
-                (KeyVoicebankDirs, L.Tr("Voicebank directories (separate with ;)")),
-                TextBoxConfig.Create()
+                (KeyVoicebankDirs, L.Tr("Voicebank directories")),
+                DirListConfig(context.Settings, KeyVoicebankDirs)
+            },
+            {
+                (KeyVocoderDirs, L.Tr("Vocoder directories")),
+                DirListConfig(context.Settings, KeyVocoderDirs)
             },
             {
                 (KeyExecutionProvider, L.Tr("Execution device")),
@@ -168,6 +174,17 @@ public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSet
         return ObjectConfig.Create(properties);
     }
 
+    // 目录列表（变长）：每行一个路径 TextBox、+ 追加空行。行数按当前已存值算——
+    // 缺席（从未配置）= 0 行、不 seed（默认目录本就隐式生效，无需列在此）。
+    static ListConfig DirListConfig(PropertyObject settings, string key)
+    {
+        int count = settings.GetValue(key, PropertyArray.Empty).Count;
+        var elements = Enumerable.Range(0, count)
+            .Select(_ => (IControllerConfig)TextBoxConfig.Create())
+            .ToList();
+        return ListConfig.Create(elements, [new AddableElement(TextBoxConfig.Create(), L.Tr("Directory"))]);
+    }
+
     public void ApplySettings(PropertyObject settings)
     {
         mSettings = settings;
@@ -188,9 +205,24 @@ public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSet
     List<string> CollectRoots()
     {
         var roots = new List<string> { DefaultVoicebankDirectory };
-        var configured = mSettings.GetString(KeyVoicebankDirs, string.Empty);
-        roots.AddRange(configured.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        roots.AddRange(ConfiguredDirs(KeyVoicebankDirs));
         return roots;
+    }
+
+    // 声码器搜索根 = 默认 Vocoders 目录 + 用户追加。与声库目录同构：默认始终生效、追加项在后。
+    List<string> CollectVocoderRoots()
+    {
+        var roots = new List<string> { DiffSingerModelCache.VocodersDirectory };
+        roots.AddRange(ConfiguredDirs(KeyVocoderDirs));
+        return roots;
+    }
+
+    // 从设置读用户配置的目录列表（PropertyArray of string）：跳过空白行、去首尾空白。
+    IEnumerable<string> ConfiguredDirs(string key)
+    {
+        foreach (var v in mSettings.GetValue(key, PropertyArray.Empty))
+            if (v.ToString(out var s) && !string.IsNullOrWhiteSpace(s))
+                yield return s.Trim();
     }
 
     static string DefaultVoicebankDirectory => Path.Combine(DiffSingerDeclarations.UserDataRoot, "Voices");
@@ -198,6 +230,8 @@ public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSet
     static void EnsureDefaultDirectory()
     {
         try { Directory.CreateDirectory(DefaultVoicebankDirectory); }
+        catch { }
+        try { Directory.CreateDirectory(DiffSingerModelCache.VocodersDirectory); }
         catch { }
     }
 

@@ -50,8 +50,13 @@ public sealed class DiffSingerModelCache : IDisposable
         }
     }
 
-    // 声码器根目录约定：插件用户数据根下、与声库 Voices 目录并列的 Vocoders 目录；声学 dsconfig 的 vocoder 字段即子目录名。
+    // 默认声码器根：插件用户数据根下的 Vocoders 目录（与声库目录彼此独立，仅默认值恰好同在用户数据根下）；声学 dsconfig 的 vocoder 字段即子目录名。
+    // 作为可配置列表的默认播种项——用户可在设置里追加其他目录（如已有的声码器收藏位置），免去复制。
     public static string VocodersDirectory => Path.Combine(DiffSingerDeclarations.UserDataRoot, "Vocoders");
+
+    // 声码器搜索根（默认 + 用户追加，由引擎每次取会话前刷入）；按序取首个含 <vocoderName>/vocoder.yaml 的目录。
+    // 引用整体赋值原子、读取取一次快照即可；默认仅含固定目录，引擎未设置时行为与旧版一致。
+    public IReadOnlyList<string> VocoderRoots { get; set; } = new[] { VocodersDirectory };
 
     // 按物理模型包目录（config.RootPath）缓存——同一 voice 选不同 model/version = 不同物理包 = 各自缓存、不重复加载。
     public VoiceModels GetOrLoad(VoicebankConfig config)
@@ -77,7 +82,12 @@ public sealed class DiffSingerModelCache : IDisposable
         if (mVocoders.TryGetValue(vocoderName, out var cached))
             return cached;
 
-        var dir = Path.Combine(VocodersDirectory, vocoderName);
+        var dir = ResolveVocoderDir(vocoderName);
+        if (dir is null)
+            throw new InvalidOperationException(
+                $"未找到声码器 {vocoderName}：搜索的声码器目录下均无 {vocoderName}/vocoder.yaml。" +
+                $"（已搜索：{string.Join(" ; ", VocoderRoots)}）请把声码器放入其中之一，或在插件设置的「声码器目录」里追加其所在目录。");
+
         var yaml = new DeserializerBuilder().Build()
             .Deserialize<Dictionary<string, object?>>(File.ReadAllText(Path.Combine(dir, "vocoder.yaml")));
         var modelFile = yaml.TryGetValue("model", out var m) ? m?.ToString() : null;
@@ -88,6 +98,20 @@ public sealed class DiffSingerModelCache : IDisposable
         var entry = (LoadSession(modelPath), DiffSingerTensorCache.HashFile(modelPath));
         mVocoders[vocoderName] = entry;
         return entry;
+    }
+
+    // 在 VocoderRoots 里按序找到首个含 <vocoderName>/vocoder.yaml 的目录；无则 null。
+    string? ResolveVocoderDir(string vocoderName)
+    {
+        foreach (var root in VocoderRoots)
+        {
+            if (string.IsNullOrWhiteSpace(root))
+                continue;
+            var dir = Path.Combine(root, vocoderName);
+            if (File.Exists(Path.Combine(dir, "vocoder.yaml")))
+                return dir;
+        }
+        return null;
     }
 
     // 执行设备同质承诺，不做进程内回退（见类注释的 AccessViolation 约束）：
