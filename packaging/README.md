@@ -63,6 +63,7 @@ Vocoders can also live elsewhere: open **Settings → Extensions → DiffSinger*
 | **Voicebank directories** | Extra model scan dirs (one per row) | empty (default dir only) |
 | **Vocoder directories** | Extra vocoder scan dirs (one per row) | empty (default dir only) |
 | **Execution device** | `GPU (DirectML)` or `CPU`. GPU is noticeably faster; use CPU if the driver misbehaves or you have no GPU | GPU (DirectML) |
+| **Inference mode** | `Isolated process` runs ONNX in a separate process so a native crash can't take down TuneLab (auto-falls back to in-process if it can't start, e.g. blocked by antivirus); `In-process` runs inside TuneLab | Isolated process |
 | **Sampling steps** | Diffusion sampling steps. Higher = finer but slower; 20 is usually enough | 20 |
 | **Tensor cache** | Caches inference intermediates — repeated synthesis of the same segment is faster and reproducible | on |
 | **Cache size limit (MB)** | Disk cap for the tensor cache; `0` = unlimited | 4096 |
