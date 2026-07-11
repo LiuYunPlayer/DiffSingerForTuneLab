@@ -14,7 +14,7 @@ internal sealed class PipeTransport : IRuntimeTransport
     readonly NamedPipeClientStream mPipe;
     readonly JobObject? mJob;
 
-    public PipeTransport(string exePath, string provider)
+    public PipeTransport(string exePath, string provider, Action<string>? log = null)
     {
         if (!File.Exists(exePath))
             throw new FileNotFoundException($"MLRuntime 可执行文件不存在：{exePath}", exePath);
@@ -26,6 +26,7 @@ internal sealed class PipeTransport : IRuntimeTransport
             FileName = exePath,
             UseShellExecute = false,
             CreateNoWindow = true,
+            RedirectStandardOutput = true,
             RedirectStandardError = true,
             WorkingDirectory = Path.GetDirectoryName(exePath)!,
         };
@@ -33,6 +34,13 @@ internal sealed class PipeTransport : IRuntimeTransport
         psi.ArgumentList.Add(provider);
 
         mProcess = Process.Start(psi) ?? throw new InvalidOperationException($"无法启动 MLRuntime：{exePath}");
+
+        // 必须异步抽干子进程 stdout+stderr：onnxruntime 原生日志会写满重定向管道缓冲（~4KB），
+        //   写满后 exe 阻塞在 Console 写、再也处理不了 Run → 与插件的响应等待互锁死锁。顺便转发进宿主日志。
+        mProcess.OutputDataReceived += (_, e) => { if (e.Data != null) log?.Invoke(e.Data); };
+        mProcess.ErrorDataReceived += (_, e) => { if (e.Data != null) log?.Invoke(e.Data); };
+        mProcess.BeginOutputReadLine();
+        mProcess.BeginErrorReadLine();
 
         // 进 Job：宿主消亡 → OS 杀本子进程（治孤儿主保险）。仅 Windows；建 Job 失败不致命（尚有管道 EOF 副保险）。
         if (OperatingSystem.IsWindows())

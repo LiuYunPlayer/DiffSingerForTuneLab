@@ -40,7 +40,7 @@ public sealed class DiffSingerModelCache : IDisposable
         {
             var dir = Path.GetDirectoryName(typeof(DiffSingerModelCache).Assembly.Location)!;
             var exe = Path.Combine(dir, "mlruntime", "MLRuntime.exe");
-            mRuntimeClient = new RuntimeClient(new PipeTransport(exe, provider));
+            mRuntimeClient = new RuntimeClient(new PipeTransport(exe, provider, line => mLogger.Info($"[MLRuntime] {line}")));
             mLogger.Info($"DiffSinger：MLRuntime 子进程模式启用（{exe}）");
         }
         else if (Environment.GetEnvironmentVariable("DIFFSINGER_RUNTIME_LOOPBACK") == "1")
