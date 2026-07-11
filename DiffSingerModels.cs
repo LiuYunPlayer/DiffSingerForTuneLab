@@ -40,12 +40,14 @@ public sealed class DiffSingerModelCache : IDisposable
         {
             var dir = Path.GetDirectoryName(typeof(DiffSingerModelCache).Assembly.Location)!;
             var exe = Path.Combine(dir, "mlruntime", "MLRuntime.exe");
-            mRuntimeClient = new RuntimeClient(new PipeTransport(exe, provider, line => mLogger.Info($"[MLRuntime] {line}")));
+            Action<string> exeLog = line => mLogger.Info($"[MLRuntime] {line}");       // 子进程 stdout/stderr 转发
+            Action<string> lifeLog = line => mLogger.Info(line);                        // 客户端生命周期（respawn/DML→CPU）
+            mRuntimeClient = new RuntimeClient(provider, p => new PipeTransport(exe, p, exeLog), canRespawn: true, lifeLog);
             mLogger.Info($"DiffSinger：MLRuntime 子进程模式启用（{exe}）");
         }
         else if (Environment.GetEnvironmentVariable("DIFFSINGER_RUNTIME_LOOPBACK") == "1")
         {
-            mRuntimeClient = new RuntimeClient(new LoopbackTransport(new RuntimeHost(provider)));
+            mRuntimeClient = new RuntimeClient(provider, p => new LoopbackTransport(new RuntimeHost(p)), canRespawn: false);
             mLogger.Info("DiffSinger：MLRuntime loopback 模式启用（进程内、经 IPC 编解码链）");
         }
     }

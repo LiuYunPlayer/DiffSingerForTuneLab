@@ -32,6 +32,7 @@ internal sealed class RuntimeHost : IDisposable
             {
                 RuntimeOp.LoadModel => HandleLoadModel(RuntimeProtocol.DecodeLoadModel(r)),
                 RuntimeOp.Run => HandleRun(RuntimeProtocol.DecodeRun(r)),
+                RuntimeOp.Release => HandleRelease(RuntimeProtocol.DecodeRelease(r)),
                 _ => RuntimeProtocol.EncodeError($"未知操作码 {(byte)op}"),
             };
         }
@@ -77,6 +78,21 @@ internal sealed class RuntimeHost : IDisposable
             outputs = TensorCodec.Clone(raw);
         }
         return RuntimeProtocol.EncodeRunOk(outputs);
+    }
+
+    byte[] HandleRelease(int sessionId)
+    {
+        lock (mRunLock)
+        {
+            if (mSessions.TryGetValue(sessionId, out var session))
+            {
+                mSessions.Remove(sessionId);
+                foreach (var kv in mByPath)
+                    if (kv.Value == sessionId) { mByPath.Remove(kv.Key); break; }
+                session.Dispose();
+            }
+        }
+        return RuntimeProtocol.EncodeAck();
     }
 
     // provider 决策：cpu 只建 CPU；directml 建 DML、失败即抛（不就地回退——同进程 DML/CPU 混用会崩，见止血补丁）。

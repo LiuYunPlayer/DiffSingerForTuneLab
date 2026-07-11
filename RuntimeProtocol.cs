@@ -9,7 +9,7 @@ namespace DiffSingerForTuneLab;
 // MLRuntime IPC 线协议（编解码层）：请求/响应 ↔ 字节帧。张量编组复用 DiffSingerTensorCache 的序列化（单一来源，
 //   与磁盘缓存同款、已被缓存往返证明无损）。与传输无关——传输层只管把一个字节帧送达对端、取回一个字节帧。
 //   帧布局：请求 [op:byte] payload；响应 [status:byte] payload（Ok=0 / Error=1）。
-internal enum RuntimeOp : byte { LoadModel = 1, Run = 2 }
+internal enum RuntimeOp : byte { LoadModel = 1, Run = 2, Release = 3 }
 internal enum RuntimeStatus : byte { Ok = 0, Error = 1 }
 
 internal static class RuntimeProtocol
@@ -36,11 +36,22 @@ internal static class RuntimeProtocol
         return ms.ToArray();
     }
 
+    public static byte[] EncodeRelease(int sessionId)
+    {
+        using var ms = new MemoryStream();
+        using var w = new BinaryWriter(ms, Encoding.UTF8);
+        w.Write((byte)RuntimeOp.Release);
+        w.Write(sessionId);
+        w.Flush();
+        return ms.ToArray();
+    }
+
     // —— 请求解码（服务端）——
     public static RuntimeOp PeekOp(BinaryReader r) => (RuntimeOp)r.ReadByte();
     public static string DecodeLoadModel(BinaryReader r) => r.ReadString();
     public static (int SessionId, List<NamedOnnxValue> Inputs) DecodeRun(BinaryReader r)
         => (r.ReadInt32(), TensorCodec.ReadValues(r));
+    public static int DecodeRelease(BinaryReader r) => r.ReadInt32();
 
     // —— 响应编码（服务端）——
     public static byte[] EncodeLoadModelOk(int sessionId, IReadOnlyList<(string Name, int[] Dims)> inputs)
@@ -70,6 +81,9 @@ internal static class RuntimeProtocol
         w.Flush();
         return ms.ToArray();
     }
+
+    // 无负载确认（Release 等）：仅状态字节。
+    public static byte[] EncodeAck() => new[] { (byte)RuntimeStatus.Ok };
 
     public static byte[] EncodeError(string message)
     {
