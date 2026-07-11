@@ -65,7 +65,9 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
             n => n.EndTime.Modified,
             n => n.Pitch.Modified,
             n => n.Lyric.Modified,
-            n => n.Phonemes.Modified,
+            n => n.LeadingPhonemes.Modified,   // 钉死音素双列表 + 结合线偏移无合并信号，须同订三者（SDK 契约）
+            n => n.BodyPhonemes.Modified,
+            n => n.BodyOffset.Modified,
             n => n.Properties.Modified);
         mNoteFieldModified.Subscribe(OnNoteModified);
         context.Notes.MembershipModified.Subscribe(OnNotesStructureChanged);   // 成员增删聚合信号 → 重分块
@@ -455,11 +457,12 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         var audio = wavOut.First(v => v.Name == "waveform").AsTensor<float>().ToArray();
         progress?.Report(1.0);
 
-        // —— 音素产物（按归属 note 键，每 note 一个 SynthesizedSyllable = 音素序列 + 前置量 Preutterance，只报标称
+        // —— 音素产物（按归属 note 键，每 note 一个 SynthesizedSyllable = 引导/主体双列表 + BodyOffset，只报标称
         //   几何；定位 / 跨 note 去重叠 / melisma 归宿主，见 §5.7）——
         //   时长 = 解析出的 EndTime − StartTime（核含 melisma 填充量、辅音为固定长）；权重核 1 / 辅音 0。
-        //   前置量（拍前发声量）= 落在 note 头（= 该 note StartTime）之前的音素时长之和——由解析几何派生、不落每音素标志
-        //   （前后归属与宿主同源；跨拍音素按落线两侧切分各计入其一）。用户锁定回填后再喂 PhonemeLayout 与显示自洽（WYSIWYG）。
+        //   引导 / 主体归属由 phonemizer 携于 PhonemeSpan.IsLeading（自由 note 按分组、钉死 note 按宿主双列表）；
+        //   BodyOffset（有符号）= 结合线 junction − note 头，几何派生（主体存在取主体首起点、否则取引导末）——与旧 Preutterance
+        //   口径同源、随解析几何自洽；BodyOffset=0 即核精确落 note 头。用户锁定回填后再喂 PhonemeLayout 与显示自洽（WYSIWYG）。
         //   归属：p.NoteIndex 对齐 snapshot.Notes，故以 origins[NoteIndex] 为键回指活 note（仅作身份 token）。
         var byNote = new Dictionary<int, List<PhonemeSpan>>();
         foreach (var p in phones)
@@ -472,19 +475,21 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         foreach (var kvp in byNote)
         {
             double noteHead = notes[kvp.Key].StartTime;
-            var items = new List<SynthesizedPhoneme>(kvp.Value.Count);
-            double preutter = 0;
-            foreach (var p in kvp.Value)
+            var leading = new List<SynthesizedPhoneme>();
+            var body = new List<SynthesizedPhoneme>();
+            double junction = noteHead;   // 结合线 = 主体首音素起点；无主体则退取引导末、皆无则 note 头（正常不触发）
+            foreach (var p in kvp.Value)   // phonemizer 按 note 内序（引导在前、主体在后）发射
             {
-                items.Add(new SynthesizedPhoneme
+                var descriptor = new SynthesizedPhoneme
                 {
                     Symbol = CleanSymbol(p.Symbol),   // 剥 lang/ 前缀：显示/钉死符号保持干净，语种走 per-phoneme 属性
                     Duration = Math.Max(0, p.EndTime - p.StartTime),
                     StretchWeight = p.IsVowel ? 1 : 0,
-                });
-                preutter += Math.Max(0, Math.Min(p.EndTime, noteHead) - p.StartTime);   // 该音素落在 note 头之前的量
+                };
+                if (p.IsLeading) { leading.Add(descriptor); junction = p.EndTime; }
+                else { if (body.Count == 0) junction = p.StartTime; body.Add(descriptor); }
             }
-            phonemes.Add(origins[kvp.Key], new SynthesizedSyllable(items, preutter));
+            phonemes.Add(origins[kvp.Key], new SynthesizedSyllable(leading, body, junction - noteHead));
         }
 
         return new RenderResult(audio, renderStart, sr, phonemes, pitchReadback, varReadback);
@@ -497,7 +502,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         for (int i = 0; i < notes.Count; i++)
         {
             string sym = PickVowelSymbol(models, noteLang[i]);
-            result.Add(new PhonemeSpan(sym, notes[i].StartTime, notes[i].EndTime, i, true));
+            result.Add(new PhonemeSpan(sym, notes[i].StartTime, notes[i].EndTime, i, true, false));   // 元音起手核 = 主体（非引导）
         }
         return result;
     }
@@ -628,8 +633,8 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         }
     }
 
-    // 合成音素（按归属 note 键）：各已合成 piece 的 note→音节（SynthesizedSyllable = 音素序列 + 前置量 Preutterance）
-    //   并入一张 map（块间 note 不相交，直接并）；只报 Symbol / Duration / StretchWeight + note 级 Preutterance——
+    // 合成音素（按归属 note 键）：各已合成 piece 的 note→音节（SynthesizedSyllable = 引导/主体双列表 + BodyOffset）
+    //   并入一张 map（块间 note 不相交，直接并）；只报 Symbol / Duration / StretchWeight + note 级引导/主体归属与 BodyOffset——
     //   定位 / 去重叠 / melisma 归宿主（见 §5.7）。失败 / 未合成块不报。
     public IReadOnlyMap<IVoiceSynthesisNote, SynthesizedSyllable> SynthesizedPhonemes
     {
