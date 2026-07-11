@@ -26,29 +26,46 @@ public sealed class DiffSingerModelCache : IDisposable
     readonly Dictionary<string, VoiceModels> mVoices = new(StringComparer.Ordinal);
     readonly Dictionary<string, (IModelSession Session, ulong Hash)> mVocoders = new(StringComparer.Ordinal);
 
-    // MLRuntime 路由（env 开关；off 默认走 InProcessModelSession，零影响）：
-    //   · DIFFSINGER_RUNTIME_SUBPROCESS=1 → PipeTransport：spawn mlruntime/MLRuntime.exe，真子进程隔离原生崩溃；
-    //   · DIFFSINGER_RUNTIME_LOOPBACK=1  → LoopbackTransport：进程内 host、走完整 IPC 编解码链（无子进程的测试/兜底路径）。
-    //   两者都产出 RuntimeClient，LoadSession 据此返回 RemoteModelSession。子进程优先于 loopback。
+    // MLRuntime 路由：推理模式由设置决定（默认 subprocess——隔离子进程跑 ONNX，原生崩溃不拖垮宿主）：
+    //   · "subprocess"（默认）→ PipeTransport：spawn mlruntime/MLRuntime.exe；启动探测失败（杀软/权限）则退回进程内。
+    //   · "inprocess"          → mRuntimeClient=null，走 InProcessModelSession（进程内直跑，逃生模式）。
+    //   · env DIFFSINGER_RUNTIME_LOOPBACK=1（dev）→ LoopbackTransport：进程内 host、走完整 IPC 编解码链（测试用）。
+    //   非 null 的 mRuntimeClient 令 LoadSession 返回 RemoteModelSession。
     readonly RuntimeClient? mRuntimeClient;
 
-    public DiffSingerModelCache(string provider, ILogger logger)
+    public DiffSingerModelCache(string provider, string runtimeMode, ILogger logger)
     {
         mProvider = provider;
         mLogger = logger;
-        if (Environment.GetEnvironmentVariable("DIFFSINGER_RUNTIME_SUBPROCESS") == "1")
-        {
-            var dir = Path.GetDirectoryName(typeof(DiffSingerModelCache).Assembly.Location)!;
-            var exe = Path.Combine(dir, "mlruntime", "MLRuntime.exe");
-            Action<string> exeLog = line => mLogger.Info($"[MLRuntime] {line}");       // 子进程 stdout/stderr 转发
-            Action<string> lifeLog = line => mLogger.Info(line);                        // 客户端生命周期（respawn/DML→CPU）
-            mRuntimeClient = new RuntimeClient(provider, p => new PipeTransport(exe, p, exeLog), canRespawn: true, lifeLog);
-            mLogger.Info($"DiffSinger：MLRuntime 子进程模式启用（{exe}）");
-        }
-        else if (Environment.GetEnvironmentVariable("DIFFSINGER_RUNTIME_LOOPBACK") == "1")
+        if (Environment.GetEnvironmentVariable("DIFFSINGER_RUNTIME_LOOPBACK") == "1")
         {
             mRuntimeClient = new RuntimeClient(provider, p => new LoopbackTransport(new RuntimeHost(p)), canRespawn: false);
-            mLogger.Info("DiffSinger：MLRuntime loopback 模式启用（进程内、经 IPC 编解码链）");
+            mLogger.Info("DiffSinger：MLRuntime loopback 模式（dev）");
+        }
+        else if (runtimeMode != "inprocess")   // 默认 subprocess
+        {
+            mRuntimeClient = TryCreateSubprocessClient(provider);
+        }
+    }
+
+    // 建子进程客户端：先立即 spawn+连一个传输作启动探测——成功则以它为初始传输建弹性 client；
+    //   失败（exe 缺失/杀软拦截/权限/管道建不起）则记警告、返回 null 退回进程内（这是「起不来」非「崩」，退回救场）。
+    RuntimeClient? TryCreateSubprocessClient(string provider)
+    {
+        var dir = Path.GetDirectoryName(typeof(DiffSingerModelCache).Assembly.Location)!;
+        var exe = Path.Combine(dir, "mlruntime", "MLRuntime.exe");
+        Action<string> exeLog = line => mLogger.Info($"[MLRuntime] {line}");   // 子进程 stdout/stderr 转发
+        Func<string, IRuntimeTransport> factory = p => new PipeTransport(exe, p, exeLog);
+        try
+        {
+            var probe = factory(provider);   // 立即 spawn+连，探测子进程能否起来
+            mLogger.Info($"DiffSinger：MLRuntime 子进程模式（{exe}）");
+            return new RuntimeClient(provider, factory, canRespawn: true, line => mLogger.Info(line), probe);
+        }
+        catch (Exception ex)
+        {
+            mLogger.Warning($"DiffSinger：MLRuntime 子进程启动失败（{ex.Message}），本次退回进程内。可在插件设置的「推理模式」调整，或检查杀软/权限。");
+            return null;
         }
     }
 

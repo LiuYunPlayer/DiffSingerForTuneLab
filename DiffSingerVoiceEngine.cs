@@ -20,6 +20,7 @@ public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSet
     const string KeyVoicebankDirs = "voicebank_dirs";
     const string KeyVocoderDirs = "vocoder_dirs";
     const string KeyExecutionProvider = "execution_provider";
+    const string KeyRuntimeMode = "runtime_mode";
     const string KeySamplingSteps = "sampling_steps";
     const string KeyTensorCache = "tensor_cache";
     const string KeyCacheMaxSizeMb = "cache_max_size_mb";
@@ -127,11 +128,13 @@ public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSet
     DiffSingerModelCache EnsureModelCache()
     {
         var provider = mSettings.GetString(KeyExecutionProvider, "directml");
-        if (mModelCache == null || mProviderInUse != provider)
+        var runtimeMode = mSettings.GetString(KeyRuntimeMode, "subprocess");
+        if (mModelCache == null || mProviderInUse != provider || mRuntimeModeInUse != runtimeMode)
         {
             mModelCache?.Dispose();
-            mModelCache = new DiffSingerModelCache(provider, TuneLabContext.Global.GetLogger());
+            mModelCache = new DiffSingerModelCache(provider, runtimeMode, TuneLabContext.Global.GetLogger());
             mProviderInUse = provider;
+            mRuntimeModeInUse = runtimeMode;
         }
         mModelCache.VocoderRoots = CollectVocoderRoots();   // 每次刷入：改「声码器目录」设置即时生效，无需重建缓存/重启
         return mModelCache;
@@ -156,6 +159,14 @@ public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSet
                 {
                     new(PropertyValue.Create("directml"), L.Tr("GPU (DirectML)")),
                     new(PropertyValue.Create("cpu"), L.Tr("CPU")),
+                })
+            },
+            {
+                (KeyRuntimeMode, L.Tr("Inference mode")),
+                ComboBoxConfig.Create(new List<ComboBoxItem>
+                {
+                    new(PropertyValue.Create("subprocess"), L.Tr("Isolated process (recommended)")),
+                    new(PropertyValue.Create("inprocess"), L.Tr("In-process")),
                 })
             },
             {
@@ -244,4 +255,5 @@ public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSet
 
     DiffSingerModelCache? mModelCache;
     string mProviderInUse = string.Empty;
+    string mRuntimeModeInUse = string.Empty;
 }

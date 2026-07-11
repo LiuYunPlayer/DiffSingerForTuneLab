@@ -24,12 +24,14 @@ internal sealed class RuntimeClient : IDisposable
 
     IRuntimeTransport? mTransport;
 
-    public RuntimeClient(string provider, Func<string, IRuntimeTransport> transportFactory, bool canRespawn, Action<string>? log = null)
+    public RuntimeClient(string provider, Func<string, IRuntimeTransport> transportFactory, bool canRespawn,
+        Action<string>? log = null, IRuntimeTransport? initialTransport = null)
     {
         mProvider = provider;
         mFactory = transportFactory;
         mCanRespawn = canRespawn;
         mLog = log;
+        mTransport = initialTransport;   // 启动探测已建的传输，首用直接复用（不再经工厂 spawn）
     }
 
     // 惰性传输：null（首次 / 崩溃丢弃后）时经工厂现建子进程。
