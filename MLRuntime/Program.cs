@@ -14,6 +14,9 @@ if (args.Length < 2)
     return 2;
 }
 
+// 在任何 ONNX 调用前注册：从父插件目录复用 onnxruntime 原生库（去重，不自带副本）。
+OnnxNativeResolver.Register();
+
 string pipeName = args[0];
 string provider = args[1];
 

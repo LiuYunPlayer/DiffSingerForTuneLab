@@ -22,6 +22,11 @@ if (Test-Path $mlStage) { Remove-Item $mlStage -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $mlStage | Out-Null
 Copy-Item -Path (Join-Path $mlSource "*") -Destination $mlStage -Recurse -Force
 
+# 去重 onnxruntime：MLRuntime 子进程经 OnnxNativeResolver 改从父插件目录 runtimes/ 加载原生库，
+# 不再自带一份（省 ~15MB×平台）。删掉暂存里的 mlruntime/runtimes/（父目录整树 runtimes/ 仍在）。
+$mlRuntimes = Join-Path $mlStage "runtimes"
+if (Test-Path $mlRuntimes) { Remove-Item $mlRuntimes -Recurse -Force }
+
 # 从 manifest.json 取 id + version 命名产物
 $desc = Get-Content (Join-Path $source "manifest.json") -Raw | ConvertFrom-Json
 $tlx = Join-Path $out ("$($desc.id)-$($desc.version).tlx")

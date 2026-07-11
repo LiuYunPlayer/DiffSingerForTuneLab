@@ -22,4 +22,8 @@ $mlDest = Join-Path $dest "mlruntime"
 New-Item -ItemType Directory -Force -Path $mlDest | Out-Null
 Copy-Item -Path (Join-Path $mlSource "*") -Destination $mlDest -Recurse -Force
 
+# 去重 onnxruntime：MLRuntime 子进程经 OnnxNativeResolver 改从父插件目录 runtimes/ 加载原生库，删掉自带副本。
+$mlRuntimes = Join-Path $mlDest "runtimes"
+if (Test-Path $mlRuntimes) { Remove-Item $mlRuntimes -Recurse -Force }
+
 Write-Host "已部署到 $dest（含 mlruntime/）"
