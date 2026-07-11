@@ -337,7 +337,7 @@ public static class DiffSingerPhonemizer
             Nv("word_div", wordDiv, nWords),
             Nv("word_dur", wordDur, nWords),
         };
-        if (dur.Linguistic.InputMetadata.ContainsKey("languages"))
+        if (dur.Linguistic.HasInput("languages"))
             lingInputs.Add(Nv("languages", langs, nTokens));
 
         var lingOut = DiffSingerTensorCache.Run(dur.Linguistic, dur.LinguisticHash, lingInputs, tensorCache);
@@ -355,7 +355,7 @@ public static class DiffSingerPhonemizer
         };
         // spk_embed 仅当 dur 模型声明该口时喂入（单说话人模型无此口）——
         //   与 DiffSingerPitch / DiffSingerVariance 一致；否则向 ORT 喂未声明输入会抛 Invalid Feed Input Name。
-        if (durModel.InputMetadata.ContainsKey("spk_embed"))
+        if (durModel.HasInput("spk_embed"))
         {
             float[] emb = dur.GetEmbedding(speaker);
             var spk = new float[nTokens * hidden];

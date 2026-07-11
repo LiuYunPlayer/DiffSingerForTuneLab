@@ -24,13 +24,13 @@ public sealed class DiffSingerPredictor : IDisposable
     readonly Dictionary<string, int> mLanguages;
     readonly IReadOnlyList<string> mSpeakers;
     readonly int mHidden;
-    readonly Dictionary<string, InferenceSession> mModels = new(StringComparer.Ordinal);
+    readonly Dictionary<string, IModelSession> mModels = new(StringComparer.Ordinal);
     readonly Dictionary<string, float[]> mEmbCache = new(StringComparer.Ordinal);
     readonly Dictionary<string, IG2p?> mG2pChains = new(StringComparer.Ordinal);  // lang → G2P 兜底链（词典 ⊕ 算法 remap），懒构建缓存
     readonly Dictionary<string, string> mSymbolTypes = new(StringComparer.Ordinal);  // symbol → type（合并 dsdict）
     readonly object mLock = new();
 
-    public InferenceSession Linguistic { get; }
+    public IModelSession Linguistic { get; }
     public int HiddenSize => mHidden;
     // linguistic 是否吃 word_div/word_dur（dsdur/dsvariance 词边界；dspitch 用已知 ph_dur）。
     public bool LinguisticUsesWordBoundary { get; }
@@ -40,7 +40,7 @@ public sealed class DiffSingerPredictor : IDisposable
     readonly Dictionary<string, ulong> mModelHashes = new(StringComparer.Ordinal);
     public ulong ModelHash(string role) => mModelHashes.TryGetValue(role, out var h) ? h : 0;
 
-    public DiffSingerPredictor(string dir, Func<string, InferenceSession> load)
+    public DiffSingerPredictor(string dir, Func<string, IModelSession> load)
     {
         mDir = dir;
         var yaml = new DeserializerBuilder().Build();
@@ -63,7 +63,7 @@ public sealed class DiffSingerPredictor : IDisposable
         var lingPath = Path.Combine(dir, Get("linguistic"));
         Linguistic = load(lingPath);
         LinguisticHash = DiffSingerTensorCache.HashFile(lingPath);
-        LinguisticUsesWordBoundary = Linguistic.InputMetadata.ContainsKey("word_div");
+        LinguisticUsesWordBoundary = Linguistic.HasInput("word_div");
         foreach (var role in new[] { "dur", "variance", "pitch" })
             if (!string.IsNullOrEmpty(Get(role)))
             {
@@ -74,7 +74,7 @@ public sealed class DiffSingerPredictor : IDisposable
     }
 
     public bool HasModel(string role) => mModels.ContainsKey(role);
-    public InferenceSession Model(string role) => mModels[role];
+    public IModelSession Model(string role) => mModels[role];
 
     // —— 符号查询 ——
     public bool IsVowel(string symbol)
@@ -243,10 +243,12 @@ public sealed class DiffSingerPredictor : IDisposable
         => new DeserializerBuilder().Build().Deserialize<Dictionary<string, int>>(File.ReadAllText(path))
            ?? new Dictionary<string, int>();
 
-    // 会话经退役机制在推理锁内释放（杜绝与在飞 Run 并发释放，根治关闭 / 换设备时的 AccessViolation）。
+    // 会话自身在设备级锁内退役并释放（杜绝与在飞 Run 并发释放，根治关闭 / 换设备时的 AccessViolation）。
     public void Dispose()
     {
-        DiffSingerTensorCache.RetireAndDispose(new[] { Linguistic }.Concat(mModels.Values));
+        Linguistic.Dispose();
+        foreach (var model in mModels.Values)
+            model.Dispose();
         mModels.Clear();
     }
 }

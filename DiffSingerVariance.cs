@@ -55,7 +55,7 @@ public static class DiffSingerVariance
         {
             lingInputs.Add(NvL("ph_dur", phDur.Select(x => (long)x).ToArray(), nTokens));
         }
-        if (v.Linguistic.InputMetadata.ContainsKey("languages"))
+        if (v.Linguistic.HasInput("languages"))
             lingInputs.Add(NvL("languages", langs, nTokens));
         var lingOut = DiffSingerTensorCache.Run(v.Linguistic, v.LinguisticHash, lingInputs, tensorCache);
         var enc = lingOut.First(o => o.Name == "encoder_out").AsTensor<float>();
@@ -76,7 +76,7 @@ public static class DiffSingerVariance
         {
             if (!predict) return;
             channels.Add(name);
-            if (model.InputMetadata.ContainsKey(name))
+            if (model.HasInput(name))
                 inputs.Add(NvF(name, new float[totalFrames], totalFrames));   // 基值 0（retake 全 true 故忽略）
         }
         Channel(cfg.PredictEnergy, "energy");
@@ -92,7 +92,7 @@ public static class DiffSingerVariance
 
         AddAccel(inputs, model, cfg, steps);
 
-        if (model.InputMetadata.ContainsKey("spk_embed"))
+        if (model.HasInput("spk_embed"))
         {
             var spk = mix.ToEmbedding(v.GetEmbedding, hidden);
             inputs.Add(NamedOnnxValue.CreateFromTensor("spk_embed",
@@ -111,15 +111,15 @@ public static class DiffSingerVariance
             Out(cfg.PredictTension, "tension_pred"));
     }
 
-    static void AddAccel(List<NamedOnnxValue> inputs, InferenceSession model, VoicebankConfig cfg, int steps)
+    static void AddAccel(List<NamedOnnxValue> inputs, IModelSession model, VoicebankConfig cfg, int steps)
     {
         if (cfg.UseContinuousAcceleration)
         {
-            if (model.InputMetadata.ContainsKey("steps"))
+            if (model.HasInput("steps"))
                 inputs.Add(NamedOnnxValue.CreateFromTensor("steps",
                     new DenseTensor<long>(new[] { (long)steps }, new[] { 1 })));
         }
-        else if (model.InputMetadata.ContainsKey("speedup"))
+        else if (model.HasInput("speedup"))
         {
             long speedup = Math.Max(1, 1000 / Math.Max(1, steps));
             while (1000 % speedup != 0 && speedup > 1) speedup--;

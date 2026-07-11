@@ -19,18 +19,18 @@ public static class DiffSingerNoise
     public const ulong StageAcoustic = 0xA0, StagePitch = 0xB0, StageVariance = 0xC0;
 
     // 标量 seed（全 part 一致，如 acoustic timbre——它全局不局部化，单一 seed 即可）。
-    public static void AddNoise(List<NamedOnnxValue> inputs, InferenceSession model, uint seed, ulong stage, int nFrames)
+    public static void AddNoise(List<NamedOnnxValue> inputs, IModelSession model, uint seed, ulong stage, int nFrames)
         => AddNoise(inputs, model, _ => seed, stage, nFrames);
 
     // 逐帧 seed（pitch/variance 的 seed 自动化轨：每帧可不同 → 时间维 × 值维 = 区域独立 take）。归一化 [0,1] 已在会话期放大到 uint32。
-    public static void AddNoise(List<NamedOnnxValue> inputs, InferenceSession model, uint[] seedPerFrame, ulong stage, int nFrames)
+    public static void AddNoise(List<NamedOnnxValue> inputs, IModelSession model, uint[] seedPerFrame, ulong stage, int nFrames)
         => AddNoise(inputs, model, t => seedPerFrame[Math.Min(t, seedPerFrame.Length - 1)], stage, nFrames);
 
-    static void AddNoise(List<NamedOnnxValue> inputs, InferenceSession model, Func<int, uint> seedAt, ulong stage, int nFrames)
+    static void AddNoise(List<NamedOnnxValue> inputs, IModelSession model, Func<int, uint> seedAt, ulong stage, int nFrames)
     {
-        if (!model.InputMetadata.TryGetValue("noise", out var meta))
+        if (!model.HasInput("noise"))
             return;   // 无 noise 口（stock 模型）→ 不喂，退回模型内部随机
-        var dims = meta.Dimensions;            // [1, num_feats, out_dims, -1]
+        var dims = model.InputShape("noise");  // [1, num_feats, out_dims, -1]
         int feats = dims[1], outDims = dims[2];
         var data = new float[feats * outDims * nFrames];
         int idx = 0;

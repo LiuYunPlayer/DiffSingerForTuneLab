@@ -47,7 +47,7 @@ public static class DiffSingerPitch
         {
             lingInputs.Add(NvL("ph_dur", phDur.Select(x => (long)x).ToArray(), nTokens));
         }
-        if (v.Linguistic.InputMetadata.ContainsKey("languages"))
+        if (v.Linguistic.HasInput("languages"))
         {
             var langs = phones.Select(p => v.LangId(PhonemeLanguage(p.Symbol))).Prepend(0L).Append(0L).ToArray();
             lingInputs.Add(NvL("languages", langs, nTokens));
@@ -79,19 +79,19 @@ public static class DiffSingerPitch
         AddAccel(inputs, model, cfg, steps);
 
         // 表现力（PEXP）：本阶段喂中性 1.0（满表现力）；可编辑 PEXP 轨后续再加。
-        if (model.InputMetadata.ContainsKey("expr"))
+        if (model.HasInput("expr"))
         {
             var expr = new float[totalFrames];
             Array.Fill(expr, 1f);
             inputs.Add(NvF("expr", expr, totalFrames));
         }
-        if (model.InputMetadata.ContainsKey("spk_embed"))
+        if (model.HasInput("spk_embed"))
         {
             var spk = mix.ToEmbedding(v.GetEmbedding, hidden);
             inputs.Add(NamedOnnxValue.CreateFromTensor("spk_embed",
                 new DenseTensor<float>(spk, new[] { 1, totalFrames, hidden })));
         }
-        if (model.InputMetadata.ContainsKey("note_rest"))
+        if (model.HasInput("note_rest"))
             inputs.Add(NamedOnnxValue.CreateFromTensor("note_rest",
                 new DenseTensor<bool>(noteRest, new[] { 1, noteRest.Length })));
 
@@ -206,15 +206,15 @@ public static class DiffSingerPitch
         }
     }
 
-    static void AddAccel(List<NamedOnnxValue> inputs, InferenceSession model, VoicebankConfig cfg, int steps)
+    static void AddAccel(List<NamedOnnxValue> inputs, IModelSession model, VoicebankConfig cfg, int steps)
     {
         if (cfg.UseContinuousAcceleration)
         {
-            if (model.InputMetadata.ContainsKey("steps"))
+            if (model.HasInput("steps"))
                 inputs.Add(NamedOnnxValue.CreateFromTensor("steps",
                     new DenseTensor<long>(new[] { (long)steps }, new[] { 1 })));
         }
-        else if (model.InputMetadata.ContainsKey("speedup"))
+        else if (model.HasInput("speedup"))
         {
             long speedup = Math.Max(1, 1000 / Math.Max(1, steps));
             while (1000 % speedup != 0 && speedup > 1) speedup--;
