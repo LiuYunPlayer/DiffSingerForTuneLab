@@ -31,7 +31,7 @@ internal static class RuntimeProtocol
         using var w = new BinaryWriter(ms, Encoding.UTF8);
         w.Write((byte)RuntimeOp.Run);
         w.Write(sessionId);
-        DiffSingerTensorCache.WriteValues(w, inputs);
+        TensorCodec.WriteValues(w, inputs);
         w.Flush();
         return ms.ToArray();
     }
@@ -40,7 +40,7 @@ internal static class RuntimeProtocol
     public static RuntimeOp PeekOp(BinaryReader r) => (RuntimeOp)r.ReadByte();
     public static string DecodeLoadModel(BinaryReader r) => r.ReadString();
     public static (int SessionId, List<NamedOnnxValue> Inputs) DecodeRun(BinaryReader r)
-        => (r.ReadInt32(), DiffSingerTensorCache.ReadValues(r));
+        => (r.ReadInt32(), TensorCodec.ReadValues(r));
 
     // —— 响应编码（服务端）——
     public static byte[] EncodeLoadModelOk(int sessionId, IReadOnlyList<(string Name, int[] Dims)> inputs)
@@ -66,7 +66,7 @@ internal static class RuntimeProtocol
         using var ms = new MemoryStream();
         using var w = new BinaryWriter(ms, Encoding.UTF8);
         w.Write((byte)RuntimeStatus.Ok);
-        DiffSingerTensorCache.WriteValues(w, outputs);
+        TensorCodec.WriteValues(w, outputs);
         w.Flush();
         return ms.ToArray();
     }
@@ -107,7 +107,7 @@ internal static class RuntimeProtocol
         using var ms = new MemoryStream(frame);
         using var r = new BinaryReader(ms, Encoding.UTF8);
         ThrowIfError(r);
-        return DiffSingerTensorCache.ReadValues(r);
+        return TensorCodec.ReadValues(r);
     }
 
     static void ThrowIfError(BinaryReader r)

@@ -46,7 +46,7 @@ internal sealed class InProcessModelSession : IModelSession
             if (mRetired)
                 throw new ObjectDisposedException(nameof(InferenceSession), "DiffSinger：模型会话已随缓存释放，推理取消。");
             using var raw = mSession.Run(inputs);
-            return DiffSingerTensorCache.Clone(raw);   // 先脱离原生内存再返回
+            return TensorCodec.Clone(raw);   // 先脱离原生内存再返回
         }
     }
 

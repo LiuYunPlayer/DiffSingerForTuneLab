@@ -15,12 +15,17 @@
     <EnableDynamicLoading>true</EnableDynamicLoading>
   </PropertyGroup>
 
-  <!-- tools/ 是 dev-only 独立项目（冒烟测试），有自己的 csproj/入口；从插件编译中排除，否则 SDK 默认 glob 会
-       连其源码与 obj 生成文件一起编进插件（重复入口/特性）。 -->
+  <!-- tools/ 是 dev-only 独立项目（冒烟测试）、MLRuntime/ 是随包分发的独立 exe（自有 csproj/入口）；
+       从插件编译中排除，否则 SDK 默认 glob 会连其源码与 obj 生成文件一起编进插件（重复入口/特性）。
+       注：MLRuntime 与插件共享的 TensorCodec/RuntimeProtocol/RuntimeHost/PipeFraming 住在仓库根、仍编进插件；
+       MLRuntime/ 下只有 Program.cs，经链接引用根部共享核。 -->
   <ItemGroup>
     <Compile Remove="tools/**/*.cs" />
     <Content Remove="tools/**" />
     <None Remove="tools/**" />
+    <Compile Remove="MLRuntime/**/*.cs" />
+    <Content Remove="MLRuntime/**" />
+    <None Remove="MLRuntime/**" />
   </ItemGroup>
 
   <!-- SDK 契约：宿主统一提供、所有插件共享，Private=false 不复制进输出、打包时别带。 -->

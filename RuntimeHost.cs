@@ -74,7 +74,7 @@ internal sealed class RuntimeHost : IDisposable
             if (!mSessions.TryGetValue(req.SessionId, out var session))
                 return RuntimeProtocol.EncodeError($"会话 {req.SessionId} 不存在");
             using var raw = session.Run(req.Inputs);
-            outputs = DiffSingerTensorCache.Clone(raw);
+            outputs = TensorCodec.Clone(raw);
         }
         return RuntimeProtocol.EncodeRunOk(outputs);
     }

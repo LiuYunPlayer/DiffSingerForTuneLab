@@ -26,16 +26,24 @@ public sealed class DiffSingerModelCache : IDisposable
     readonly Dictionary<string, VoiceModels> mVoices = new(StringComparer.Ordinal);
     readonly Dictionary<string, (IModelSession Session, ulong Hash)> mVocoders = new(StringComparer.Ordinal);
 
-    // dev 验证开关（env DIFFSINGER_RUNTIME_LOOPBACK=1）：经进程内 loopback host 跑 ONNX，走完整 IPC 编解码链，
-    //   验证协议/host/client/RemoteModelSession 与直跑等价。off（默认）走 InProcessModelSession，零影响。
-    //   P3 落地后把 LoopbackTransport 换成 PipeTransport 即真子进程；本 loopback 模式作为无子进程的测试/兜底路径长期保留。
+    // MLRuntime 路由（env 开关；off 默认走 InProcessModelSession，零影响）：
+    //   · DIFFSINGER_RUNTIME_SUBPROCESS=1 → PipeTransport：spawn mlruntime/MLRuntime.exe，真子进程隔离原生崩溃；
+    //   · DIFFSINGER_RUNTIME_LOOPBACK=1  → LoopbackTransport：进程内 host、走完整 IPC 编解码链（无子进程的测试/兜底路径）。
+    //   两者都产出 RuntimeClient，LoadSession 据此返回 RemoteModelSession。子进程优先于 loopback。
     readonly RuntimeClient? mRuntimeClient;
 
     public DiffSingerModelCache(string provider, ILogger logger)
     {
         mProvider = provider;
         mLogger = logger;
-        if (Environment.GetEnvironmentVariable("DIFFSINGER_RUNTIME_LOOPBACK") == "1")
+        if (Environment.GetEnvironmentVariable("DIFFSINGER_RUNTIME_SUBPROCESS") == "1")
+        {
+            var dir = Path.GetDirectoryName(typeof(DiffSingerModelCache).Assembly.Location)!;
+            var exe = Path.Combine(dir, "mlruntime", "MLRuntime.exe");
+            mRuntimeClient = new RuntimeClient(new PipeTransport(exe, provider));
+            mLogger.Info($"DiffSinger：MLRuntime 子进程模式启用（{exe}）");
+        }
+        else if (Environment.GetEnvironmentVariable("DIFFSINGER_RUNTIME_LOOPBACK") == "1")
         {
             mRuntimeClient = new RuntimeClient(new LoopbackTransport(new RuntimeHost(provider)));
             mLogger.Info("DiffSinger：MLRuntime loopback 模式启用（进程内、经 IPC 编解码链）");
