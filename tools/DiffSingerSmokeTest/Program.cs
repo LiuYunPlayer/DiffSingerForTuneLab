@@ -69,6 +69,12 @@ if (args.Contains("--bench-ipc"))
     return 0;
 }
 
+if (args.Contains("--test-crash"))
+{
+    TestCrashRecovery(voiceRoot, acousticCfg, acousticPath);
+    return 0;
+}
+
 Synthesize(voiceRoot, acousticCfg, acousticPath, vocoderPath, hopSize, sampleRate, outWav);
 return 0;
 
@@ -298,6 +304,41 @@ static void BenchIpc(string voiceRoot, Dictionary<string, object?> cfg, string a
     Console.WriteLine("\n  === 结论 ===");
     Console.WriteLine($"  进程内 中位 {mi:F1} ms  |  子进程 中位 {ms:F1} ms");
     Console.WriteLine($"  子进程额外开销 = {ms - mi:F1} ms/遍  ({(ms - mi) / mi * 100:F1}% 相对进程内)");
+}
+
+// —— 崩溃恢复注错验证：正常跑 → 外部杀 MLRuntime（模拟原生崩溃）→ 验「本次任务抛错」→ 验「下个任务自动重启并成功」。
+//    只杀本测试 spawn 的子进程（按启动前后 PID 差集，不误伤 TuneLab 的 MLRuntime）。 ——
+static void TestCrashRecovery(string voiceRoot, Dictionary<string, object?> cfg, string acousticPath)
+{
+    string mlExe = Environment.GetEnvironmentVariable("DIFFSINGER_MLRUNTIME_EXE")
+        ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "TuneLab", "Extensions", "diffsingerfortunelab", "mlruntime", "MLRuntime.exe");
+    Console.WriteLine("\n======== CRASH RECOVERY TEST ========");
+    Console.WriteLine($"  MLRuntime.exe: {mlExe}  存在={File.Exists(mlExe)}");
+
+    List<NamedOnnxValue> feeds;
+    using (var meta = Open(acousticPath))
+        feeds = BuildAcousticFeeds(voiceRoot, cfg, meta, 100, 10);
+
+    int MelLen(IReadOnlyList<NamedOnnxValue> r) => r.First(v => v.Name == "mel").AsTensor<float>().ToArray().Length;
+    List<Process> Spawned(HashSet<int> before) => Process.GetProcessesByName("MLRuntime").Where(p => !before.Contains(p.Id)).ToList();
+
+    var before = Process.GetProcessesByName("MLRuntime").Select(p => p.Id).ToHashSet();
+    using var client = new RuntimeClient("directml",
+        p => new PipeTransport(mlExe, p, l => Console.WriteLine($"    [MLRuntime] {l}")), canRespawn: true);
+    var s = RemoteModelSession.Load(client, acousticPath);
+
+    Console.WriteLine($"  [1] 首次 Run … mel={MelLen(s.Run(feeds))} 元素 ✓");
+
+    var mine = Spawned(before);
+    foreach (var p in mine) { p.Kill(); p.WaitForExit(3000); }
+    Console.WriteLine($"  [2] 已杀 MLRuntime PID {string.Join(",", mine.Select(p => p.Id))}（模拟原生崩溃）");
+
+    try { s.Run(feeds); Console.WriteLine("  [3] ✗ 预期本次任务抛错，但没有！"); }
+    catch (Exception ex) { Console.WriteLine($"  [3] ✓ 本次任务抛错（符合预期）：{ex.Message}"); }
+
+    Console.WriteLine($"  [4] 下个任务 Run … mel={MelLen(s.Run(feeds))} 元素 ✓（子进程已自动重启并重载）");
+    Console.WriteLine($"  重启后本测试的 MLRuntime PID {string.Join(",", Spawned(before).Select(p => p.Id))}（应不同于 [2] 被杀的）");
 }
 
 static double[] TimeRuns(IModelSession s, IReadOnlyCollection<NamedOnnxValue> feeds, int warmup, int iters)
