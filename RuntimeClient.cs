@@ -1,26 +1,27 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Linq;
 using Microsoft.ML.OnnxRuntime;
 
 namespace DiffSingerForTuneLab;
 
-// MLRuntime 弹性客户端（逻辑层 + 生命周期）：经传输层发 LoadModel/Run/Release，并在子进程崩溃 / DML 失败时自愈。
-//   · 传输由工厂按当前 provider 现建（factory(provider)）；respawn = 弃旧传输（杀旧子进程）+ 按新 provider 重建 + 重载已知模型。
-//   · 崩溃重启：Run/Load 遇传输级故障（管道断/子进程崩）→ 同 provider 重开、重载、重试一次；再失败则抛出（不无限重启）。
-//   · DML→CPU：Load 遇 host 明确报错（多为 DML 算子不支持/设备起不来）→ 整个 runtime 重开为 CPU（进程级同质），重载。
-//   · 模型以「路径」为稳定键：sessionId 随子进程重建而失效，故本地缓存 path→(id, 输入元数据)，respawn 后按 path 重载取新 id。
-//   loopback（canRespawn=false）不自愈：其 host 在插件进程内，DML→CPU 会触发 AccessViolation；仅子进程模式开启自愈。
+// MLRuntime 客户端（逻辑层 + 崩溃处理）：经传输层发 LoadModel/Run/Release，并处理子进程崩溃。
+//   · 传输由工厂按 provider 惰性现建（factory(provider)）；子进程崩后丢弃连接，下次 Load/Run 惰性重建并按需重载模型。
+//   · 崩溃策略（管道断/子进程崩）：丢弃死连接、本次任务直接抛错上报——宿主侧据此把这次合成标失败并报错给用户。
+//     不自动重试同任务（同输入必然再崩 → 自动重启+自动重跑=死循环），不自动切 CPU。
+//     下次任务分配时惰性重启子进程、重载模型，后续片段照常合成；崩掉的那次是否重试完全由用户决定。
+//   · DML 加载失败（host 报错、exe 存活）：抛可读错误提示用户手动把执行设备改为 CPU——不自动切换（同「崩了不暴力切 CPU」）。
+//   · 模型以 path 为稳定键（sessionId 随重建失效），RemoteModelSession 跨重建透明有效。
+//   loopback（canRespawn=false）：host 在插件进程内、不会崩，故不启用重建/错误包装。
 internal sealed class RuntimeClient : IDisposable
 {
+    readonly string mProvider;
     readonly Func<string, IRuntimeTransport> mFactory;
     readonly bool mCanRespawn;
     readonly Action<string>? mLog;
     readonly object mLock = new();
     readonly Dictionary<string, (int Id, IReadOnlyDictionary<string, int[]> Inputs)> mLoaded = new(StringComparer.Ordinal);
 
-    string mProvider;
     IRuntimeTransport? mTransport;
 
     public RuntimeClient(string provider, Func<string, IRuntimeTransport> transportFactory, bool canRespawn, Action<string>? log = null)
@@ -31,9 +32,10 @@ internal sealed class RuntimeClient : IDisposable
         mLog = log;
     }
 
+    // 惰性传输：null（首次 / 崩溃丢弃后）时经工厂现建子进程。
     IRuntimeTransport Transport => mTransport ??= mFactory(mProvider);
 
-    // 加载模型，返回输入元数据（名→形状）。幂等（已载即返缓存）；含 DML→CPU 与崩溃重载自愈。
+    // 加载模型，返回输入元数据（名→形状）。幂等（已载即返缓存）。
     public IReadOnlyDictionary<string, int[]> Load(string path)
     {
         lock (mLock)
@@ -47,15 +49,16 @@ internal sealed class RuntimeClient : IDisposable
             }
             catch (RuntimeHostException ex) when (mCanRespawn && mProvider != "cpu")
             {
-                mLog?.Invoke($"DiffSinger：MLRuntime DirectML 加载 {Path.GetFileName(path)} 失败，重开为 CPU：{ex.Message}");
-                RespawnAs("cpu");
-                return LoadInner(path);
+                // DML 加载失败（host 报错、exe 存活、非崩溃）：不自动切 CPU，抛可读错误让用户手动改执行设备。
+                throw new InvalidOperationException(
+                    $"MLRuntime 用 DirectML 加载 {Path.GetFileName(path)} 失败。请在插件设置里把「执行设备」改为 CPU 并重启 TuneLab。原始错误：{ex.Message}", ex);
             }
             catch (Exception ex) when (mCanRespawn && IsTransportFailure(ex))
             {
-                mLog?.Invoke($"DiffSinger：MLRuntime 连接中断（{ex.Message}），重启并重载 {Path.GetFileName(path)}。");
-                RespawnAs(mProvider);
-                return LoadInner(path);
+                DiscardRuntime();
+                mLog?.Invoke($"DiffSinger：MLRuntime 加载 {Path.GetFileName(path)} 时崩溃（{ex.Message}）；已丢弃连接，下次合成自动重启。");
+                throw new InvalidOperationException(
+                    $"MLRuntime 子进程在加载 {Path.GetFileName(path)} 时崩溃，本次合成失败（子进程将在下次合成时自动重启）。", ex);
             }
         }
     }
@@ -70,9 +73,12 @@ internal sealed class RuntimeClient : IDisposable
             }
             catch (Exception ex) when (mCanRespawn && IsTransportFailure(ex))
             {
-                mLog?.Invoke($"DiffSinger：MLRuntime 推理中断（{ex.Message}），重启子进程并重试一次。");
-                RespawnAs(mProvider);
-                return RunInner(path, inputs);   // 重试一次；再失败则抛出，不无限重启
+                // 子进程崩溃：丢弃死连接、本次片段抛错上报（宿主标失败并报错）——不自动重试（同输入必然再崩 → 死循环）。
+                //   下次任务分配时惰性重启子进程、重载模型，后续片段照常；崩掉的那次是否重试由用户决定。
+                DiscardRuntime();
+                mLog?.Invoke($"DiffSinger：MLRuntime 推理 {Path.GetFileName(path)} 时崩溃（{ex.Message}）；已丢弃连接，下次合成自动重启。");
+                throw new InvalidOperationException(
+                    $"MLRuntime 子进程在推理 {Path.GetFileName(path)} 时崩溃，本次合成失败（子进程将在下次合成时自动重启）。若重试仍崩，可能是该模型/输入触发原生崩溃。", ex);
             }
         }
     }
@@ -103,7 +109,7 @@ internal sealed class RuntimeClient : IDisposable
 
     IReadOnlyList<NamedOnnxValue> RunInner(string path, IReadOnlyCollection<NamedOnnxValue> inputs)
     {
-        if (!mLoaded.TryGetValue(path, out var e))
+        if (!mLoaded.TryGetValue(path, out var e))   // 崩溃丢弃后首次访问：惰性重载（Transport 现建新子进程）
         {
             LoadInner(path);
             e = mLoaded[path];
@@ -112,16 +118,12 @@ internal sealed class RuntimeClient : IDisposable
         return RuntimeProtocol.DecodeRunResult(resp);
     }
 
-    // 重开 runtime：换 provider、弃旧传输（杀旧子进程）、清失效的 sessionId、按 path 重载所有先前已载模型（取新 id）。
-    void RespawnAs(string provider)
+    // 丢弃当前（已崩的）传输与失效的 sessionId；下次 Load/Run 经工厂惰性重建子进程并按需重载模型。
+    void DiscardRuntime()
     {
-        mProvider = provider;
         try { mTransport?.Dispose(); } catch { }
-        mTransport = null;   // 下次 Transport 访问经 factory(mProvider) 重建
-        var paths = mLoaded.Keys.ToArray();
+        mTransport = null;
         mLoaded.Clear();
-        foreach (var p in paths)
-            LoadInner(p);
     }
 
     static bool IsTransportFailure(Exception ex)
@@ -130,10 +132,6 @@ internal sealed class RuntimeClient : IDisposable
     public void Dispose()
     {
         lock (mLock)
-        {
-            try { mTransport?.Dispose(); } catch { }
-            mTransport = null;
-            mLoaded.Clear();
-        }
+            DiscardRuntime();
     }
 }
