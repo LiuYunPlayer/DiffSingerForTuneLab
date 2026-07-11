@@ -134,9 +134,7 @@ public sealed class DiffSingerTensorCache
             {
                 if (reader.ReadString() != FormatHeader)
                     throw new InvalidDataException($"[TensorCache] 缓存文件头异常：{mFilename}。");
-                var count = reader.ReadInt32();
-                for (var i = 0; i < count; ++i)
-                    result.Add(DeserializeNamedOnnxValue(reader));
+                result = ReadValues(reader);
             }
         }
         catch (Exception e)
@@ -167,9 +165,24 @@ public sealed class DiffSingerTensorCache
         using var stream = new FileStream(cachePath, FileMode.Create, FileAccess.Write);
         using var writer = new BinaryWriter(stream);
         writer.Write(FormatHeader);
-        writer.Write(outputs.Count);
-        foreach (var onnxValue in outputs)
-            SerializeNamedOnnxValue(writer, onnxValue);
+        WriteValues(writer, outputs);
+    }
+
+    // —— 张量组序列化（单一来源）：磁盘缓存与 IPC 编解码共用；格式 = [count][value...]（不含缓存文件头）。 ——
+    internal static void WriteValues(BinaryWriter writer, IReadOnlyCollection<NamedOnnxValue> values)
+    {
+        writer.Write(values.Count);
+        foreach (var v in values)
+            SerializeNamedOnnxValue(writer, v);
+    }
+
+    internal static List<NamedOnnxValue> ReadValues(BinaryReader reader)
+    {
+        var count = reader.ReadInt32();
+        var list = new List<NamedOnnxValue>(count);
+        for (var i = 0; i < count; ++i)
+            list.Add(DeserializeNamedOnnxValue(reader));
+        return list;
     }
 
     static void SerializeNamedOnnxValue(BinaryWriter writer, NamedOnnxValue namedOnnxValue)

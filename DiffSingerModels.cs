@@ -26,10 +26,20 @@ public sealed class DiffSingerModelCache : IDisposable
     readonly Dictionary<string, VoiceModels> mVoices = new(StringComparer.Ordinal);
     readonly Dictionary<string, (IModelSession Session, ulong Hash)> mVocoders = new(StringComparer.Ordinal);
 
+    // dev 验证开关（env DIFFSINGER_RUNTIME_LOOPBACK=1）：经进程内 loopback host 跑 ONNX，走完整 IPC 编解码链，
+    //   验证协议/host/client/RemoteModelSession 与直跑等价。off（默认）走 InProcessModelSession，零影响。
+    //   P3 落地后把 LoopbackTransport 换成 PipeTransport 即真子进程；本 loopback 模式作为无子进程的测试/兜底路径长期保留。
+    readonly RuntimeClient? mRuntimeClient;
+
     public DiffSingerModelCache(string provider, ILogger logger)
     {
         mProvider = provider;
         mLogger = logger;
+        if (Environment.GetEnvironmentVariable("DIFFSINGER_RUNTIME_LOOPBACK") == "1")
+        {
+            mRuntimeClient = new RuntimeClient(new LoopbackTransport(new RuntimeHost(provider)));
+            mLogger.Info("DiffSinger：MLRuntime loopback 模式启用（进程内、经 IPC 编解码链）");
+        }
     }
 
     // 声码器根目录约定：插件用户数据根下、与声库 Voices 目录并列的 Vocoders 目录；声学 dsconfig 的 vocoder 字段即子目录名。
@@ -78,6 +88,12 @@ public sealed class DiffSingerModelCache : IDisposable
     IModelSession LoadSession(string modelPath)
     {
         var fileName = Path.GetFileName(modelPath);
+        if (mRuntimeClient != null)   // loopback 验证模式：会话在 host 侧、经 IPC 派发
+        {
+            var remote = RemoteModelSession.Load(mRuntimeClient, modelPath);
+            mLogger.Info($"DiffSinger：加载 {fileName} · MLRuntime({mProvider})");
+            return remote;
+        }
         if (mProvider == "cpu")
         {
             var cpu = new InferenceSession(modelPath);
@@ -114,6 +130,8 @@ public sealed class DiffSingerModelCache : IDisposable
                 entry.Session.Dispose();
             mVoices.Clear();
             mVocoders.Clear();
+            // loopback 模式：真实会话在 host 侧，释放 client 连带释放 host 及其所有会话（RemoteModelSession.Dispose 为空操作）。
+            mRuntimeClient?.Dispose();
         }
     }
 }
