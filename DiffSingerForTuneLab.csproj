@@ -39,6 +39,11 @@
     <Content Include="manifest.json" CopyToOutputDirectory="PreserveNewest" />
     <!-- 移植/捆绑第三方（OpenUtau MIT）的署名，随包分发。 -->
     <Content Include="THIRD-PARTY-NOTICES.md" CopyToOutputDirectory="PreserveNewest" />
+    <!-- 包级 README 详情页：宿主在扩展详情窗渲染包根的 README.md（README.<culture>.md 优先）。
+         基准 = 英文（README.md，覆盖所有非精确命中语言）；中文经 README.zh-CN.md 精确命中。
+         源文件放 packaging/（与开发向的仓库根 README.md 区分），经 Link 改名落到输出根 = 包根。 -->
+    <Content Include="packaging\README.md" Link="README.md" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="packaging\README.zh-CN.md" Link="README.zh-CN.md" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <!-- G2P 算法引擎的语言包（移植自 OpenUtau，MIT；各含 dict.txt + phones.txt + g2p.onnx）。
