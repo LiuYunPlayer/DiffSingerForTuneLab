@@ -31,7 +31,7 @@
 
   <!-- manifest 随输出，宿主据此免反射即知插件提供什么。 -->
   <ItemGroup>
-    <Content Include="description.json" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="manifest.json" CopyToOutputDirectory="PreserveNewest" />
     <!-- 移植/捆绑第三方（OpenUtau MIT）的署名，随包分发。 -->
     <Content Include="THIRD-PARTY-NOTICES.md" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
