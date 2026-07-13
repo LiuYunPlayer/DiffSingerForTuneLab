@@ -370,6 +370,15 @@ public static class DiffSingerPhonemizer
         };
         if (dur.Linguistic.HasInput("languages"))
             lingInputs.Add(Nv("languages", langs, nTokens));
+        // P1-a：dur 不做音素混合（钉死覆盖时长故 moot），但共享 linguistic 编码器把 tokens_b/blend 列为必需输入
+        //   （图里 emb(tokens_b) 恒被计算，故 tokens_b 必须是合法索引）→ 喂空操作(tokens_b=tokens、blend=0)，
+        //   与旧行为逐值一致。模型无此输入则跳过。
+        if (dur.Linguistic.HasInput("tokens_b"))
+        {
+            lingInputs.Add(Nv("tokens_b", (long[])tokens.Clone(), nTokens));
+            lingInputs.Add(NamedOnnxValue.CreateFromTensor("blend",
+                new DenseTensor<float>(new float[nTokens], new[] { 1, nTokens })));
+        }
 
         var lingOut = DiffSingerTensorCache.Run(dur.Linguistic, dur.LinguisticHash, lingInputs, tensorCache);
         var enc = lingOut.First(v => v.Name == "encoder_out").AsTensor<float>();
