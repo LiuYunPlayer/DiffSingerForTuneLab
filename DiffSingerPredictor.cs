@@ -40,7 +40,9 @@ public sealed class DiffSingerPredictor : IDisposable
     readonly Dictionary<string, ulong> mModelHashes = new(StringComparer.Ordinal);
     public ulong ModelHash(string role) => mModelHashes.TryGetValue(role, out var h) ? h : 0;
 
-    public DiffSingerPredictor(string dir, Func<string, IModelSession> load)
+    // onlyRole 非空 ⇒ 只加载该职责 role（对齐 OpenUtau：各预测器只用自己那一个 role，忽略 dsconfig 里其余 role 字段，
+    //   哪怕它们指向不存在的文件）；为空（未知子目录）⇒ 保守加载全部声明的 role，不改老行为。
+    public DiffSingerPredictor(string dir, Func<string, IModelSession> load, string? onlyRole = null)
     {
         mDir = dir;
         var yaml = new DeserializerBuilder().Build();
@@ -64,7 +66,8 @@ public sealed class DiffSingerPredictor : IDisposable
         Linguistic = load(lingPath);
         LinguisticHash = DiffSingerTensorCache.HashFile(lingPath);
         LinguisticUsesWordBoundary = Linguistic.HasInput("word_div");
-        foreach (var role in new[] { "dur", "variance", "pitch" })
+        var roles = string.IsNullOrEmpty(onlyRole) ? new[] { "dur", "variance", "pitch" } : new[] { onlyRole };
+        foreach (var role in roles)
             if (!string.IsNullOrEmpty(Get(role)))
             {
                 var rolePath = Path.Combine(dir, Get(role));

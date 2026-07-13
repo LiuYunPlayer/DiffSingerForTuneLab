@@ -278,6 +278,13 @@ public sealed class VoiceModels : IDisposable
     public bool TryGetPhoneme(string symbol, out int id) => mPhonemes.TryGetValue(symbol, out id);
     public bool TryGetLanguage(string lang, out int id) => mLanguages.TryGetValue(lang, out id);
 
+    // 子目录 → 该预测器唯一职责 role（对齐 OpenUtau：dsdur 只用 dur、dspitch 只用 pitch、dsvariance 只用 variance）。
+    //   仅加载本职 role + linguistic；dsconfig 里其余 role 字段（打包遗留/串味）一律忽略——即便指向不存在的文件也不影响加载。
+    static readonly Dictionary<string, string> PredictorRole = new(StringComparer.Ordinal)
+    {
+        ["dsdur"] = "dur", ["dspitch"] = "pitch", ["dsvariance"] = "variance",
+    };
+
     // 预测器懒加载（子目录如 "dsvariance" / "dspitch"）：首用时按声库会话加载器构造；
     // 子目录无 dsconfig 或加载失败返回 null（记忆化，不重试），调用方据此降级。
     public DiffSingerPredictor? GetPredictor(string subdir)
@@ -291,7 +298,9 @@ public sealed class VoiceModels : IDisposable
             var dir = Path.Combine(mConfig.RootPath, subdir);
             if (File.Exists(Path.Combine(dir, "dsconfig.yaml")))
             {
-                try { predictor = new DiffSingerPredictor(dir, mLoad); }
+                // 未知子目录（无映射）退化为加载全部 role，保守不改老行为。
+                var role = PredictorRole.GetValueOrDefault(subdir);
+                try { predictor = new DiffSingerPredictor(dir, mLoad, role); }
                 catch (Exception ex) { mLogger.Warning($"DiffSinger：加载预测器 {subdir} 失败：{ex.Message}"); }
             }
             mPredictors[subdir] = predictor;
