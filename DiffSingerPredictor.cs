@@ -91,6 +91,24 @@ public sealed class DiffSingerPredictor : IDisposable
             : throw new InvalidOperationException($"音素 \"{symbol}\" 不在 {Path.GetFileName(mDir)} 的音素表中");
     public long LangId(string lang) => mLanguages.TryGetValue(lang, out var id) ? id : 0;
 
+    // 音素混合（帧级，role 模型侧）：从主 tokens 克隆出「目标 token 流」——设了混合、且本预测器词表可解析目标符号的
+    //   音素槽替换为目标 token，其余保持 base；anyMix = 是否至少一个槽被替换（无则可跳过第二次 linguistic）。
+    //   目标符号按本预测器自己词表解析（acoustic/predictor id 空间不共享，查不到即优雅降级不混）。
+    //   primaryTokens 布局 = [SP, ...phones..., SP]，phones[i] 落 primaryTokens[i+1]。
+    public static long[] BuildMixTargetTokens(
+        DiffSingerPredictor v, IReadOnlyList<PhonemeSpan> phones, long[] primaryTokens, out bool anyMix)
+    {
+        var tgt = (long[])primaryTokens.Clone();
+        anyMix = false;
+        for (int i = 0; i < phones.Count; i++)
+            if (!string.IsNullOrEmpty(phones[i].MixSymbol) && v.TryPhoneme(phones[i].MixSymbol, out var mid))
+            {
+                tgt[i + 1] = mid;
+                anyMix = true;
+            }
+        return tgt;
+    }
+
     // —— G2P：按语言懒构建兜底链（词典 → 算法引擎 remap），exact 后小写回退（忠实 OpenUtau GetSymbols）——
     public string[] G2P(string lyric, string lang)
     {

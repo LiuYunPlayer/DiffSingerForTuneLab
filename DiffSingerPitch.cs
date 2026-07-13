@@ -21,7 +21,8 @@ public static class DiffSingerPitch
     public static float[]? Predict(
         DiffSingerPredictor? v, IReadOnlyList<PhonemeSpan> phones,
         IReadOnlyList<VoiceSynthesisNoteSnapshot> notes, int[] phDur,
-        double renderStart, double frameSec, DiffSingerSpeakerMix mix, VoicebankConfig cfg, int steps, uint[] seedPerFrame, bool tensorCache)
+        double renderStart, double frameSec, DiffSingerSpeakerMix mix, VoicebankConfig cfg, int steps, uint[] seedPerFrame, bool tensorCache,
+        float[]? blendPerFrame = null)
     {
         if (v is null || !v.HasModel("pitch") || phones.Count == 0 || notes.Count == 0)
             return null;
@@ -35,33 +36,45 @@ public static class DiffSingerPitch
             .Prepend((long)v.PhonemeToken("SP")).Append((long)v.PhonemeToken("SP")).ToArray();
 
         // —— linguistic 编码器（词模式吃 word_div/word_dur，否则音素模式吃 ph_dur）——
-        var lingInputs = new List<NamedOnnxValue> { NvL("tokens", tokens, nTokens) };
-        if (v.LinguisticUsesWordBoundary)
+        //   base 与（若有混合）目标 token 流各跑一次；结构输入(word_div/word_dur/ph_dur/languages)共享，只换 tokens。
+        List<NamedOnnxValue> BuildLing(long[] toks)
         {
-            var isVowel = phones.Select(p => v.IsVowel(p.Symbol)).ToArray();
-            var (wordDiv, wordDur) = DiffSingerFrames.PaddedWordDivAndDur(isVowel, phDur);
-            lingInputs.Add(NvL("word_div", wordDiv, wordDiv.Length));
-            lingInputs.Add(NvL("word_dur", wordDur, wordDur.Length));
+            var li = new List<NamedOnnxValue> { NvL("tokens", toks, nTokens) };
+            if (v.LinguisticUsesWordBoundary)
+            {
+                var isVowel = phones.Select(p => v.IsVowel(p.Symbol)).ToArray();   // 结构按 base 音素分组（目标共用）
+                var (wordDiv, wordDur) = DiffSingerFrames.PaddedWordDivAndDur(isVowel, phDur);
+                li.Add(NvL("word_div", wordDiv, wordDiv.Length));
+                li.Add(NvL("word_dur", wordDur, wordDur.Length));
+            }
+            else
+            {
+                li.Add(NvL("ph_dur", phDur.Select(x => (long)x).ToArray(), nTokens));
+            }
+            if (v.Linguistic.HasInput("languages"))
+            {
+                var langs = phones.Select(p => v.LangId(PhonemeLanguage(p.Symbol))).Prepend(0L).Append(0L).ToArray();
+                li.Add(NvL("languages", langs, nTokens));
+            }
+            // linguistic 若把 tokens_b/blend 列为必需输入（P1-a 导出遗留），喂空操作满足——帧级混合在 role 模型做，不在此。
+            if (v.Linguistic.HasInput("tokens_b"))
+            {
+                li.Add(NvL("tokens_b", (long[])toks.Clone(), nTokens));
+                li.Add(NvF("blend", new float[nTokens], nTokens));
+            }
+            return li;
         }
-        else
+        DenseTensor<float> Encode(long[] toks)
         {
-            lingInputs.Add(NvL("ph_dur", phDur.Select(x => (long)x).ToArray(), nTokens));
+            var o = DiffSingerTensorCache.Run(v.Linguistic, v.LinguisticHash, BuildLing(toks), tensorCache);
+            var e = o.First(x => x.Name == "encoder_out").AsTensor<float>();
+            return new DenseTensor<float>(e.ToArray(), e.Dimensions.ToArray());
         }
-        if (v.Linguistic.HasInput("languages"))
-        {
-            var langs = phones.Select(p => v.LangId(PhonemeLanguage(p.Symbol))).Prepend(0L).Append(0L).ToArray();
-            lingInputs.Add(NvL("languages", langs, nTokens));
-        }
-        // 音素混合包络仅作用于 acoustic；预测器 linguistic 若声明 tokens_b/blend 为必需输入，喂空操作满足即可
-        //   （tokens_b=tokens、blend=0，逐值等价无混合）。
-        if (v.Linguistic.HasInput("tokens_b"))
-        {
-            lingInputs.Add(NvL("tokens_b", (long[])tokens.Clone(), nTokens));
-            lingInputs.Add(NvF("blend", new float[nTokens], nTokens));
-        }
-        var lingOut = DiffSingerTensorCache.Run(v.Linguistic, v.LinguisticHash, lingInputs, tensorCache);
-        var enc = lingOut.First(o => o.Name == "encoder_out").AsTensor<float>();
-        var encDense = new DenseTensor<float>(enc.ToArray(), enc.Dimensions.ToArray());
+        var encDense = Encode(tokens);
+
+        // 音素混合（帧级，条件级）：目标 token 流(base 换目标)编码出 encoder_out_b，逐帧 blend 在 role 模型混合。
+        var tokensTgt = DiffSingerPredictor.BuildMixTargetTokens(v, phones, tokens, out bool anyMix);
+        var encTgt = anyMix && blendPerFrame != null ? Encode(tokensTgt) : null;
 
         // —— note 序列：head padding + 各 note（间隙插 rest）+ tail padding；rest 组 tone 由最近非 rest 填充 ——
         var (noteMidi, noteDur, noteRest) = BuildNotes(v, phones, notes, renderStart, frameSec, totalFrames, head, tail);
@@ -82,6 +95,13 @@ public static class DiffSingerPitch
             NvF("pitch", pitch, totalFrames),
             NamedOnnxValue.CreateFromTensor("retake", new DenseTensor<bool>(retake, new[] { 1, totalFrames })),
         };
+
+        // 音素混合（帧级）：目标流 encoder_out_b [1,nTokens,H] + 逐帧 blend [1,totalFrames] 喂 role 模型（条件级混合、去噪一次）。
+        if (encTgt != null && model.HasInput("encoder_out_b"))
+        {
+            inputs.Add(NamedOnnxValue.CreateFromTensor("encoder_out_b", encTgt));
+            inputs.Add(NvF("blend", blendPerFrame!, totalFrames));
+        }
 
         AddAccel(inputs, model, cfg, steps);
 
