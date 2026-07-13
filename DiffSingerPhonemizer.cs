@@ -172,8 +172,21 @@ public static class DiffSingerPhonemizer
                     StretchWeight = usePin ? ph[k].StretchWeight : (dur.IsVowel(sym) ? 1 : 0),
                 };
                 if (usePin)
-                    mix[k] = (ph[k].Properties.GetString(DiffSingerDeclarations.KeyMixPhoneme, string.Empty),
-                              ph[k].Properties.GetDouble(DiffSingerDeclarations.KeyMixPhonemeRatio, 0));
+                {
+                    var mixSym = ph[k].Properties.GetString(DiffSingerDeclarations.KeyMixPhoneme, string.Empty);
+                    var mixRatio = ph[k].Properties.GetDouble(DiffSingerDeclarations.KeyMixPhonemeRatio, 0);
+                    if (!string.IsNullOrEmpty(mixSym))
+                    {
+                        // 混合目标语言：显式选择 > 跟随本音素语言（per-phoneme language 属性）> note 语言。
+                        var mixLang = ph[k].Properties.GetString(DiffSingerDeclarations.KeyMixLanguage, string.Empty);
+                        if (string.IsNullOrEmpty(mixLang))
+                            mixLang = ph[k].Properties.GetString(DiffSingerDeclarations.KeyLanguage, string.Empty);
+                        if (string.IsNullOrEmpty(mixLang))
+                            mixLang = noteLang[i];
+                        mixSym = ResolveMixSymbol(dur, mixSym, mixLang);
+                    }
+                    mix[k] = (mixSym, mixRatio);
+                }
             }
             // 引导 / 主体分界（结合线）+ BodyOffset（结合线相对 note 头的有符号偏移，喂 Resolve 的 nominal）：
             //   · 钉死 note：用宿主随快照下发的用户显式分类——引导数 = LeadingPhonemes.Count、BodyOffset = 快照值。
@@ -322,6 +335,15 @@ public static class DiffSingerPhonemizer
         if (dur.TryPhoneme(sym, out _)) return sym;
         var lang = ph.Properties.GetString(DiffSingerDeclarations.KeyLanguage, string.Empty);
         if (string.IsNullOrEmpty(lang)) lang = noteLang;
+        var prefixed = $"{lang}/{sym}";
+        return dur.TryPhoneme(prefixed, out _) ? prefixed : sym;
+    }
+
+    // 音素混合目标符号还原（与 ResolvePinnedSymbol 同构）：先试裸符号，再试 <lang>/<符号> 还原嵌入表键；
+    //   都不中原样返回（下游 acoustic/predictor 各自查表，查不到即不混——优雅降级）。
+    static string ResolveMixSymbol(DiffSingerPredictor dur, string sym, string lang)
+    {
+        if (dur.TryPhoneme(sym, out _)) return sym;
         var prefixed = $"{lang}/{sym}";
         return dur.TryPhoneme(prefixed, out _) ? prefixed : sym;
     }
