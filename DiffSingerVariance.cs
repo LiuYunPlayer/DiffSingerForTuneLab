@@ -26,12 +26,12 @@ public readonly record struct VarianceCurves(float[]? Energy, float[]? Breathine
 public static class DiffSingerVariance
 {
     // phones = body 音素（不含 head/tail）；phDur = padded 帧（len=phones+2）；pitchSemis = totalFrames 半音曲线。
-    //   收 PhonemeSpan（非纯符号）以取音素混合目标（MixSymbol）；blendPerFrame = 逐帧包络比例（与 acoustic 同源），
-    //   帧级混合在 role 模型条件级做（跑两次 linguistic：base + 目标流）。
+    //   收 PhonemeSpan（含逐槽 MixSymbols）；blendRows[r] = 第 r 槽逐帧包络比例（与 acoustic 同源、已归一），
+    //   帧级混合在 role 模型条件级做（每槽跑一次 linguistic 目标流 + base）。
     public static VarianceCurves Predict(
         DiffSingerPredictor? v, IReadOnlyList<PhonemeSpan> phones, int[] phDur,
         float[] pitchSemis, DiffSingerSpeakerMix mix, VoicebankConfig cfg, int steps, uint[] seedPerFrame, bool tensorCache,
-        float[]? blendPerFrame = null)
+        float[][]? blendRows = null)
     {
         if (v is null || !v.HasModel("variance") || phones.Count == 0)
             return default;
@@ -79,10 +79,6 @@ public static class DiffSingerVariance
         }
         var encDense = Encode(tokens);
 
-        // 音素混合（帧级，条件级）：目标 token 流编码出 encoder_out_b，逐帧 blend 在 role 模型混合。
-        var tokensTgt = DiffSingerPredictor.BuildMixTargetTokens(v, phones, tokens, out bool anyMix);
-        var encTgt = anyMix && blendPerFrame != null ? Encode(tokensTgt) : null;
-
         // —— variance ——
         var model = v.Model("variance");
         var inputs = new List<NamedOnnxValue>
@@ -112,12 +108,26 @@ public static class DiffSingerVariance
         inputs.Add(NamedOnnxValue.CreateFromTensor("retake",
             new DenseTensor<bool>(retake, new[] { 1, totalFrames, numVar })));
 
-        // 音素混合（帧级）：role 模型把 encoder_out_b/blend 列为**必需**输入（导出恒有），故只要模型声明就**总是**喂——
-        //   无混合 ⇒ no-op（encoder_out_b=base、blend 全 0），base 权重=1 ⇒ 等价不混（避免缺必需输入崩溃）。
+        // 音素混合（帧级，N 槽）：role 模型把 encoder_out_b/blend 列为**必需**输入（导出恒有），故只要模型声明就**总是**喂。
+        //   逐槽 r：目标流编码出一行 encoder_out_b[r]（该槽无目标 ⇒ 复用 base）；blend[r]=blendRows[r]。S=mixRows(≥1)；
+        //   无混合时 S=1、blend 全 0、目标=base ⇒ 等价不混。
         if (model.HasInput("encoder_out_b"))
         {
-            inputs.Add(NamedOnnxValue.CreateFromTensor("encoder_out_b", encTgt ?? encDense));
-            inputs.Add(NvF("blend", encTgt != null ? blendPerFrame! : new float[totalFrames], totalFrames));
+            int mixRows = blendRows is { Length: > 0 } ? blendRows.Length : 1;
+            var ebFlat = new float[mixRows * nTokens * hidden];
+            for (int r = 0; r < mixRows; r++)
+            {
+                var tgt = DiffSingerPredictor.BuildMixTargetTokens(v, phones, tokens, r, out bool anyMix);
+                var arr = (anyMix ? Encode(tgt) : encDense).ToArray();
+                Array.Copy(arr, 0, ebFlat, r * nTokens * hidden, nTokens * hidden);
+            }
+            inputs.Add(NamedOnnxValue.CreateFromTensor("encoder_out_b",
+                new DenseTensor<float>(ebFlat, new[] { mixRows, nTokens, hidden })));
+            var blFlat = new float[mixRows * totalFrames];
+            for (int r = 0; r < mixRows; r++)
+                if (blendRows != null && r < blendRows.Length)
+                    Array.Copy(blendRows[r], 0, blFlat, r * totalFrames, totalFrames);
+            inputs.Add(NamedOnnxValue.CreateFromTensor("blend", new DenseTensor<float>(blFlat, new[] { mixRows, totalFrames })));
         }
 
         AddAccel(inputs, model, cfg, steps);

@@ -219,10 +219,11 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
             : (config.Speakers.Count > 0 ? config.Speakers[0] : string.Empty);
         var noteLang = notes.Select(nt => nt.Properties.GetString(KeyLanguage, partLang)).ToArray();
 
-        // —— Phonemizer：歌词 → 音素时间线（绝对秒、含前置辅音越界）——
+        // —— Phonemizer：歌词 → 音素时间线（绝对秒、含前置辅音越界）；mixSlots 决定逐音素读几组混合目标 ——
+        int mixSlots = MixSlots(snapshot.PartProperties);
         var durPred = models.GetPredictor("dsdur");
         var phones = durPred != null
-            ? DiffSingerPhonemizer.Phonemize(durPred, notes, noteLang, speaker, hop, sr, mTensorCache)
+            ? DiffSingerPhonemizer.Phonemize(durPred, notes, noteLang, speaker, hop, sr, mTensorCache, mixSlots)
             : FallbackPhonemes(models, notes, noteLang);   // 无 dur 预测器：每 note 一元音兜底
         if (phones.Count == 0)
             return null;
@@ -277,28 +278,42 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
             langs[i + 1] = models.TryGetLanguage(PhonemeLang(phones[i].Symbol), out var lid) ? lid : 0;
         }
 
-        // —— P3 包络：音素混合 → tokens_b（目标音素，逐 token）+ blend（逐帧比例，来自 part 级包络曲线）——
-        //   目标符号来自 per-phoneme 属性（经 PhonemeSpan 透传，已解析）；比例来自 KeyMixCurve 逐帧采样。
-        //   非目标 token 的 tokens_b=base，故其帧 blend 即便非 0 也无效（无须逐 token 置 0）。
-        //   blend 逐帧包络与 pitch/variance 共用（同帧时间线）。声学未声明 tokens_b/blend（老库）时 HasInput gating 静默跳过。
-        var tokensB = (long[])tokens.Clone();
-        for (int i = 0; i < phones.Count; i++)
+        // —— 音素混合（帧级包络，N 槽）→ tokens_b [S,nTokens]（各槽目标音素流）+ blend [S,nFrames]（各槽逐帧比例）——
+        //   槽 k(1..N) → 张量行 r=k-1；tokens_b[r]=base 换该槽目标；blend[r,f]=phoneme_mix:k 逐帧采样，逐帧归一 Σ≤1（凸）。
+        //   N=0 时喂 1 行 no-op(base + 全 0)满足模型必需输入。blendRows 归一后与 pitch/variance 共用（同帧时间线）。
+        //   非目标 token 的 tokens_b=base ⇒ 该帧混合无效（无须逐 token 置 0）。老库无 tokens_b/blend 时 HasInput gating 静默跳过。
+        int mixRows = Math.Max(1, mixSlots);
+        var mixTokensB = new long[mixRows][];
+        var blendRows = new float[mixRows][];
+        for (int r = 0; r < mixRows; r++)
         {
-            var mixSym = phones[i].MixSymbol;
-            if (!string.IsNullOrEmpty(mixSym) && models.TryGetPhoneme(mixSym, out _))
-                tokensB[i + 1] = AcousticToken(models, mixSym);
+            var tb = (long[])tokens.Clone();
+            var br = new float[nFrames];
+            if (r < mixSlots)   // 真实槽（r<N）
+            {
+                for (int i = 0; i < phones.Count; i++)
+                {
+                    var sym = phones[i].MixSymbols is { } ms && r < ms.Length ? ms[r] : null;
+                    if (!string.IsNullOrEmpty(sym) && models.TryGetPhoneme(sym, out _))
+                        tb[i + 1] = AcousticToken(models, sym);
+                }
+                if (snapshot.Automations.TryGetValue(SlotKey(KeyMixCurve, r + 1), out var auto))
+                {
+                    var sampled = auto.Evaluator.Evaluate(frameTimes);
+                    for (int f = 0; f < nFrames; f++)
+                        br[f] = (float)Math.Clamp(double.IsNaN(sampled[f]) ? 0 : sampled[f], 0, 1);
+                }
+            }
+            mixTokensB[r] = tb;
+            blendRows[r] = br;
         }
-        var mixRatioCurve = snapshot.Automations.TryGetValue(KeyMixCurve, out var mixRatioAuto)
-            ? mixRatioAuto.Evaluator.Evaluate(frameTimes) : null;
-        float[]? blendPerFrame = null;   // null ⇒ 无曲线，各域 no-op
-        if (mixRatioCurve != null)
+        for (int f = 0; f < nFrames; f++)   // 逐帧凸归一：Σ>1 时按和缩放（保 base 权重=1-Σ≥0）
         {
-            blendPerFrame = new float[nFrames];
-            for (int f = 0; f < nFrames; f++)
-                blendPerFrame[f] = (float)Math.Clamp(double.IsNaN(mixRatioCurve[f]) ? 0 : mixRatioCurve[f], 0, 1);
+            float sum = 0;
+            for (int r = 0; r < mixRows; r++) sum += blendRows[r][f];
+            if (sum > 1)
+                for (int r = 0; r < mixRows; r++) blendRows[r][f] /= sum;
         }
-        var blend = blendPerFrame ?? new float[nFrames];   // 声学喂入（无曲线 = 全 0 = 不混合）
-
         // 逐帧 note 音高回退（head→首 note，phone i→其 note，tail→末 note）。
         var framePitch = new double[nFrames];
         int fi = 0;
@@ -315,7 +330,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         //   用户已画处（Pitch 非 NaN）用户值覆盖；NaN 自由区用预测轮廓（无 dspitch ⇒ 仍用矩形 framePitch）；PITD/vibrato 叠加在上。
         var predictedPitch = DiffSingerPitch.Predict(
             models.GetPredictor("dspitch"), phones, notes, durations,
-            renderStart, frameSec, speakerMix, config, mSamplingSteps, seedPitchCurve, mTensorCache, blendPerFrame);
+            renderStart, frameSec, speakerMix, config, mSamplingSteps, seedPitchCurve, mTensorCache, blendRows);
         progress?.Report(0.28);
         if (cancellation.IsCancellationRequested)
             return null;
@@ -343,7 +358,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         // —— variance 预测（基线；下方与用户 delta 合成喂声学、纯预测产回显）——
         var varCurves = DiffSingerVariance.Predict(
             models.GetPredictor("dsvariance"), phones,
-            durations, semis, speakerMix, config, mSamplingSteps, seedVarianceCurve, mTensorCache, blendPerFrame);
+            durations, semis, speakerMix, config, mSamplingSteps, seedVarianceCurve, mTensorCache, blendRows);
         progress?.Report(0.45);
         if (cancellation.IsCancellationRequested)
             return null;
@@ -359,8 +374,16 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         AddL("tokens", tokens, new[] { 1, nTokens });
         AddL("languages", langs, new[] { 1, nTokens });
         AddL("durations", durations.Select(x => (long)x).ToArray(), new[] { 1, nTokens });
-        AddL("tokens_b", tokensB, new[] { 1, nTokens });   // 音素混合目标 [S=1, nTokens]（模型无此输入则静默跳过）
-        AddF("blend", blend, new[] { 1, nFrames });        // 逐帧比例包络 [S=1, nFrames]
+        // 音素混合：tokens_b [S,nTokens] + blend [S,nFrames]（S=mixRows；各行拉平）。模型无此输入则静默跳过。
+        var tokensBFlat = new long[mixRows * nTokens];
+        var blendFlat = new float[mixRows * nFrames];
+        for (int r = 0; r < mixRows; r++)
+        {
+            Array.Copy(mixTokensB[r], 0, tokensBFlat, r * nTokens, nTokens);
+            Array.Copy(blendRows[r], 0, blendFlat, r * nFrames, nFrames);
+        }
+        AddL("tokens_b", tokensBFlat, new[] { mixRows, nTokens });
+        AddF("blend", blendFlat, new[] { mixRows, nFrames });
         AddF("f0", f0, new[] { 1, nFrames });
 
         // —— variance：预测 + 用户 delta 合成喂声学，同时产纯预测回显 ——
@@ -823,6 +846,9 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
             desired.Add(key.Id);
         foreach (var (key, _) in MixTrackKeys(pc.Resolved))
             desired.Add(key);
+        // 音素混合曲线 phoneme_mix:1..MaxMixSlots：全量列入候选，下方按 live（宿主实际声明的 N 条）过滤订阅。
+        for (int k = 1; k <= MaxMixSlots; k++)
+            desired.Add(SlotKey(KeyMixCurve, k));
 
         // 补订：应有且宿主已声明(live)、尚未订阅的。
         foreach (var key in desired)

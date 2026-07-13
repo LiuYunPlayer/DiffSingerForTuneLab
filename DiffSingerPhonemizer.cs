@@ -10,8 +10,9 @@ namespace DiffSingerForTuneLab;
 // 一个音素的解析结果（绝对秒、归属 note、是否韵核、引导/主体归属）。时间可越界 note（前置辅音落在 note 起点之前）。
 //   引导 / 主体归属做成结构化双列表（见 PhonemeLayout / SynthesizedSyllable）——IsLeading 携带该分类（引导 = 核前前置辅音），
 //   由 phonemizer 的分组（自由 note）或宿主钉死双列表（钉死 note）定，供会话 Render 还原输出双列表 + BodyOffset。
-//   MixSymbol：音素混合目标符号（钉死音素的 per-phoneme 属性，已解析；"" = 不混合）；混合比例由 part 级包络曲线逐帧给（见会话）。
-public readonly record struct PhonemeSpan(string Symbol, double StartTime, double EndTime, int NoteIndex, bool IsVowel, bool IsLeading, string MixSymbol = "");
+//   MixSymbols：逐槽音素混合目标符号（钉死音素的 per-phoneme 属性，已解析；索引 = 槽行 = 号-1；元素 "" 或数组 null = 不混）；
+//   比例由 part 级逐槽包络曲线逐帧给（见会话）。
+public readonly record struct PhonemeSpan(string Symbol, double StartTime, double EndTime, int NoteIndex, bool IsVowel, bool IsLeading, string[]? MixSymbols = null);
 
 // DiffSinger phonemizer：歌词 → 音素时间线。G2P / 分组 / dur 预测忠实移植 OpenUtau DiffSingerBasePhonemizer：
 //   · 短语首加前导 SP 组 + 500ms padding（给首辅音留空间），尾加哨兵；
@@ -39,7 +40,7 @@ public static class DiffSingerPhonemizer
 
     public static List<PhonemeSpan> Phonemize(
         DiffSingerPredictor dur, IReadOnlyList<VoiceSynthesisNoteSnapshot> notes,
-        IReadOnlyList<string> noteLang, string speaker, int hop, int sampleRate, bool tensorCache)
+        IReadOnlyList<string> noteLang, string speaker, int hop, int sampleRate, bool tensorCache, int mixSlots = 0)
     {
         if (notes.Count == 0)
             return new List<PhonemeSpan>();
@@ -151,7 +152,7 @@ public static class DiffSingerPhonemizer
         var layoutNotes = new List<PhonemeLayoutNote>();
         var layoutNoteIndex = new List<int>();          // layoutNotes[ln] → snapshot note 下标
         var layoutLeadCut = new List<int>();            // 引导 / 主体分界（引导 = 前 leadCut 个）：定位与输出双列表同用
-        var layoutMix = new List<string[]>();   // 逐音素混合目标符号（与 items/times 原序对齐；仅钉死音素有值，"" = 不混合）
+        var layoutMix = new List<string[][]>();   // 逐 layoutNote：每音素一个 string[mixSlots]（槽行→已解析目标，"" 不混）；非钉死/无槽为 null
         for (int i = 0; i < notes.Count; i++)
         {
             int count = noteSymbolCount[i];
@@ -160,7 +161,7 @@ public static class DiffSingerPhonemizer
             var ph = notes[i].Phonemes;
             bool isPinned = pinned[i];
             var items = new SynthesizedPhoneme[count];
-            var mix = new string[count];   // 非钉死槽保持 null = 不混合；比例改由 part 级包络曲线逐帧给（见会话）
+            var mix = new string[count][];   // mix[k] = 音素 k 的逐槽目标(string[mixSlots])；非钉死/无槽保持 null = 不混
             for (int k = 0; k < count; k++)
             {
                 string sym = flatSymbols[baseFlat + k];
@@ -171,20 +172,22 @@ public static class DiffSingerPhonemizer
                     Duration = usePin ? ph[k].Duration : durationFrames[baseFlat + k] * frameSec,
                     StretchWeight = usePin ? ph[k].StretchWeight : (dur.IsVowel(sym) ? 1 : 0),
                 };
-                if (usePin)
+                if (usePin && mixSlots > 0)
                 {
-                    var mixSym = ph[k].Properties.GetString(DiffSingerDeclarations.KeyMixPhoneme, string.Empty);
-                    if (!string.IsNullOrEmpty(mixSym))
+                    var slots = new string[mixSlots];
+                    for (int s = 1; s <= mixSlots; s++)
                     {
+                        var raw = ph[k].Properties.GetString(DiffSingerDeclarations.SlotKey(DiffSingerDeclarations.KeyMixPhoneme, s), string.Empty);
+                        if (string.IsNullOrEmpty(raw)) { slots[s - 1] = string.Empty; continue; }
                         // 混合目标语言：显式选择 > 跟随本音素语言（per-phoneme language 属性）> note 语言。
-                        var mixLang = ph[k].Properties.GetString(DiffSingerDeclarations.KeyMixLanguage, string.Empty);
+                        var mixLang = ph[k].Properties.GetString(DiffSingerDeclarations.SlotKey(DiffSingerDeclarations.KeyMixLanguage, s), string.Empty);
                         if (string.IsNullOrEmpty(mixLang))
                             mixLang = ph[k].Properties.GetString(DiffSingerDeclarations.KeyLanguage, string.Empty);
                         if (string.IsNullOrEmpty(mixLang))
                             mixLang = noteLang[i];
-                        mixSym = ResolveMixSymbol(dur, mixSym, mixLang);
+                        slots[s - 1] = ResolveMixSymbol(dur, raw, mixLang);
                     }
-                    mix[k] = mixSym;
+                    mix[k] = slots;
                 }
             }
             // 引导 / 主体分界（结合线）+ BodyOffset（结合线相对 note 头的有符号偏移，喂 Resolve 的 nominal）：
@@ -219,7 +222,7 @@ public static class DiffSingerPhonemizer
             {
                 var it = k < leadCut ? layoutNote.LeadingPhonemes[k] : layoutNote.BodyPhonemes[k - leadCut];
                 result.Add(new PhonemeSpan(it.Symbol, times[k].Start, times[k].End, noteIndex, dur.IsVowel(it.Symbol), k < leadCut,
-                    layoutMix[ln][k] ?? string.Empty));
+                    layoutMix[ln][k]));
             }
         }
         return result;

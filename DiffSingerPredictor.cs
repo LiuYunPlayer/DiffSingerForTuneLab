@@ -91,21 +91,25 @@ public sealed class DiffSingerPredictor : IDisposable
             : throw new InvalidOperationException($"音素 \"{symbol}\" 不在 {Path.GetFileName(mDir)} 的音素表中");
     public long LangId(string lang) => mLanguages.TryGetValue(lang, out var id) ? id : 0;
 
-    // 音素混合（帧级，role 模型侧）：从主 tokens 克隆出「目标 token 流」——设了混合、且本预测器词表可解析目标符号的
-    //   音素槽替换为目标 token，其余保持 base；anyMix = 是否至少一个槽被替换（无则可跳过第二次 linguistic）。
+    // 音素混合（帧级，role 模型侧）：从主 tokens 克隆出第 slotRow 槽的「目标 token 流」——该槽设了混合、且本预测器词表
+    //   可解析目标符号的音素替换为目标 token，其余保持 base；anyMix = 该槽是否至少一个音素被替换（无则可复用 base 编码）。
     //   目标符号按本预测器自己词表解析（acoustic/predictor id 空间不共享，查不到即优雅降级不混）。
-    //   primaryTokens 布局 = [SP, ...phones..., SP]，phones[i] 落 primaryTokens[i+1]。
+    //   primaryTokens 布局 = [SP, ...phones..., SP]，phones[i] 落 primaryTokens[i+1]；slotRow = 槽行（号-1）。
     public static long[] BuildMixTargetTokens(
-        DiffSingerPredictor v, IReadOnlyList<PhonemeSpan> phones, long[] primaryTokens, out bool anyMix)
+        DiffSingerPredictor v, IReadOnlyList<PhonemeSpan> phones, long[] primaryTokens, int slotRow, out bool anyMix)
     {
         var tgt = (long[])primaryTokens.Clone();
         anyMix = false;
         for (int i = 0; i < phones.Count; i++)
-            if (!string.IsNullOrEmpty(phones[i].MixSymbol) && v.TryPhoneme(phones[i].MixSymbol, out var mid))
+        {
+            var ms = phones[i].MixSymbols;
+            var sym = ms is not null && slotRow < ms.Length ? ms[slotRow] : null;
+            if (!string.IsNullOrEmpty(sym) && v.TryPhoneme(sym, out var mid))
             {
                 tgt[i + 1] = mid;
                 anyMix = true;
             }
+        }
         return tgt;
     }
 

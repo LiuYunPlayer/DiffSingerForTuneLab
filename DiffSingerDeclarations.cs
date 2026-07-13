@@ -34,11 +34,19 @@ public static class DiffSingerDeclarations
     public const double SeedCurveMax = 1;
     public const string KeyMix = "speaker_mix";    // part 属性：说话人混合变长键控容器，条目键 = suffix
     public const string KeyMixPrefix = "mix:";     // 说话人混合自动化轨 key 前缀：mix:<suffix>
-    // —— P1-a 实验：逐音素「音素混合」（与说话人混合正交）。需重导出声学模型带 tokens_b/blend 输入；
-    //   无该输入的声库合成期 HasInput gating 静默忽略（面板仍显示但无效——实验分支约定，正式化前应加能力门控）——
-    public const string KeyMixPhoneme = "mix_phoneme";            // per-phoneme：混合目标音素（裸符号；"" = 不混合）
-    public const string KeyMixLanguage = "mix_phoneme_lang";      // per-phoneme：混合目标音素的语言（"" = 跟随本音素语言）
-    public const string KeyMixCurve = "phoneme_mix";              // part 级：音素混合比例包络曲线 [0,1]（逐帧；0 = 不混合）
+    // —— 音素混合（帧级包络，N 槽；与说话人混合正交）。需重导出模型带 tokens_b/blend/encoder_out_b 输入，
+    //   无该输入的老库合成期 HasInput gating 静默忽略。键按槽号 1..N（SlotKey），槽号即张量行 = 号-1——
+    public const string KeyMixSlots = "phoneme_mix_slots";        // part 属性：音素混合槽数 N（0=关；N=槽 1..N）
+    public const string KeyMixPhoneme = "mix_phoneme";            // per-phoneme 前缀：目标音素 → SlotKey mix_phoneme:k
+    public const string KeyMixLanguage = "mix_phoneme_lang";      // per-phoneme 前缀：目标语言 → mix_phoneme_lang:k（"" = 跟随本音素）
+    public const string KeyMixCurve = "phoneme_mix";              // part 级前缀：比例包络曲线 [0,1] → phoneme_mix:k
+    public const int MaxMixSlots = 8;                             // 槽数上限（UI 理智值；模型动态支持任意 N）
+
+    // 槽键：base:k（k 从 1）。号 = 张量槽行 k-1。
+    public static string SlotKey(string baseKey, int slot) => $"{baseKey}:{slot}";
+    // part 属性读槽数，clamp [0, MaxMixSlots]。
+    public static int MixSlots(PropertyObject partProperties)
+        => Math.Clamp((int)Math.Round(partProperties.GetDouble(KeyMixSlots, 0)), 0, MaxMixSlots);
 
     // 归一化刻度：gender 中性 0、量程 [-1,1]；speed 中性 1（=原速）、量程 [0,2]（百分比小数化）。
     public const double GenderBaseline = 0, GenderMin = -1, GenderMax = 1;
@@ -73,6 +81,11 @@ public static class DiffSingerDeclarations
         var set = SpeakerSet.Compute(pc.Resolved);
         foreach (var (suffix, display, color) in SelectedMixTracks(set, partProperties))
             map.Add((KeyMixPrefix + suffix, display), Continuous(color, 0, 0, 1));   // 混合权重归一化 [0,1]（0=不混入）
+        // 音素混合比例包络：按槽数 N 生成 phoneme_mix:1..N（逐帧 [0,1]、基线 0）。目标音素在 per-phoneme 面板设。
+        int mixSlots = MixSlots(partProperties);
+        for (int k = 1; k <= mixSlots; k++)
+            map.Add((SlotKey(KeyMixCurve, k), $"{L.Tr("Phoneme mix")} {k}"),
+                Continuous(MixColors[(k - 1) % MixColors.Length], 0, 0, 1));
         return map;
     }
 
@@ -89,10 +102,6 @@ public static class DiffSingerDeclarations
             map.Add((KeyGender, L.Tr("Gender")), Continuous("#E5A573", GenderBaseline, GenderMin, GenderMax));
         if (config.UseSpeedEmbed)
             map.Add((KeySpeed, L.Tr("Speed")), Continuous("#73B5E5", SpeedBaseline, SpeedMin, SpeedMax));
-
-        // 音素混合比例包络（P3，实验）：始终暴露，逐帧 [0,1]、基线 0=不混合。目标音素在 per-phoneme 面板设；
-        //   仅重导出（带 tokens_b/blend 的动态 batch）acoustic 生效，老库合成期 HasInput gating 静默忽略。
-        map.Add((KeyMixCurve, L.Tr("Phoneme mix")), Continuous("#C79BF0", 0, 0, 1));
 
         // seed 轨：仅当 manifest 声明对应 retake 能力时暴露（连续、基线 0、量程 [0,SeedCurveMax]）。
         if (retake.Pitch)
@@ -162,6 +171,10 @@ public static class DiffSingerDeclarations
         if (set.Options.Any(o => o.Suffix != set.DefaultSuffix))
             properties.Add((KeyMix, L.Tr("Speaker mix")), BuildSpeakerMixConfig(set, mergedProps));
 
+        // 音素混合槽数：0=关；调到 N → 自动化面板出 N 条 phoneme_mix:k 曲线、每个音素出 N 组目标音素/语言。
+        properties.Add((KeyMixSlots, L.Tr("Phoneme mix slots")),
+            DraggableNumberBoxConfig.Integer(0).WithRange(0, MaxMixSlots));
+
         return ObjectConfig.Create(properties);
     }
 
@@ -196,8 +209,9 @@ public static class DiffSingerDeclarations
         return ObjectConfig.Create(properties);
     }
 
-    // per-phoneme 面板：多语言时暴露 per-phoneme 语言覆盖（默认空 = 跟随 note）；始终暴露 P1-a 音素混合（目标音素 + 语言 + 比例）。
-    public static ObjectConfig BuildPhonemeConfig(PartContext pc)
+    // per-phoneme 面板：多语言时暴露 per-phoneme 语言覆盖（默认空 = 跟随 note）；按 part 槽数 N 暴露 N 组音素混合（目标 + 语言）。
+    //   slots 来自 part 属性 phoneme_mix_slots；每槽 k 一组 mix_phoneme:k + mix_phoneme_lang:k。比例由 part 级 phoneme_mix:k 曲线给。
+    public static ObjectConfig BuildPhonemeConfig(PartContext pc, int slots)
     {
         var props = new OrderedMap<PropertyKey, IControllerConfig>();
         if (HasLanguageChoice(pc))
@@ -207,16 +221,19 @@ public static class DiffSingerDeclarations
                 options.Add(new ComboBoxItem(PropertyValue.Create(id), display));
             props.Add((KeyLanguage, L.Tr("Language")), ComboBoxConfig.Create(options).WithDefault(PropertyValue.Create(string.Empty)));
         }
-        // 音素混合（P3 包络）：目标音素输入框（裸符号，空 = 不混合）+ 语言下拉（多语言库才显示，默认 "" = 跟随本音素语言）。
-        //   比例改由 part 级「Phoneme mix」包络曲线逐帧给（此处不再有比例滑块）。调整任一项 → 宿主自动钉死该 note。
-        //   目标符号在合成期按语言解析、查不到即不混（优雅降级）。
-        props.Add((KeyMixPhoneme, L.Tr("Mix phoneme")), TextBoxConfig.Create());
-        if (HasLanguageChoice(pc))
+        // 音素混合（帧级包络）：每槽 k = 目标音素输入框（裸符号，空=该槽不混）+ 语言下拉（多语言库才显示，默认跟随本音素）。
+        //   比例由 part 级「Phoneme mix k」包络曲线逐帧给。调整任一项 → 宿主自动钉死该 note；目标符号合成期按语言解析、查不到即不混。
+        for (int k = 1; k <= slots; k++)
         {
-            var mixLangs = new List<ComboBoxItem> { new(PropertyValue.Create(string.Empty), L.Tr("(follow phoneme)")) };
-            foreach (var (id, display) in EffectiveLanguages(pc))
-                mixLangs.Add(new ComboBoxItem(PropertyValue.Create(id), display));
-            props.Add((KeyMixLanguage, L.Tr("Mix language")), ComboBoxConfig.Create(mixLangs).WithDefault(PropertyValue.Create(string.Empty)));
+            props.Add((SlotKey(KeyMixPhoneme, k), $"{L.Tr("Mix phoneme")} {k}"), TextBoxConfig.Create());
+            if (HasLanguageChoice(pc))
+            {
+                var mixLangs = new List<ComboBoxItem> { new(PropertyValue.Create(string.Empty), L.Tr("(follow phoneme)")) };
+                foreach (var (id, display) in EffectiveLanguages(pc))
+                    mixLangs.Add(new ComboBoxItem(PropertyValue.Create(id), display));
+                props.Add((SlotKey(KeyMixLanguage, k), $"{L.Tr("Mix language")} {k}"),
+                    ComboBoxConfig.Create(mixLangs).WithDefault(PropertyValue.Create(string.Empty)));
+            }
         }
         return ObjectConfig.Create(props);
     }
