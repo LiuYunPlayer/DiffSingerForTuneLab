@@ -277,6 +277,22 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
             langs[i + 1] = models.TryGetLanguage(PhonemeLang(phones[i].Symbol), out var lid) ? lid : 0;
         }
 
+        // —— P1-a：逐音素「音素混合」→ tokens_b（次要音素）+ blend（逐音素比例 [0,1]）——
+        //   混合目标/比例来自 per-phoneme 属性（经 PhonemeSpan 透传）；无混合 ⇒ tokens_b=tokens、blend=0（等价原模型）。
+        //   SP padding 槽恒不混合。声学模型未声明 tokens_b/blend 输入时，下方 AddL/AddF 的 HasInput gating 静默跳过。
+        var tokensB = new long[nTokens];
+        var blend = new float[nTokens];
+        tokensB[0] = tokens[0];
+        tokensB[nTokens - 1] = tokens[nTokens - 1];
+        for (int i = 0; i < phones.Count; i++)
+        {
+            var mixSym = phones[i].MixSymbol;
+            double ratio = phones[i].MixRatio;
+            bool hasMix = ratio > 0 && !string.IsNullOrEmpty(mixSym) && models.TryGetPhoneme(mixSym, out _);
+            tokensB[i + 1] = hasMix ? AcousticToken(models, mixSym) : tokens[i + 1];
+            blend[i + 1] = hasMix ? (float)Math.Clamp(ratio, 0, 1) : 0f;
+        }
+
         // 逐帧 note 音高回退（head→首 note，phone i→其 note，tail→末 note）。
         var framePitch = new double[nFrames];
         int fi = 0;
@@ -337,6 +353,8 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         AddL("tokens", tokens, new[] { 1, nTokens });
         AddL("languages", langs, new[] { 1, nTokens });
         AddL("durations", durations.Select(x => (long)x).ToArray(), new[] { 1, nTokens });
+        AddL("tokens_b", tokensB, new[] { 1, nTokens });   // P1-a 音素混合（模型无此输入则静默跳过）
+        AddF("blend", blend, new[] { 1, nTokens });
         AddF("f0", f0, new[] { 1, nFrames });
 
         // —— variance：预测 + 用户 delta 合成喂声学，同时产纯预测回显 ——

@@ -79,7 +79,8 @@ public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSet
 
     public IReadOnlyList<ObjectConfig> GetPhonemePropertyConfigs(IVoiceSynthesisNotePropertyContext context)
     {
-        if (Resolve(context.Part.VoiceId, context.Part.PartProperties) is not { } pc || !DiffSingerDeclarations.HasLanguageChoice(pc))
+        // 门控放开：音素混合对任何声库都暴露（不再限多语言）；语言下拉在 BuildPhonemeConfig 内按 HasLanguageChoice 自 gate。
+        if (Resolve(context.Part.VoiceId, context.Part.PartProperties) is not { } pc)
             return [];
         var phonemeConfig = DiffSingerDeclarations.BuildPhonemeConfig(pc);
         return context.Notes.SelectMany(n => n.Phonemes).Select(_ => phonemeConfig).ToList();

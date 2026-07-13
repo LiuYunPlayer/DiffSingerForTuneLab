@@ -34,6 +34,10 @@ public static class DiffSingerDeclarations
     public const double SeedCurveMax = 1;
     public const string KeyMix = "speaker_mix";    // part 属性：说话人混合变长键控容器，条目键 = suffix
     public const string KeyMixPrefix = "mix:";     // 说话人混合自动化轨 key 前缀：mix:<suffix>
+    // —— P1-a 实验：逐音素「音素混合」（与说话人混合正交）。需重导出声学模型带 tokens_b/blend 输入；
+    //   无该输入的声库合成期 HasInput gating 静默忽略（面板仍显示但无效——实验分支约定，正式化前应加能力门控）——
+    public const string KeyMixPhoneme = "mix_phoneme";            // per-phoneme：混合目标音素（声学音素表键；"" = 不混合）
+    public const string KeyMixPhonemeRatio = "mix_phoneme_ratio"; // per-phoneme：混合比例 [0,1]（0 = 纯本音素）
 
     // 归一化刻度：gender 中性 0、量程 [-1,1]；speed 中性 1（=原速）、量程 [0,2]（百分比小数化）。
     public const double GenderBaseline = 0, GenderMin = -1, GenderMax = 1;
@@ -187,15 +191,44 @@ public static class DiffSingerDeclarations
         return ObjectConfig.Create(properties);
     }
 
-    // per-phoneme 语言：每个钉死音素一个语言下拉，覆盖该音素语种；默认空 = 跟随 note。
+    // per-phoneme 面板：多语言时暴露 per-phoneme 语言覆盖（默认空 = 跟随 note）；始终暴露 P1-a 音素混合（目标音素 + 比例）。
     public static ObjectConfig BuildPhonemeConfig(PartContext pc)
     {
-        var options = new List<ComboBoxItem> { new(PropertyValue.Create(string.Empty), L.Tr("(follow note)")) };
-        foreach (var (id, display) in EffectiveLanguages(pc))
-            options.Add(new ComboBoxItem(PropertyValue.Create(id), display));
         var props = new OrderedMap<PropertyKey, IControllerConfig>();
-        props.Add((KeyLanguage, L.Tr("Language")), ComboBoxConfig.Create(options).WithDefault(PropertyValue.Create(string.Empty)));
+        if (HasLanguageChoice(pc))
+        {
+            var options = new List<ComboBoxItem> { new(PropertyValue.Create(string.Empty), L.Tr("(follow note)")) };
+            foreach (var (id, display) in EffectiveLanguages(pc))
+                options.Add(new ComboBoxItem(PropertyValue.Create(id), display));
+            props.Add((KeyLanguage, L.Tr("Language")), ComboBoxConfig.Create(options).WithDefault(PropertyValue.Create(string.Empty)));
+        }
+        // 音素混合：目标音素下拉（声学音素表 + "(none)"）+ 比例滑块 [0,1]。调整任一项 → 宿主自动钉死该 note（写属性即 LockPhonemes）。
+        var mix = new List<ComboBoxItem> { new(PropertyValue.Create(string.Empty), L.Tr("(none)")) };
+        foreach (var sym in AcousticPhonemeSymbols(pc))
+            mix.Add(new ComboBoxItem(PropertyValue.Create(sym), sym));
+        props.Add((KeyMixPhoneme, L.Tr("Mix phoneme")), ComboBoxConfig.Create(mix).WithDefault(PropertyValue.Create(string.Empty)));
+        props.Add((KeyMixPhonemeRatio, L.Tr("Mix ratio")), SliderConfig.Linear(0, 0, 1));
         return ObjectConfig.Create(props);
+    }
+
+    // 声学音素表符号（混合目标下拉选项）：解析 dsconfig phonemes（音素→id JSON）取键，按文件路径缓存（声明面每次 commit 重算）。
+    static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string[]> mPhonemeSymbols = new();
+    static string[] AcousticPhonemeSymbols(PartContext pc)
+    {
+        var config = pc.Config;
+        if (string.IsNullOrEmpty(config.PhonemesFileName) || string.IsNullOrEmpty(config.RootPath))
+            return Array.Empty<string>();
+        var path = Path.Combine(config.RootPath, config.PhonemesFileName);
+        return mPhonemeSymbols.GetOrAdd(path, p =>
+        {
+            try
+            {
+                var map = new YamlDotNet.Serialization.DeserializerBuilder().Build()
+                    .Deserialize<Dictionary<string, int>>(File.ReadAllText(p));
+                return map.Keys.OrderBy(k => k, StringComparer.Ordinal).ToArray();
+            }
+            catch { return Array.Empty<string>(); }
+        });
     }
 
     public static bool HasLanguageChoice(PartContext pc)
