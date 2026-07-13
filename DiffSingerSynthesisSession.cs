@@ -336,7 +336,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
 
         // —— variance 预测（基线；下方与用户 delta 合成喂声学、纯预测产回显）——
         var varCurves = DiffSingerVariance.Predict(
-            models.GetPredictor("dsvariance"), phones.Select(p => p.Symbol).ToList(),
+            models.GetPredictor("dsvariance"), phones,
             durations, semis, speakerMix, config, mSamplingSteps, seedVarianceCurve, mTensorCache);
         progress?.Report(0.45);
         if (cancellation.IsCancellationRequested)

@@ -25,28 +25,29 @@ public readonly record struct VarianceCurves(float[]? Energy, float[]? Breathine
 
 public static class DiffSingerVariance
 {
-    // symbols = body 音素（不含 head/tail）；phDur = padded 帧（len=symbols+2）；pitchSemis = totalFrames 半音曲线。
+    // phones = body 音素（不含 head/tail）；phDur = padded 帧（len=phones+2）；pitchSemis = totalFrames 半音曲线。
+    //   收 PhonemeSpan（非纯符号）以取 per-phoneme 音素混合（MixSymbol/MixRatio）——与 acoustic 一致，否则只看主音素 emb。
     public static VarianceCurves Predict(
-        DiffSingerPredictor? v, IReadOnlyList<string> symbols, int[] phDur,
+        DiffSingerPredictor? v, IReadOnlyList<PhonemeSpan> phones, int[] phDur,
         float[] pitchSemis, DiffSingerSpeakerMix mix, VoicebankConfig cfg, int steps, uint[] seedPerFrame, bool tensorCache)
     {
-        if (v is null || !v.HasModel("variance") || symbols.Count == 0)
+        if (v is null || !v.HasModel("variance") || phones.Count == 0)
             return default;
 
         int hidden = v.HiddenSize;
-        int nTokens = symbols.Count + 2;
+        int nTokens = phones.Count + 2;
         int totalFrames = phDur.Sum();
 
-        var tokens = symbols.Select(s => (long)v.PhonemeToken(s)).Prepend((long)v.PhonemeToken("SP"))
+        var tokens = phones.Select(p => (long)v.PhonemeToken(p.Symbol)).Prepend((long)v.PhonemeToken("SP"))
             .Append((long)v.PhonemeToken("SP")).ToArray();
-        var langs = symbols.Select(s => v.LangId(PhonemeLanguage(s))).Prepend(0L).Append(0L).ToArray();
+        var langs = phones.Select(p => v.LangId(PhonemeLanguage(p.Symbol))).Prepend(0L).Append(0L).ToArray();
         // —— linguistic（词模式吃 word_div/word_dur，否则音素模式吃 ph_dur；同 dspitch 按编码器实际输入判）——
         //   variance 的编码器模式随 dsconfig.predict_dur：true=词模式、false=音素模式（ph_dur 已知）；
         //   忠实对齐 OpenUtau DiffSingerVariance，且与本插件 dspitch 路径同构。
         var lingInputs = new List<NamedOnnxValue> { NvL("tokens", tokens, nTokens) };
         if (v.LinguisticUsesWordBoundary)
         {
-            var isVowel = symbols.Select(v.IsVowel).ToArray();
+            var isVowel = phones.Select(p => v.IsVowel(p.Symbol)).ToArray();
             var (wordDiv, wordDur) = DiffSingerFrames.PaddedWordDivAndDur(isVowel, phDur);
             lingInputs.Add(NvL("word_div", wordDiv, wordDiv.Length));
             lingInputs.Add(NvL("word_dur", wordDur, wordDur.Length));
@@ -57,6 +58,13 @@ public static class DiffSingerVariance
         }
         if (v.Linguistic.HasInput("languages"))
             lingInputs.Add(NvL("languages", langs, nTokens));
+        // P1-a 音素混合：linguistic 编码器侧同步（一致性——否则 variance 只看主音素 emb）。模型无此输入则跳过。
+        if (v.Linguistic.HasInput("tokens_b"))
+        {
+            var (tokensB, blend) = DiffSingerPredictor.BuildPhonemeMix(v, phones, tokens);
+            lingInputs.Add(NvL("tokens_b", tokensB, nTokens));
+            lingInputs.Add(NvF("blend", blend, nTokens));
+        }
         var lingOut = DiffSingerTensorCache.Run(v.Linguistic, v.LinguisticHash, lingInputs, tensorCache);
         var enc = lingOut.First(o => o.Name == "encoder_out").AsTensor<float>();
         var encDense = new DenseTensor<float>(enc.ToArray(), enc.Dimensions.ToArray());
