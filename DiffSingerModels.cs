@@ -104,7 +104,8 @@ public sealed class DiffSingerModelCache : IDisposable
         var dir = ResolveVocoderDir(vocoderName);
         if (dir is null)
             throw new InvalidOperationException(
-                $"未找到声码器 {vocoderName}：搜索的声码器目录下均无 {vocoderName}/vocoder.yaml。" +
+                $"未找到声码器 {vocoderName}：搜索的声码器目录下，既无同名子目录 {vocoderName}/vocoder.yaml，" +
+                $"也无任何 vocoder.yaml 的 name 字段等于 {vocoderName}。" +
                 $"（已搜索：{string.Join(" ; ", VocoderRoots)}）请把声码器放入其中之一，或在插件设置的「声码器目录」里追加其所在目录。");
 
         var yaml = new DeserializerBuilder().Build()
@@ -119,9 +120,18 @@ public sealed class DiffSingerModelCache : IDisposable
         return entry;
     }
 
-    // 在 VocoderRoots 里按序找到首个含 <vocoderName>/vocoder.yaml 的目录；无则 null。
+    // 按 vocoder.yaml 内声明的 name 字段解析目录，目录名只作快速路径/歧义消解——而非判据。
+    //   身份契约：声学 dsconfig 的 vocoder 字段 == 声码器包 vocoder.yaml 的 name 字段（见 OpenUtau DsVocoderConfig.name）。
+    //   目录名本不该是判据：OpenUtau bundled 约定就把目录写死为 "dsvocoder"、真名另存 yaml，用户重命名/自定义收藏目录也不该导致找不到。
+    //   故这里主认 yaml name、rename-proof。相对 OpenUtau（它构造时忽略 name、只认「dsvocoder 固定目录」或「依赖目录/dsconfig.vocoder」）
+    //   这是一处主动增强，契合我们「全局共享 Vocoders 目录、按名引用」的取向。
+    // 解析顺序（按 VocoderRoots 序）：
+    //   1) 快速路径：<root>/<vocoderName>/vocoder.yaml 存在即返回——目录名恰好命中，零扫描、老库不回归、天然消解 name 撞车；
+    //   2) 内容匹配：扫 root 直属子目录，返回首个 vocoder.yaml.name == vocoderName 者（目录名可任意，如 "dsvocoder"）。
+    //   同一 root 下多目录 name 撞车取首个（EnumerateDirectories 序）；yaml 读/解析失败的目录跳过，不让无关坏包中断扫描。
     string? ResolveVocoderDir(string vocoderName)
     {
+        // 1) 快速路径：目录名精确命中（沿用旧行为，保证零回归）
         foreach (var root in VocoderRoots)
         {
             if (string.IsNullOrWhiteSpace(root))
@@ -130,7 +140,37 @@ public sealed class DiffSingerModelCache : IDisposable
             if (File.Exists(Path.Combine(dir, "vocoder.yaml")))
                 return dir;
         }
+        // 2) 内容匹配：按 yaml 的 name 字段认目录（仅在缓存 miss 时走一次）
+        foreach (var root in VocoderRoots)
+        {
+            if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
+                continue;
+            foreach (var dir in Directory.EnumerateDirectories(root))
+            {
+                var yamlPath = Path.Combine(dir, "vocoder.yaml");
+                if (!File.Exists(yamlPath) || TryReadVocoderName(yamlPath) != vocoderName)
+                    continue;
+                mLogger.Info($"DiffSinger：声码器 {vocoderName} 按 vocoder.yaml 的 name 命中目录「{Path.GetFileName(dir)}」（目录名与声码器名不同）。");
+                return dir;
+            }
+        }
         return null;
+    }
+
+    // 读 vocoder.yaml 的 name 字段；读/解析失败或缺字段返回 null（调用方跳过该目录，不中断整轮扫描）。
+    string? TryReadVocoderName(string yamlPath)
+    {
+        try
+        {
+            var yaml = new DeserializerBuilder().Build()
+                .Deserialize<Dictionary<string, object?>>(File.ReadAllText(yamlPath));
+            return yaml.TryGetValue("name", out var n) ? n?.ToString() : null;
+        }
+        catch (Exception ex)
+        {
+            mLogger.Warning($"DiffSinger：解析声码器配置 {yamlPath} 失败，扫描时跳过：{ex.Message}");
+            return null;
+        }
     }
 
     // 执行设备同质承诺，不做进程内回退（见类注释的 AccessViolation 约束）：
@@ -238,6 +278,13 @@ public sealed class VoiceModels : IDisposable
     public bool TryGetPhoneme(string symbol, out int id) => mPhonemes.TryGetValue(symbol, out id);
     public bool TryGetLanguage(string lang, out int id) => mLanguages.TryGetValue(lang, out id);
 
+    // 子目录 → 该预测器唯一职责 role（对齐 OpenUtau：dsdur 只用 dur、dspitch 只用 pitch、dsvariance 只用 variance）。
+    //   仅加载本职 role + linguistic；dsconfig 里其余 role 字段（打包遗留/串味）一律忽略——即便指向不存在的文件也不影响加载。
+    static readonly Dictionary<string, string> PredictorRole = new(StringComparer.Ordinal)
+    {
+        ["dsdur"] = "dur", ["dspitch"] = "pitch", ["dsvariance"] = "variance",
+    };
+
     // 预测器懒加载（子目录如 "dsvariance" / "dspitch"）：首用时按声库会话加载器构造；
     // 子目录无 dsconfig 或加载失败返回 null（记忆化，不重试），调用方据此降级。
     public DiffSingerPredictor? GetPredictor(string subdir)
@@ -251,7 +298,9 @@ public sealed class VoiceModels : IDisposable
             var dir = Path.Combine(mConfig.RootPath, subdir);
             if (File.Exists(Path.Combine(dir, "dsconfig.yaml")))
             {
-                try { predictor = new DiffSingerPredictor(dir, mLoad); }
+                // 未知子目录（无映射）退化为加载全部 role，保守不改老行为。
+                var role = PredictorRole.GetValueOrDefault(subdir);
+                try { predictor = new DiffSingerPredictor(dir, mLoad, role); }
                 catch (Exception ex) { mLogger.Warning($"DiffSinger：加载预测器 {subdir} 失败：{ex.Message}"); }
             }
             mPredictors[subdir] = predictor;
