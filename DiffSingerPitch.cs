@@ -96,17 +96,13 @@ public static class DiffSingerPitch
             NamedOnnxValue.CreateFromTensor("retake", new DenseTensor<bool>(retake, new[] { 1, totalFrames })),
         };
 
-        // 音素混合（帧级）：目标流 encoder_out_b [1,nTokens,H] + 逐帧 blend [1,totalFrames] 喂 role 模型（条件级混合、去噪一次）。
-        if (encTgt != null && model.HasInput("encoder_out_b"))
+        // 音素混合（帧级）：role 模型把 encoder_out_b/blend 列为**必需**输入（导出恒有），故只要模型声明就**总是**喂——
+        //   有混合 ⇒ 目标流 encoder_out_b [1,nTokens,H] + 逐帧 blend [1,totalFrames]；
+        //   无混合 ⇒ 喂 no-op（encoder_out_b=base、blend 全 0），base 权重=1 ⇒ 等价不混（避免缺必需输入崩溃）。
+        if (model.HasInput("encoder_out_b"))
         {
-            // —— 诊断（临时）：打印实际喂入形状，定位 /pre/Unsqueeze_4 崩溃 ——
-            TuneLabContext.Global.GetLogger().Warning(
-                $"[phoneme-mix/pitch] nTokens={nTokens} totalFrames={totalFrames} blendPerFrame.Len={blendPerFrame!.Length} " +
-                $"encoder_out=[{string.Join(',', encDense.Dimensions.ToArray())}] " +
-                $"encoder_out_b=[{string.Join(',', encTgt.Dimensions.ToArray())}] " +
-                $"ph_dur.sum={phDur.Sum()} note_dur.sum={noteDur.Sum()} noteMidi.len={noteMidi.Length}");
-            inputs.Add(NamedOnnxValue.CreateFromTensor("encoder_out_b", encTgt));
-            inputs.Add(NvF("blend", blendPerFrame!, totalFrames));
+            inputs.Add(NamedOnnxValue.CreateFromTensor("encoder_out_b", encTgt ?? encDense));
+            inputs.Add(NvF("blend", encTgt != null ? blendPerFrame! : new float[totalFrames], totalFrames));
         }
 
         AddAccel(inputs, model, cfg, steps);

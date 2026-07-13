@@ -112,11 +112,12 @@ public static class DiffSingerVariance
         inputs.Add(NamedOnnxValue.CreateFromTensor("retake",
             new DenseTensor<bool>(retake, new[] { 1, totalFrames, numVar })));
 
-        // 音素混合（帧级）：目标流 encoder_out_b [1,nTokens,H] + 逐帧 blend [1,totalFrames] 喂 role 模型（条件级、去噪一次）。
-        if (encTgt != null && model.HasInput("encoder_out_b"))
+        // 音素混合（帧级）：role 模型把 encoder_out_b/blend 列为**必需**输入（导出恒有），故只要模型声明就**总是**喂——
+        //   无混合 ⇒ no-op（encoder_out_b=base、blend 全 0），base 权重=1 ⇒ 等价不混（避免缺必需输入崩溃）。
+        if (model.HasInput("encoder_out_b"))
         {
-            inputs.Add(NamedOnnxValue.CreateFromTensor("encoder_out_b", encTgt));
-            inputs.Add(NvF("blend", blendPerFrame!, totalFrames));
+            inputs.Add(NamedOnnxValue.CreateFromTensor("encoder_out_b", encTgt ?? encDense));
+            inputs.Add(NvF("blend", encTgt != null ? blendPerFrame! : new float[totalFrames], totalFrames));
         }
 
         AddAccel(inputs, model, cfg, steps);
