@@ -52,12 +52,12 @@ public static class DiffSingerPitch
             var langs = phones.Select(p => v.LangId(PhonemeLanguage(p.Symbol))).Prepend(0L).Append(0L).ToArray();
             lingInputs.Add(NvL("languages", langs, nTokens));
         }
-        // P1-a 音素混合：linguistic 编码器侧同步（一致性——否则 pitch 只看主音素 emb）。模型无此输入则跳过。
+        // 音素混合包络仅作用于 acoustic；预测器 linguistic 若声明 tokens_b/blend 为必需输入，喂空操作满足即可
+        //   （tokens_b=tokens、blend=0，逐值等价无混合）。
         if (v.Linguistic.HasInput("tokens_b"))
         {
-            var (tokensB, blend) = DiffSingerPredictor.BuildPhonemeMix(v, phones, tokens);
-            lingInputs.Add(NvL("tokens_b", tokensB, nTokens));
-            lingInputs.Add(NvF("blend", blend, nTokens));
+            lingInputs.Add(NvL("tokens_b", (long[])tokens.Clone(), nTokens));
+            lingInputs.Add(NvF("blend", new float[nTokens], nTokens));
         }
         var lingOut = DiffSingerTensorCache.Run(v.Linguistic, v.LinguisticHash, lingInputs, tensorCache);
         var enc = lingOut.First(o => o.Name == "encoder_out").AsTensor<float>();

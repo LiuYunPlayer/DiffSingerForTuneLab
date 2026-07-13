@@ -31,7 +31,7 @@ internal static class L
             ["Mix phoneme"] = "混合音素",
             ["Mix language"] = "混合语言",
             ["(follow phoneme)"] = "（跟随音素）",
-            ["Mix ratio"] = "混合比例",
+            ["Phoneme mix"] = "音素混合",
             ["Gender"] = "性别",
             ["Speed"] = "语速",
             ["Energy"] = "能量",

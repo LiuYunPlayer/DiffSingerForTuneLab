@@ -277,20 +277,31 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
             langs[i + 1] = models.TryGetLanguage(PhonemeLang(phones[i].Symbol), out var lid) ? lid : 0;
         }
 
-        // —— P1-a：逐音素「音素混合」→ tokens_b（次要音素）+ blend（逐音素比例 [0,1]）——
-        //   混合目标/比例来自 per-phoneme 属性（经 PhonemeSpan 透传）；无混合 ⇒ tokens_b=tokens、blend=0（等价原模型）。
-        //   SP padding 槽恒不混合。声学模型未声明 tokens_b/blend 输入时，下方 AddL/AddF 的 HasInput gating 静默跳过。
-        var tokensB = new long[nTokens];
-        var blend = new float[nTokens];
-        tokensB[0] = tokens[0];
-        tokensB[nTokens - 1] = tokens[nTokens - 1];
+        // —— P3 包络：音素混合 → tokens_b（次要音素，逐 token）+ blend（逐帧比例，来自 part 级包络曲线）——
+        //   目标符号来自 per-phoneme 属性（经 PhonemeSpan 透传，已解析）；比例来自 KeyMixCurve 逐帧采样。
+        //   单槽（S=1）：tokens_b=[1,nTokens]、blend=[1,nFrames]。无目标的 token 其帧 blend 置 0（该 token tokens_b=base，
+        //   即便非 0 也无效，置 0 只为语义清晰）。声学未声明 tokens_b/blend（老库）时下方 HasInput gating 静默跳过。
+        var tokensB = (long[])tokens.Clone();
+        var tokenHasMix = new bool[nTokens];
         for (int i = 0; i < phones.Count; i++)
         {
             var mixSym = phones[i].MixSymbol;
-            double ratio = phones[i].MixRatio;
-            bool hasMix = ratio > 0 && !string.IsNullOrEmpty(mixSym) && models.TryGetPhoneme(mixSym, out _);
-            tokensB[i + 1] = hasMix ? AcousticToken(models, mixSym) : tokens[i + 1];
-            blend[i + 1] = hasMix ? (float)Math.Clamp(ratio, 0, 1) : 0f;
+            if (!string.IsNullOrEmpty(mixSym) && models.TryGetPhoneme(mixSym, out _))
+            {
+                tokensB[i + 1] = AcousticToken(models, mixSym);
+                tokenHasMix[i + 1] = true;
+            }
+        }
+        var mixRatioCurve = snapshot.Automations.TryGetValue(KeyMixCurve, out var mixRatioAuto)
+            ? mixRatioAuto.Evaluator.Evaluate(frameTimes) : null;
+        var blend = new float[nFrames];   // 全 0 = 不混合（等价原模型）
+        if (mixRatioCurve != null && tokenHasMix.Any(b => b))
+        {
+            int mf = 0;
+            for (int seg = 0; seg < nTokens; seg++)
+                for (int k = 0; k < durations[seg]; k++, mf++)
+                    if (tokenHasMix[seg])
+                        blend[mf] = (float)Math.Clamp(double.IsNaN(mixRatioCurve[mf]) ? 0 : mixRatioCurve[mf], 0, 1);
         }
 
         // 逐帧 note 音高回退（head→首 note，phone i→其 note，tail→末 note）。
@@ -353,8 +364,8 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         AddL("tokens", tokens, new[] { 1, nTokens });
         AddL("languages", langs, new[] { 1, nTokens });
         AddL("durations", durations.Select(x => (long)x).ToArray(), new[] { 1, nTokens });
-        AddL("tokens_b", tokensB, new[] { 1, nTokens });   // P1-a 音素混合（模型无此输入则静默跳过）
-        AddF("blend", blend, new[] { 1, nTokens });
+        AddL("tokens_b", tokensB, new[] { 1, nTokens });   // 音素混合目标 [S=1, nTokens]（模型无此输入则静默跳过）
+        AddF("blend", blend, new[] { 1, nFrames });        // 逐帧比例包络 [S=1, nFrames]
         AddF("f0", f0, new[] { 1, nFrames });
 
         // —— variance：预测 + 用户 delta 合成喂声学，同时产纯预测回显 ——

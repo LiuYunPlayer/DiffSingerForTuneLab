@@ -38,7 +38,7 @@ public static class DiffSingerDeclarations
     //   无该输入的声库合成期 HasInput gating 静默忽略（面板仍显示但无效——实验分支约定，正式化前应加能力门控）——
     public const string KeyMixPhoneme = "mix_phoneme";            // per-phoneme：混合目标音素（裸符号；"" = 不混合）
     public const string KeyMixLanguage = "mix_phoneme_lang";      // per-phoneme：混合目标音素的语言（"" = 跟随本音素语言）
-    public const string KeyMixPhonemeRatio = "mix_phoneme_ratio"; // per-phoneme：混合比例 [0,1]（0 = 纯本音素）
+    public const string KeyMixCurve = "phoneme_mix";              // part 级：音素混合比例包络曲线 [0,1]（逐帧；0 = 不混合）
 
     // 归一化刻度：gender 中性 0、量程 [-1,1]；speed 中性 1（=原速）、量程 [0,2]（百分比小数化）。
     public const double GenderBaseline = 0, GenderMin = -1, GenderMax = 1;
@@ -89,6 +89,10 @@ public static class DiffSingerDeclarations
             map.Add((KeyGender, L.Tr("Gender")), Continuous("#E5A573", GenderBaseline, GenderMin, GenderMax));
         if (config.UseSpeedEmbed)
             map.Add((KeySpeed, L.Tr("Speed")), Continuous("#73B5E5", SpeedBaseline, SpeedMin, SpeedMax));
+
+        // 音素混合比例包络（P3，实验）：始终暴露，逐帧 [0,1]、基线 0=不混合。目标音素在 per-phoneme 面板设；
+        //   仅重导出（带 tokens_b/blend 的动态 batch）acoustic 生效，老库合成期 HasInput gating 静默忽略。
+        map.Add((KeyMixCurve, L.Tr("Phoneme mix")), Continuous("#C79BF0", 0, 0, 1));
 
         // seed 轨：仅当 manifest 声明对应 retake 能力时暴露（连续、基线 0、量程 [0,SeedCurveMax]）。
         if (retake.Pitch)
@@ -203,8 +207,9 @@ public static class DiffSingerDeclarations
                 options.Add(new ComboBoxItem(PropertyValue.Create(id), display));
             props.Add((KeyLanguage, L.Tr("Language")), ComboBoxConfig.Create(options).WithDefault(PropertyValue.Create(string.Empty)));
         }
-        // 音素混合（P1-a）：目标音素输入框（裸符号，空 = 不混合）+ 语言下拉（多语言库才显示，默认 "" = 跟随本音素语言）+ 比例滑块 [0,1]。
-        //   调整任一项 → 宿主自动钉死该 note（写属性即 LockPhonemes）。目标符号在合成期按语言解析、查不到即不混（优雅降级）。
+        // 音素混合（P3 包络）：目标音素输入框（裸符号，空 = 不混合）+ 语言下拉（多语言库才显示，默认 "" = 跟随本音素语言）。
+        //   比例改由 part 级「Phoneme mix」包络曲线逐帧给（此处不再有比例滑块）。调整任一项 → 宿主自动钉死该 note。
+        //   目标符号在合成期按语言解析、查不到即不混（优雅降级）。
         props.Add((KeyMixPhoneme, L.Tr("Mix phoneme")), TextBoxConfig.Create());
         if (HasLanguageChoice(pc))
         {
@@ -213,7 +218,6 @@ public static class DiffSingerDeclarations
                 mixLangs.Add(new ComboBoxItem(PropertyValue.Create(id), display));
             props.Add((KeyMixLanguage, L.Tr("Mix language")), ComboBoxConfig.Create(mixLangs).WithDefault(PropertyValue.Create(string.Empty)));
         }
-        props.Add((KeyMixPhonemeRatio, L.Tr("Mix ratio")), SliderConfig.Linear(0, 0, 1));
         return ObjectConfig.Create(props);
     }
 
