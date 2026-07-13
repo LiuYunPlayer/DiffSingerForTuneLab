@@ -187,7 +187,9 @@ public sealed class DiffSingerModelCache : IDisposable
         }
         if (mProvider == "cpu")
         {
-            var cpu = new InferenceSession(modelPath);
+            // 见 RuntimeHost.LoadSession：onnxruntime 1.20.1 CPU EP 扩展层图优化在 DiffSinger 声学图上原生崩溃，封顶 BASIC。
+            var cpuOptions = new SessionOptions { GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_BASIC };
+            var cpu = new InferenceSession(modelPath, cpuOptions);
             mLogger.Info($"DiffSinger：加载 {fileName} · CPU");
             return new InProcessModelSession(cpu);
         }

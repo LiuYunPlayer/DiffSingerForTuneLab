@@ -99,6 +99,12 @@ public static class DiffSingerPitch
         // 音素混合（帧级）：目标流 encoder_out_b [1,nTokens,H] + 逐帧 blend [1,totalFrames] 喂 role 模型（条件级混合、去噪一次）。
         if (encTgt != null && model.HasInput("encoder_out_b"))
         {
+            // —— 诊断（临时）：打印实际喂入形状，定位 /pre/Unsqueeze_4 崩溃 ——
+            TuneLabContext.Global.GetLogger().Warning(
+                $"[phoneme-mix/pitch] nTokens={nTokens} totalFrames={totalFrames} blendPerFrame.Len={blendPerFrame!.Length} " +
+                $"encoder_out=[{string.Join(',', encDense.Dimensions.ToArray())}] " +
+                $"encoder_out_b=[{string.Join(',', encTgt.Dimensions.ToArray())}] " +
+                $"ph_dur.sum={phDur.Sum()} note_dur.sum={noteDur.Sum()} noteMidi.len={noteMidi.Length}");
             inputs.Add(NamedOnnxValue.CreateFromTensor("encoder_out_b", encTgt));
             inputs.Add(NvF("blend", blendPerFrame!, totalFrames));
         }
