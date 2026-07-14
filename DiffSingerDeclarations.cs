@@ -44,6 +44,8 @@ public static class DiffSingerDeclarations
 
     // 槽键：base:k（k 从 1）。号 = 张量槽行 k-1。
     public static string SlotKey(string baseKey, int slot) => $"{baseKey}:{slot}";
+    // 槽显示名：仅一槽时省略序号（key 不受影响，槽数变化时同一 key 显示名会跟着变）。
+    public static string SlotDisplay(string label, int slot, int slots) => slots == 1 ? label : $"{label} {slot}";
     // part 属性读槽数，clamp [0, MaxMixSlots]。
     public static int MixSlots(PropertyObject partProperties)
         => Math.Clamp((int)Math.Round(partProperties.GetDouble(KeyMixSlots, 0)), 0, MaxMixSlots);
@@ -92,7 +94,7 @@ public static class DiffSingerDeclarations
         // 音素混合比例包络：按槽数 N 生成 phoneme_mix:1..N（逐帧 [0,1]、基线 0）。仅能力声库暴露；目标音素在 per-phoneme 面板设。
         int mixSlots = HasPhonemeMix(pc) ? MixSlots(partProperties) : 0;
         for (int k = 1; k <= mixSlots; k++)
-            map.Add((SlotKey(KeyMixCurve, k), $"{L.Tr("Phoneme mix")} {k}"),
+            map.Add((SlotKey(KeyMixCurve, k), SlotDisplay(L.Tr("Phoneme mix"), k, mixSlots)),
                 Continuous(MixColors[(k - 1) % MixColors.Length], 0, 0, 1));
         return map;
     }
@@ -234,13 +236,13 @@ public static class DiffSingerDeclarations
         //   比例由 part 级「Phoneme mix k」包络曲线逐帧给。调整任一项 → 宿主自动钉死该 note；目标符号合成期按语言解析、查不到即不混。
         for (int k = 1; k <= slots; k++)
         {
-            props.Add((SlotKey(KeyMixPhoneme, k), $"{L.Tr("Mix phoneme")} {k}"), TextBoxConfig.Create());
+            props.Add((SlotKey(KeyMixPhoneme, k), SlotDisplay(L.Tr("Mix phoneme"), k, slots)), TextBoxConfig.Create());
             if (HasLanguageChoice(pc))
             {
                 var mixLangs = new List<ComboBoxItem> { new(PropertyValue.Create(string.Empty), L.Tr("(follow phoneme)")) };
                 foreach (var (id, display) in EffectiveLanguages(pc))
                     mixLangs.Add(new ComboBoxItem(PropertyValue.Create(id), display));
-                props.Add((SlotKey(KeyMixLanguage, k), $"{L.Tr("Mix language")} {k}"),
+                props.Add((SlotKey(KeyMixLanguage, k), SlotDisplay(L.Tr("Mix language"), k, slots)),
                     ComboBoxConfig.Create(mixLangs).WithDefault(PropertyValue.Create(string.Empty)));
             }
         }
