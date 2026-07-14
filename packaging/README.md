@@ -81,6 +81,7 @@ What it enables:
 - **Merging one person across multiple models** into a single top-level entry (data-retrain upgrades);
 - **Versioning** — multiple versions of the same lineage, auto-follow-latest or explicitly pinned;
 - **Retake capability declaration** — note-level pitch / variance / timbre retake requires the model to be built with the [externalized-noise build of DiffSinger](https://github.com/LiuYunPlayer/DiffSinger) (it exposes the diffusion noise as a `noise` input); standard exports cannot retake. Pitch / variance retake needs only **re-exporting** with it, while **acoustic (timbre) retake additionally requires retraining** with it. Declare only what your model actually supports;
+- **Phoneme-mix capability declaration** — frame-level phoneme mixing (morphing a sound between phonemes over time, see §5) requires the acoustic + pitch + variance models to be **re-exported** with a build that supports it; declare `phoneme_mix: true` after re-exporting to expose the feature;
 - **Localization** — model / singer / language names shown per the host language.
 
 Minimal example (`<model-folder>/tunelab.yaml`):
@@ -98,6 +99,8 @@ retake:                        # optional: only set true if the model truly supp
   variance: false
   acoustic: false
 
+phoneme_mix: true              # optional: all three models re-exported for frame-level phoneme mixing (see §5)
+
 voices:                        # optional: presence = whitelist; absent = one voice per model
   - { id: singer-a, speaker: spk_a, name: Singer A, name_i18n: { zh-CN: 歌手 A } }
   - { id: singer-b, speaker: spk_b, name: Singer B }
@@ -114,6 +117,7 @@ Field reference:
 | `version_label` | | human-readable version label (display only) |
 | `released` | | `YYYY` / `YYYY-MM` / `YYYY-MM-DD`, used for cross-model ordering |
 | `retake.{pitch,variance,acoustic}` | | declares retake support; all default `false` (not exposed). A wrong declaration won't crash — synthesis silently treats it as unsupported |
+| `phoneme_mix` | | declares frame-level phoneme-mix support; default `false` (not exposed). A wrong declaration won't crash — silently treated as unsupported |
 | `voices[]` | | exposed singer whitelist: `id`=global singer id, `speaker`=this model's dsconfig suffix, plus `name`/`name_i18n`/`default_language`/`portrait`/`color` |
 | `languages` | | language display-name overlay + whitelist (`id` must match a dsconfig language key) |
 
@@ -121,7 +125,22 @@ Field reference:
 
 ---
 
-## 5. Troubleshooting
+## 5. Phoneme mix (frame-level)
+
+> Only appears when the voicebank's `tunelab.yaml` declares `phoneme_mix: true` (see §4); voicebanks without it show no related controls.
+
+Morphs a sound **between phonemes over time** — e.g. an `a` gliding smoothly to `o` within a note — with timbre, pitch and variance moving together.
+
+1. In the **part properties**, set **"Phoneme mix slots"** to ≥1 (`0` = off).
+2. After one synthesis, each phoneme's property panel shows **"Mix phoneme k"** (target phoneme — type the bare symbol, e.g. `o`) + **"Mix language k"** (multi-language banks only; defaults to following this phoneme's language).
+3. The automation panel gets a **"Phoneme mix k"** curve — draw it to control **when / how much** (`0` = no mix, `1` = fully the target phoneme).
+4. **Multiple slots**: raise the slot count to mix toward several targets at once (independent target + curve per slot); when per-frame slot weights sum above `1` they are auto-normalized, so it won't break up.
+
+> Sweet spot: transitions **between same-family vowels** (a↔o, e↔i) sound most natural; cross-category (vowel↔consonant) is not guaranteed.
+
+---
+
+## 6. Troubleshooting
 
 - **Model missing from the singer list** → verify the folder has **both** `dsconfig.yaml` and `character.yaml` (or `.txt`); confirm it's under the default dir or a dir you added in settings; settings changes auto-rescan.
 - **No sound after synthesis** → see §2; usually a missing or misnamed vocoder.
