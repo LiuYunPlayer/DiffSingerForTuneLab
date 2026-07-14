@@ -61,10 +61,11 @@ public static class DiffSingerDeclarations
 
     // 编辑轨（delta 语义）归一化到小数：energy/breath/tension 中性 0、量程 [-1,1]；voicing 中性 1、量程 [0,1]。
     //   Delta(x=预测声学值, y=用户归一化值) 系数随之 ×100：y=1 等价旧 y=100（energy/breath ±12dB、tension ±5）。
-    //   AcousticMin/Max 为回显轨的真实声学单位（dB）值域，保持不变。
-    //   voicing 有意偏离 OpenUtau（其满偏 −12dB 够不着静音底、无法做纯气声段）：线性+三次幂混合，
-    //     y→1 斜率精确 = 基准 12dB/满程（手感一致）、y=0 恒精确触底 −96；消声点实测 ≈ y 0.4。
-    //     预测 < −84dB 的帧中段轻微下越 −96，由合成期 clamp 兜住。详见 schema 文档 §14.2。
+    //   AcousticMin/Max 为回显轨的真实声学单位（dB）值域；EditMin/Max 兼作合成期输入 clamp（宿主数据层无量程硬契约）。
+    //   voicing 有意偏离 OpenUtau（其满偏 −12dB 够不着静音底、无法做纯气声段）：饱和有理项 + 十二次幂跳水项，
+    //     y→1 斜率 48（浅笔即可闻）、消声点实测 ≈ y 0.2、y=0 恒精确触底 −96。导数刻意非单调（先陡后缓再跳水）：
+    //     起步斜率 48 > 可听区平均斜率 ~32，中段必须放缓找平，末端 ~70dB 挤在最后两成行程——三项需求联立的必然形状，勿当 bug 修。
+    //     预测 < −72dB 的帧（本就近静音）中段轻微下越 −96，由合成期 clamp 兜住。详见 schema 文档 §14.2。
     public static readonly VarianceSpec[] Variances =
     {
         new("energy",      "Energy",      "#E573A5", c => c.UseEnergyEmbed,      c => c.PredictEnergy,      -1, 1, 0, -96, 0, (x, y) => x + y * 12),

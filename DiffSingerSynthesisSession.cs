@@ -579,7 +579,11 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         for (int f = 0; f < n; f++)
         {
             float x = predicted == null ? 0f : (f < predicted.Length ? predicted[f] : predicted[^1]);
-            double y = user != null && !double.IsNaN(user[f]) ? user[f] : spec.Neutral;
+            // 用户值钳到编辑量程：宿主 UI 落笔时钳制，但数据层无硬契约（锚点+默认值合成、跨引擎同 key 复用、
+            //   手改工程皆可越界），而 voicing 的幂式对越界输入极敏感（偶次幂/分母变号），必须本地兜底。
+            double y = user != null && !double.IsNaN(user[f])
+                ? Math.Clamp(user[f], spec.EditMin, spec.EditMax)
+                : spec.Neutral;
             result[f] = (float)Math.Clamp(spec.Delta(x, (float)y), spec.AcousticMin, spec.AcousticMax);
         }
         return result;
