@@ -79,10 +79,11 @@ public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSet
 
     public IReadOnlyList<ObjectConfig> GetPhonemePropertyConfigs(IVoiceSynthesisNotePropertyContext context)
     {
-        // per-phoneme 面板 = 语言覆盖（多语言）+ N 组音素混合目标（N = part 属性 phoneme_mix_slots）。
+        // per-phoneme 面板 = 语言覆盖（多语言）+ N 组音素混合目标（N = part 属性 phoneme_mix_slots，仅能力声库）。
         if (Resolve(context.Part.VoiceId, context.Part.PartProperties) is not { } pc)
             return [];
-        var phonemeConfig = DiffSingerDeclarations.BuildPhonemeConfig(pc, DiffSingerDeclarations.MixSlots(context.Part.PartProperties));
+        int slots = DiffSingerDeclarations.HasPhonemeMix(pc) ? DiffSingerDeclarations.MixSlots(context.Part.PartProperties) : 0;
+        var phonemeConfig = DiffSingerDeclarations.BuildPhonemeConfig(pc, slots);
         return context.Notes.SelectMany(n => n.Phonemes).Select(_ => phonemeConfig).ToList();
     }
 

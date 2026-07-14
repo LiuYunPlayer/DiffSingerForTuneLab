@@ -33,6 +33,7 @@ internal static class L
             ["(follow phoneme)"] = "（跟随音素）",
             ["Phoneme mix"] = "音素混合",
             ["Phoneme mix slots"] = "音素混合槽数",
+            ["Phoneme mix slots"] = "音素混合槽数",
             ["Gender"] = "性别",
             ["Speed"] = "语速",
             ["Energy"] = "能量",

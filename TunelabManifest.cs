@@ -27,6 +27,10 @@ public sealed class TunelabManifest
     public bool RetakePitch { get; private init; }
     public bool RetakeVariance { get; private init; }
 
+    // 音素混合能力：模型（acoustic + pitch/variance role）已重导出、带 tokens_b/blend/encoder_out_b 输入。
+    //   缺省 false ⇒ 不暴露音素混合 UI（老库/未重导出的库）。
+    public bool PhonemeMix { get; private init; }
+
     public string? DefaultLanguage { get; private init; }
     // 语言显示叠加（id 必须匹配 dsconfig 语言表的键）；空 = 不限定，用 dsconfig 全部、显示裸 id。
     public IReadOnlyList<ManifestLanguage> Languages { get; private init; } = [];
@@ -66,6 +70,7 @@ public sealed class TunelabManifest
                 RetakeAcoustic = dto.retake?.acoustic ?? false,
                 RetakePitch = dto.retake?.pitch ?? false,
                 RetakeVariance = dto.retake?.variance ?? false,
+                PhonemeMix = dto.phoneme_mix ?? false,
                 DefaultLanguage = NullIfBlank(dto.languages?.@default),
                 Languages = (dto.languages?.expose ?? new())
                     .Where(e => !string.IsNullOrWhiteSpace(e.id))
@@ -128,6 +133,7 @@ public sealed class TunelabManifest
         [YamlMember(Alias = "version_label_i18n")] public Dictionary<string, string>? version_label_i18n { get; set; }
         public string? released { get; set; }
         public RetakeDto? retake { get; set; }
+        [YamlMember(Alias = "phoneme_mix")] public bool? phoneme_mix { get; set; }
         public LanguagesDto? languages { get; set; }
         public List<VoiceDto>? voices { get; set; }
     }

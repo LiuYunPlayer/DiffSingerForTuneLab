@@ -191,7 +191,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
 
     // 推理链（worker，只读冻结快照）：忠实移植 OpenUtau phonemizer + renderer（见记忆 openutau-is-authority）。
     //   phonemizer(dsdur) → 音素时间线；renderer 加 head/tail SP padding、tokens[SP..SP]、durations[8..8]、
-    //   f0(Hz over totalFrames)、variance 预测+用户 delta 合成喂声学（纯预测产回显轨）、spk by frame、depth/steps。
+    //   f0(Hz over totalFrames)、variance 预测+用户 delta 合成喂声学（同一份实参产回显轨）、spk by frame、depth/steps。
     //   gender/velocity 走用户曲线 + OpenUtau GENC/VELC convert；pitch 自由区走 dspitch 预测轮廓、已画处用户值覆盖。
     RenderResult? Render(VoiceSynthesisSnapshot snapshot, IReadOnlyList<IVoiceSynthesisNote> origins,
         IProgress<double>? progress, CancellationToken cancellation)
@@ -219,8 +219,8 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
             : (config.Speakers.Count > 0 ? config.Speakers[0] : string.Empty);
         var noteLang = notes.Select(nt => nt.Properties.GetString(KeyLanguage, partLang)).ToArray();
 
-        // —— Phonemizer：歌词 → 音素时间线（绝对秒、含前置辅音越界）；mixSlots 决定逐音素读几组混合目标 ——
-        int mixSlots = MixSlots(snapshot.PartProperties);
+        // —— Phonemizer：歌词 → 音素时间线（绝对秒、含前置辅音越界）；mixSlots 决定逐音素读几组混合目标（仅能力声库）——
+        int mixSlots = HasPhonemeMix(pc) ? MixSlots(snapshot.PartProperties) : 0;
         var durPred = models.GetPredictor("dsdur");
         var phones = durPred != null
             ? DiffSingerPhonemizer.Phonemize(durPred, notes, noteLang, speaker, hop, sr, mTensorCache, mixSlots)
@@ -355,7 +355,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         if (cancellation.IsCancellationRequested)
             return null;
 
-        // —— variance 预测（基线；下方与用户 delta 合成喂声学、纯预测产回显）——
+        // —— variance 预测（基线；下方与用户 delta 合成喂声学、同一份实参产回显）——
         var varCurves = DiffSingerVariance.Predict(
             models.GetPredictor("dsvariance"), phones,
             durations, semis, speakerMix, config, mSamplingSteps, seedVarianceCurve, mTensorCache, blendRows);
@@ -386,9 +386,9 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         AddF("blend", blendFlat, new[] { mixRows, nFrames });
         AddF("f0", f0, new[] { 1, nFrames });
 
-        // —— variance：预测 + 用户 delta 合成喂声学，同时产纯预测回显 ——
+        // —— variance：预测 + 用户 delta 合成喂声学，同一份实参产回显 ——
         //   用户曲线按帧求值（连续轨：未编辑处=中性基线 → Delta 恒得纯预测；编辑处 → 叠加），clamp 到声学值域。
-        //   回显（Use && Predict）= 纯预测值，不含用户编辑。
+        //   回显（Use && Predict）= 实参（预测 + 用户 delta、clamp 后）——与 pitch 回显同语义：所见即喂给声学的值。
         var varReadback = new Dictionary<string, IReadOnlyList<Point>>();
         foreach (var spec in Variances)
         {
@@ -396,12 +396,13 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
             double[]? user = snapshot.Automations.TryGetValue(spec.Key, out var auto)
                 ? auto.Evaluator.Evaluate(frameTimes)
                 : null;
+            var combined = CombineVariance(spec, predicted, user, nFrames);
 
             if (ac.HasInput(spec.Key))
-                AddF(spec.Key, CombineVariance(spec, predicted, user, nFrames), new[] { 1, nFrames });
+                AddF(spec.Key, combined, new[] { 1, nFrames });
 
             if (spec.Use(config) && spec.Predict(config) && predicted != null)
-                varReadback[spec.Key] = BuildReadbackSegment(spec, predicted, frameTimes, nFrames);
+                varReadback[spec.Key] = BuildReadbackSegment(spec, combined, frameTimes, nFrames);
         }
 
         // —— gender / velocity：纯用户曲线（无方差器基线），按帧 convert 喂声学（忠实移植 OpenUtau GENC/VELC）——
@@ -626,7 +627,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
     // VELC convert（OpenUtau DiffSingerRenderer）：对数标度，speed 归一化后 1 = 原速，每 +1 速度 ×2。
     static double SpeedConvert(double x) => Math.Pow(2, x - 1);
 
-    // 回显段：纯预测值（不含用户编辑），clamp 到声学值域，逐帧 (全局秒, 值)。
+    // 回显段：实参（预测 + 用户 delta 合成后），clamp 到声学值域，逐帧 (全局秒, 值)。
     static List<Point> BuildReadbackSegment(VarianceSpec spec, float[] predicted, double[] frameTimes, int n)
     {
         var points = new List<Point>(n);
@@ -661,7 +662,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         }
     }
 
-    // 回显产物（数据线程发布、可跨线程读）：按声明的回显轨 key 聚合各 piece 的纯预测段（每 piece 一段、段间断开）。
+    // 回显产物（数据线程发布、可跨线程读）：按声明的回显轨 key 聚合各 piece 的实参段（每 piece 一段、段间断开）。
     public IReadOnlyMap<string, SynthesizedParameter> SynthesizedParameters
     {
         get

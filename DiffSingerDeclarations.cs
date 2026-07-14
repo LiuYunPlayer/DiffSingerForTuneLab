@@ -74,6 +74,9 @@ public static class DiffSingerDeclarations
     public static (bool Acoustic, bool Pitch, bool Variance) RetakeOf(ResolvedVoice resolved)
         => resolved.Manifest is { } m ? (m.RetakeAcoustic, m.RetakePitch, m.RetakeVariance) : (false, false, false);
 
+    // 音素混合能力（manifest phoneme_mix；legacy/未重导出 → false ⇒ 不暴露任何音素混合 UI）。
+    public static bool HasPhonemeMix(PartContext pc) => pc.Resolved.Manifest?.PhonemeMix ?? false;
+
     // —— 自动化轨（可编辑曲线）= 固定轨 + 已启用的说话人混合轨 ——
     public static OrderedMap<PropertyKey, AutomationConfig> BuildAutomationConfigs(PartContext pc, PropertyObject partProperties)
     {
@@ -81,8 +84,8 @@ public static class DiffSingerDeclarations
         var set = SpeakerSet.Compute(pc.Resolved);
         foreach (var (suffix, display, color) in SelectedMixTracks(set, partProperties))
             map.Add((KeyMixPrefix + suffix, display), Continuous(color, 0, 0, 1));   // 混合权重归一化 [0,1]（0=不混入）
-        // 音素混合比例包络：按槽数 N 生成 phoneme_mix:1..N（逐帧 [0,1]、基线 0）。目标音素在 per-phoneme 面板设。
-        int mixSlots = MixSlots(partProperties);
+        // 音素混合比例包络：按槽数 N 生成 phoneme_mix:1..N（逐帧 [0,1]、基线 0）。仅能力声库暴露；目标音素在 per-phoneme 面板设。
+        int mixSlots = HasPhonemeMix(pc) ? MixSlots(partProperties) : 0;
         for (int k = 1; k <= mixSlots; k++)
             map.Add((SlotKey(KeyMixCurve, k), $"{L.Tr("Phoneme mix")} {k}"),
                 Continuous(MixColors[(k - 1) % MixColors.Length], 0, 0, 1));
@@ -130,7 +133,7 @@ public static class DiffSingerDeclarations
         }
     }
 
-    // 只读回显轨：仅当声学接受该量为输入且方差器能产基线时——显示方差器纯预测。
+    // 只读回显轨：仅当声学接受该量为输入且方差器能产基线时——显示实参（预测 + 用户 delta 合成后）。
     public static OrderedMap<PropertyKey, AutomationConfig> BuildReadbackConfigs(VoicebankConfig config)
     {
         var map = new OrderedMap<PropertyKey, AutomationConfig>();
@@ -171,9 +174,10 @@ public static class DiffSingerDeclarations
         if (set.Options.Any(o => o.Suffix != set.DefaultSuffix))
             properties.Add((KeyMix, L.Tr("Speaker mix")), BuildSpeakerMixConfig(set, mergedProps));
 
-        // 音素混合槽数：0=关；调到 N → 自动化面板出 N 条 phoneme_mix:k 曲线、每个音素出 N 组目标音素/语言。
-        properties.Add((KeyMixSlots, L.Tr("Phoneme mix slots")),
-            DraggableNumberBoxConfig.Integer(0).WithRange(0, MaxMixSlots));
+        // 音素混合槽数（仅能力声库暴露）：0=关；调到 N → 自动化面板出 N 条 phoneme_mix:k 曲线、每个音素出 N 组目标音素/语言。
+        if (HasPhonemeMix(pc))
+            properties.Add((KeyMixSlots, L.Tr("Phoneme mix slots")),
+                DraggableNumberBoxConfig.Integer(0).WithRange(0, MaxMixSlots));
 
         return ObjectConfig.Create(properties);
     }
