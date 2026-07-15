@@ -61,19 +61,23 @@ public static class DiffSingerDeclarations
         double AcousticMin, double AcousticMax,
         Func<float, float, float> Delta);
 
-    // 编辑轨（delta 语义）归一化到小数：energy/breath/tension 中性 0、量程 [-1,1]；voicing 中性 1、量程 [0,1]。
+    // 编辑轨（delta 语义）归一化到小数：energy/breath/tension 中性 0、量程 [-1,1]；voicing 中性 1、量程 [0,1.25]。
     //   Delta(x=预测声学值, y=用户归一化值) 系数随之 ×100：y=1 等价旧 y=100（energy/breath ±12dB、tension ±5）。
     //   AcousticMin/Max 为回显轨的真实声学单位（dB）值域；EditMin/Max 兼作合成期输入 clamp（宿主数据层无量程硬契约）。
-    //   voicing 有意偏离 OpenUtau（其满偏 −12dB 够不着静音底、无法做纯气声段）：饱和有理项 + 十二次幂跳水项，
-    //     y→1 斜率 48（浅笔即可闻）、消声点实测 ≈ y 0.2、y=0 恒精确触底 −96。导数刻意非单调（先陡后缓再跳水）：
-    //     起步斜率 48 > 可听区平均斜率 ~32，中段必须放缓找平，末端 ~70dB 挤在最后两成行程——三项需求联立的必然形状，勿当 bug 修。
-    //     预测 < −72dB 的帧（本就近静音）中段轻微下越 −96，由合成期 clamp 兜住。详见 schema 文档 §14.2。
+    //   voicing 有意偏离 OpenUtau（其满偏 −12dB 够不着静音底、无法做纯气声段），分两支：
+    //     下行（y≤1）饱和有理项 + 十二次幂跳水项：起步斜率 48（浅笔即可闻）、消声点实测 ≈ y 0.2、y=0 恒精确触底 −96。
+    //       导数刻意非单调（先陡后缓再跳水）：起步斜率 48 > 可听区平均斜率 ~32，中段必须放缓找平，
+    //       末端 ~70dB 挤在最后两成行程——三项需求联立的必然形状，勿当 bug 修。
+    //     上行（y>1）线性 +48(y−1)：满偏 1.25 = +12dB（与 energy 正向满偏对齐、避开 0dBFS 过载区）；
+    //       中性线两侧斜率相等（48）、过线无顿挫（仅二阶导跳变）。
+    //     预测 < −72dB 的帧（本就近静音）下行中段轻微下越 −96，由合成期 clamp 兜住。详见 schema 文档 §14.2。
     public static readonly VarianceSpec[] Variances =
     {
         new("energy",      "Energy",      "#E573A5", c => c.UseEnergyEmbed,      c => c.PredictEnergy,      -1, 1, 0, -96, 0, (x, y) => x + y * 12),
         new("breathiness", "Breathiness", "#73E5C2", c => c.UseBreathinessEmbed, c => c.PredictBreathiness, -1, 1, 0, -96, 0, (x, y) => x + y * 12),
-        new("voicing",     "Voicing",     "#C2E573", c => c.UseVoicingEmbed,     c => c.PredictVoicing,      0, 1, 1, -96, 0,
-            (x, y) => x - 48 * (1 - y) / (2 - y) - (x + 72) * MathF.Pow(1 - y, 12)),
+        new("voicing",     "Voicing",     "#C2E573", c => c.UseVoicingEmbed,     c => c.PredictVoicing,      0, 1.25, 1, -96, 0,
+            (x, y) => y > 1 ? x + 48 * (y - 1)
+                            : x - 48 * (1 - y) / (2 - y) - (x + 72) * MathF.Pow(1 - y, 12)),
         new("tension",     "Tension",     "#A573E5", c => c.UseTensionEmbed,     c => c.PredictTension,     -1, 1, 0, -10, 10, (x, y) => x + y * 5),
     };
 
