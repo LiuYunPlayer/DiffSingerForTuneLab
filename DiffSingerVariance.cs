@@ -7,8 +7,9 @@ using Microsoft.ML.OnnxRuntime.Tensors;
 namespace DiffSingerForTuneLab;
 
 // variance 预测器（dsvariance）：忠实移植 OpenUtau DsVariance.Process。
-//   linguistic(词模式：word_div/word_dur 由已知 ph_dur 按元音分组) + variance；
-//   energy/breathiness/voicing/tension 基值喂 0 + retake 全 true → 全量预测；pitch 输入为半音；输出预测曲线。
+//   linguistic(词模式：word_div/word_dur 由已知 ph_dur 按元音分组) + variance；pitch 输入为半音；输出预测曲线。
+//   seed 轨驱动帧级 retake mask（对齐 acoustic/pitch）：全保留/全重摇单趟全量预测（基值 0、retake 全 true），
+//   混合时先 seed=0 算 take-0 参照、再正式趟 retake=逐帧 mask（单轨广播到全部通道）+ 各通道口喂参照 ⇒ 保留帧钉住。
 // 当前阶段只把预测值喂声学（无用户编辑/回显——留作下一阶段）。
 public readonly record struct VarianceCurves(float[]? Energy, float[]? Breathiness, float[]? Voicing, float[]? Tension)
 {
@@ -89,24 +90,13 @@ public static class DiffSingerVariance
         };
 
         // 预测通道（顺序固定 energy→breathiness→voicing→tension，仅 predict_* 为真者参与）。
+        //   通道基值 / retake / noise 不进共享条件，按下方重摇逻辑逐趟追加。
         var channels = new List<string>();
-        void Channel(bool predict, string name)
-        {
-            if (!predict) return;
-            channels.Add(name);
-            if (model.HasInput(name))
-                inputs.Add(NvF(name, new float[totalFrames], totalFrames));   // 基值 0（retake 全 true 故忽略）
-        }
-        Channel(cfg.PredictEnergy, "energy");
-        Channel(cfg.PredictBreathiness, "breathiness");
-        Channel(cfg.PredictVoicing, "voicing");
-        Channel(cfg.PredictTension, "tension");
-
+        if (cfg.PredictEnergy) channels.Add("energy");
+        if (cfg.PredictBreathiness) channels.Add("breathiness");
+        if (cfg.PredictVoicing) channels.Add("voicing");
+        if (cfg.PredictTension) channels.Add("tension");
         int numVar = channels.Count;
-        var retake = new bool[totalFrames * numVar];
-        Array.Fill(retake, true);
-        inputs.Add(NamedOnnxValue.CreateFromTensor("retake",
-            new DenseTensor<bool>(retake, new[] { 1, totalFrames, numVar })));
 
         // 音素混合（帧级，N 槽）：role 模型把 encoder_out_b/blend 列为**必需**输入（导出恒有），故只要模型声明就**总是**喂。
         //   逐槽 r：目标流编码出一行 encoder_out_b[r]（该槽无目标 ⇒ 复用 base）；blend[r]=blendRows[r]。S=mixRows(≥1)；
@@ -139,16 +129,56 @@ public static class DiffSingerVariance
                 new DenseTensor<float>(spk, new[] { 1, totalFrames, hidden })));
         }
 
-        DiffSingerNoise.AddNoise(inputs, model, seedPerFrame, DiffSingerNoise.StageVariance, totalFrames);
+        // —— 帧级 seed retake（与 acoustic/pitch 同语义）：seed≠0 的帧重摇、seed=0 的帧保留 take-0。
+        //   openvpi 导出保留帧条件 = variance_embed(基值)*~retake ⇒ 保留帧把 take-0 参照喂进各通道口即被钉住；
+        //   重摇帧基值被 ~retake 乘 0 屏蔽。retake 2D [1,T,numVar]：单一 seed 轨逐帧广播到全部通道。
+        //   · 非混合 → 单趟：基值 0、retake 全 true、噪声按 seed 轨（全 0 即 take-0）。
+        //   · 混合 → 先算 take-0 参照（同单趟但噪声 seed=0；输入恒定 → 张量缓存只算一次），
+        //     再正式趟（retake=逐帧、基值=参照、噪声按 seed 轨）。参照确定性重算，不记忆上次输出。
+        VarianceCurves RunVariance(VarianceCurves bases, bool[] frameMask, uint[]? seeds)
+        {
+            var ins = new List<NamedOnnxValue>(inputs);
+            foreach (var name in channels)
+                if (model.HasInput(name))
+                    ins.Add(NvF(name, bases[name] ?? new float[totalFrames], totalFrames));
+            var retake = new bool[totalFrames * numVar];
+            for (int f = 0; f < totalFrames; f++)
+                if (frameMask[f])
+                    for (int c = 0; c < numVar; c++)
+                        retake[f * numVar + c] = true;
+            ins.Add(NamedOnnxValue.CreateFromTensor("retake",
+                new DenseTensor<bool>(retake, new[] { 1, totalFrames, numVar })));
+            if (seeds != null)
+                DiffSingerNoise.AddNoise(ins, model, seeds, DiffSingerNoise.StageVariance, totalFrames);
+            else
+                DiffSingerNoise.AddNoise(ins, model, 0u, DiffSingerNoise.StageVariance, totalFrames);
+            var outputs = DiffSingerTensorCache.Run(model, v.ModelHash("variance"), ins, tensorCache);
+            float[]? Out(bool predict, string name)
+                => predict ? outputs.First(o => o.Name == name).AsTensor<float>().ToArray() : null;
+            return new VarianceCurves(
+                Out(cfg.PredictEnergy, "energy_pred"),
+                Out(cfg.PredictBreathiness, "breathiness_pred"),
+                Out(cfg.PredictVoicing, "voicing_pred"),
+                Out(cfg.PredictTension, "tension_pred"));
+        }
 
-        var outputs = DiffSingerTensorCache.Run(model, v.ModelHash("variance"), inputs, tensorCache);
-        float[]? Out(bool predict, string name)
-            => predict ? outputs.First(o => o.Name == name).AsTensor<float>().ToArray() : null;
-        return new VarianceCurves(
-            Out(cfg.PredictEnergy, "energy_pred"),
-            Out(cfg.PredictBreathiness, "breathiness_pred"),
-            Out(cfg.PredictVoicing, "voicing_pred"),
-            Out(cfg.PredictTension, "tension_pred"));
+        var allTrue = new bool[totalFrames];
+        Array.Fill(allTrue, true);
+        var mask = new bool[totalFrames];
+        bool anyKeep = false, anyReroll = false;
+        for (int f = 0; f < totalFrames; f++)
+        {
+            bool rr = seedPerFrame[Math.Min(f, seedPerFrame.Length - 1)] != 0;
+            mask[f] = rr;
+            anyReroll |= rr;
+            anyKeep |= !rr;
+        }
+
+        if (!(anyKeep && anyReroll))
+            return RunVariance(default, allTrue, seedPerFrame);
+
+        var reference = RunVariance(default, allTrue, null);   // take-0 参照
+        return RunVariance(reference, mask, seedPerFrame);
     }
 
     static void AddAccel(List<NamedOnnxValue> inputs, IModelSession model, VoicebankConfig cfg, int steps)

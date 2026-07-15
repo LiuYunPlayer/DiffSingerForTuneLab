@@ -251,7 +251,8 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
 
         // pitch / variance 的 seed 自动化轨 → 逐帧 seed：归一化 [0,1] 放大到 uint32（哈希白化，刻度不影响质量）。
         //   平线 = 全局 take；画区段 = 该区独立 take（时间维 × 值维）。无轨/未画/NaN → 0（= 保留 take-0）。
-        //   只有精确 v=0 映成 seed 0；任何画上去的 v>0 都映成非零 → 触发该帧重摇（acoustic retake mask 命门）。
+        //   只有精确 v=0 映成 seed 0；任何画上去的 v>0 都映成非零 → 触发该帧重摇
+        //   （retake mask 命门，acoustic/pitch/variance 三域同语义：seed≠0 ⇒ retake=true）。
         uint[] SampleSeedCurve(string key)
         {
             var seeds = new uint[nFrames];
@@ -326,7 +327,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
             for (int k = 0; k < durations[seg]; k++) framePitch[fi++] = pitch;
         }
 
-        // —— dspitch 自然音高预测（纯从音符、retake 全 true、不吃用户音高）：替代自由区的矩形 note-step 兜底 ——
+        // —— dspitch 自然音高预测（纯从音符、不吃用户音高；seed 轨帧级 retake mask 在预测器内部处理）：替代自由区的矩形 note-step 兜底 ——
         //   用户已画处（Pitch 非 NaN）用户值覆盖；NaN 自由区用预测轮廓（无 dspitch ⇒ 仍用矩形 framePitch）；PITD/vibrato 叠加在上。
         var predictedPitch = DiffSingerPitch.Predict(
             models.GetPredictor("dspitch"), phones, notes, durations,
