@@ -11,6 +11,10 @@ using DiffSingerForTuneLab;   // 链接进来的运行时核心（IModelSession 
 //   或设环境变量 DIFFSINGER_VOICE_ROOT / DIFFSINGER_VOCODER_DIR 后直接 dotnet run。
 // 一切声库相关标识（speaker、音素、语言）均从配置/文件运行时解析，源码不写入任何敏感名。
 
+// 无模型自检：mulaw voicing 编解码数值契约（三明治转换，见 VoicingDomainCodec / schema §14.2）。
+if (args.Contains("--mulaw-codec"))
+    return MulawCodecSelfTest();
+
 var positional = args.Where(a => !a.StartsWith("--")).ToArray();
 string? voiceRoot = ArgOrEnv(positional, 0, "DIFFSINGER_VOICE_ROOT");
 string? vocoderDir = ArgOrEnv(positional, 1, "DIFFSINGER_VOCODER_DIR");
@@ -719,6 +723,38 @@ static void WriteWav(string path, float[] samples, int sampleRate)
     w.Write(dataBytes);
     foreach (var s in samples)
         w.Write((short)(Math.Clamp(s, -1f, 1f) * short.MaxValue));
+}
+
+// mulaw voicing 编解码自检：锚点参考值（独立推导）+ 全值域往返 + 真零特判。全过返 0。
+static int MulawCodecSelfTest()
+{
+    var codec = new DiffSingerForTuneLab.VoicingDomainCodec(255);
+    bool ok = true;
+    void Check(string name, double actual, double expect, double tol)
+    {
+        bool pass = Math.Abs(actual - expect) <= tol;
+        ok &= pass;
+        Console.WriteLine($"  [{(pass ? "PASS" : "FAIL")}] {name}: {actual:F4}（期望 {expect:F4} ±{tol}）");
+    }
+
+    Console.WriteLine("锚点（μ=255）：");
+    Check("WireToDb(0) 满刻度=0dB", codec.WireToDb(0f), 0, 1e-3);
+    Check("WireToDb(-48) m=0.5→a=15/255", codec.WireToDb(-48f), -24.6090, 1e-3);   // 20·log10(15/255)
+    Check("WireToDb(-96) 真零→地板", codec.WireToDb(-96f), -96, 0);
+    Check("DbToWire(0)", codec.DbToWire(0f), 0, 1e-3);
+    Check("DbToWire(-12) a=10^-0.6", codec.DbToWire(-12f), -23.7174, 1e-3);        // 96·ln(1+255a)/ln256−96
+    Check("DbToWire(-96) 触底特判=精确-96", codec.DbToWire(-96f), -96, 0);
+    Check("DbToWire(-95.999)≠-96（特判仅触底）", codec.DbToWire(-95.999f) > -96 ? 1 : 0, 1, 0);
+
+    Console.WriteLine("往返（wire→dB→wire，全值域步进 0.25）：");
+    double worst = 0;
+    for (float w = -95.75f; w <= 0f; w += 0.25f)
+        worst = Math.Max(worst, Math.Abs(codec.DbToWire(codec.WireToDb(w)) - w));
+    Check("最大往返误差", worst, 0, 1e-3);
+    Check("往返 -96 恒 -96", codec.DbToWire(codec.WireToDb(-96f)), -96, 0);
+
+    Console.WriteLine(ok ? "mulaw codec 自检全过" : "mulaw codec 自检有 FAIL");
+    return ok ? 0 : 1;
 }
 
 // dsdict-{lang}.yaml 结构：entries: - {grapheme, phonemes:[...]}。

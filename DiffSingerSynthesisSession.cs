@@ -390,6 +390,9 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         // —— variance：预测 + 用户 delta 合成喂声学，同一份实参产回显 ——
         //   用户曲线按帧求值（连续轨：未编辑处=中性基线 → Delta 恒得纯预测；编辑处 → 叠加），clamp 到声学值域。
         //   回显（Use && Predict）= 实参（预测 + 用户 delta、clamp 后）——与 pitch 回显同语义：所见即喂给声学的值。
+        //   mulaw 声库（voicing_domain）三明治：预测解码成 dB 进公式、出公式编码回线上域喂声学；
+        //   公式/回显/clamp 恒 dB 语义（见 VoicingDomainCodec 与 schema §14.2）。db 声库 codec=null、路径不变。
+        var voicingCodec = VoicingDomainCodec.For(config.VoicingDomain, config.VoicingMu);
         var varReadback = new Dictionary<string, IReadOnlyList<Point>>();
         foreach (var spec in Variances)
         {
@@ -397,10 +400,12 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
             double[]? user = snapshot.Automations.TryGetValue(spec.Key, out var auto)
                 ? auto.Evaluator.Evaluate(frameTimes)
                 : null;
-            var combined = CombineVariance(spec, predicted, user, nFrames);
+            var codec = spec.Key == "voicing" ? voicingCodec : null;
+            var combined = CombineVariance(spec, predicted, user, nFrames, codec);
 
             if (ac.HasInput(spec.Key))
-                AddF(spec.Key, combined, new[] { 1, nFrames });
+                AddF(spec.Key, codec == null ? combined : Array.ConvertAll(combined, codec.DbToWire),
+                    new[] { 1, nFrames });
 
             if (spec.Use(config) && spec.Predict(config) && predicted != null)
                 varReadback[spec.Key] = BuildReadbackSegment(spec, combined, frameTimes, nFrames);
@@ -574,12 +579,16 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
 
     // 预测 x 与用户值 y（UI 单位，NaN 自由区代入中性）按 OpenUtau delta 函数合成，clamp 到声学值域。
     //   预测缺失（null，即 !Predict 而声学仍需该输入）→ 以 0 为基线降级，仅叠加用户 delta。
-    static float[] CombineVariance(VarianceSpec spec, float[]? predicted, double[]? user, int n)
+    //   codec 非空（mulaw voicing）：预测是模型线上值、先解码成 dB 再进公式；返回值恒 dB 语义
+    //   （回显直接用，喂声学前由调用方编码回线上域）。
+    static float[] CombineVariance(VarianceSpec spec, float[]? predicted, double[]? user, int n,
+        VoicingDomainCodec? codec = null)
     {
         var result = new float[n];
         for (int f = 0; f < n; f++)
         {
             float x = predicted == null ? 0f : (f < predicted.Length ? predicted[f] : predicted[^1]);
+            if (codec != null) x = codec.WireToDb(x);
             // 用户值钳到编辑量程：宿主 UI 落笔时钳制，但数据层无硬契约（锚点+默认值合成、跨引擎同 key 复用、
             //   手改工程皆可越界），而 voicing 的幂式对越界输入极敏感（偶次幂/分母变号），必须本地兜底。
             double y = user != null && !double.IsNaN(user[f])
