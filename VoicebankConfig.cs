@@ -71,10 +71,12 @@ public sealed class VoicebankConfig
 
     // 方差器能否自动产出该量（predict_*）：true ⇒ 自由区有基线，回显有意义。
     // 能量/气声默认 true、发声/张力默认 false——仅当方差配置存在时这些默认才适用。
+    // mouth_opening 默认 false（与 use_mouth_opening_embed 解耦，仅方差器自身输出通道）。
     public bool PredictEnergy { get; private init; }
     public bool PredictBreathiness { get; private init; }
     public bool PredictVoicing { get; private init; }
     public bool PredictTension { get; private init; }
+    public bool PredictMouthOpening { get; private init; }
 
     // —— voicing 线上编码域（fork feat/mulaw-voicing 实验声库）——
     // "db"（缺省 = 历史声库）或 "mulaw"（binarize 期谐波 RMS 压 mu-law 后线性映射到 [-96,0] 伪装 dB）。
@@ -138,6 +140,7 @@ public sealed class VoicebankConfig
             PredictBreathiness = variance is not null && GetBool(variance, "predict_breathiness", true),
             PredictVoicing = predictVoicing,
             PredictTension = variance is not null && GetBool(variance, "predict_tension", false),
+            PredictMouthOpening = variance is not null && GetBool(variance, "predict_mouth_opening", false),
             VoicingDomain = voicingDomain,
             VoicingMu = voicingMu,
         };
