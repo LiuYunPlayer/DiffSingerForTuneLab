@@ -415,6 +415,8 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         //   无轨 / NaN 自由区 → 中性 → convert 得中性 embed（gender 0、velocity 1）；OpenUtau 不 clamp（UI 量程已界定）。
         AddF("gender", BuildCurveInput(snapshot, KeyGender, GenderBaseline, GenderConvert(config), frameTimes, nFrames), new[] { 1, nFrames });
         AddF("velocity", BuildCurveInput(snapshot, KeySpeed, SpeedBaseline, SpeedConvert, frameTimes, nFrames), new[] { 1, nFrames });
+        // SHMC 口型偏移 alpha：模型原生 [-1,1]、中性 0，透传无 convert（相对量、无域转换）。
+        AddF("shift_mouth_opening", BuildCurveInput(snapshot, KeyMouthOpening, MouthOpeningBaseline, static x => x, frameTimes, nFrames), new[] { 1, nFrames });
 
         if (ac.HasInput("spk_embed"))
         {

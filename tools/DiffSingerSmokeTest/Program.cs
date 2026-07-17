@@ -234,6 +234,7 @@ static void Synthesize(string voiceRoot, Dictionary<string, object?> cfg,
     float depth = float.Parse(cfg.GetValueOrDefault("max_depth")?.ToString() ?? "1.0");
     long steps = 20;
 
+    using var acoustic = Open(acousticPath);
     var acInputs = new List<NamedOnnxValue>
     {
         NvL("tokens", tokens, 1, nTokens),
@@ -250,10 +251,27 @@ static void Synthesize(string voiceRoot, Dictionary<string, object?> cfg,
         NamedOnnxValue.CreateFromTensor("steps", new DenseTensor<long>(new[] { steps }, Array.Empty<int>())),
     };
 
-    using var acoustic = Open(acousticPath);
+    // SHMC 声库：口型偏移 alpha 中性 0（模型有此输入才喂；老库无输入不加）。
+    if (acoustic.InputMetadata.ContainsKey("shift_mouth_opening"))
+        acInputs.Add(NvF("shift_mouth_opening", Fill(nFrames, 0f), 1, nFrames));
+
     using var melResult = acoustic.Run(acInputs);
     var mel = melResult.First(v => v.Name == "mel").AsTensor<float>();
     Console.WriteLine($"  mel: [{string.Join(",", mel.Dimensions.ToArray())}]");
+
+    // SHMC 响应自检：alpha=+0.8 复跑一次，mel 必须可观测地变化（扩散现采噪声本有底噪差异，
+    // 但 alpha 生效时均差应显著大于 0；若 ≈0 说明输入被图无视/被冻结）。
+    if (acoustic.InputMetadata.ContainsKey("shift_mouth_opening"))
+    {
+        var shifted = acInputs.Where(v => v.Name != "shift_mouth_opening").ToList();
+        shifted.Add(NvF("shift_mouth_opening", Fill(nFrames, 0.8f), 1, nFrames));
+        using var shiftedResult = acoustic.Run(shifted);
+        var mel2 = shiftedResult.First(v => v.Name == "mel").AsTensor<float>();
+        double diff = 0;
+        var a = mel.ToArray(); var b = mel2.ToArray();
+        for (int i = 0; i < a.Length; i++) diff += Math.Abs(a[i] - b[i]);
+        Console.WriteLine($"  SHMC alpha 0→0.8 mean|Δmel| = {diff / a.Length:F4}");
+    }
 
     using var vocoder = Open(vocoderPath);
     using var wavResult = vocoder.Run(new List<NamedOnnxValue>

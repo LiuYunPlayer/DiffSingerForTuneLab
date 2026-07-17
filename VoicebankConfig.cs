@@ -61,6 +61,9 @@ public sealed class VoicebankConfig
     public bool UseBreathinessEmbed { get; private init; }
     public bool UseVoicingEmbed { get; private init; }
     public bool UseTensionEmbed { get; private init; }
+    // SHMC（fork PR#2）：声学接受帧级口型偏移 alpha ∈ [-1,1]（相对隐式基线，0 = 不干预）。
+    // 冻结导出（--freeze_shift_mouth_opening）时导出器写 false ⇒ 不暴露轨。
+    public bool UseShiftMouthOpeningEmbed { get; private init; }
 
     // Gender 轨量程（半音）：取声学增广 augmentation_args.random_pitch_shifting.range，缺省回退 ±DefaultKeyShiftRange。
     public double KeyShiftMin { get; private init; } = -DefaultKeyShiftRange;
@@ -127,6 +130,7 @@ public sealed class VoicebankConfig
             UseBreathinessEmbed = GetBool(acoustic, "use_breathiness_embed", false),
             UseVoicingEmbed = useVoicingEmbed,
             UseTensionEmbed = GetBool(acoustic, "use_tension_embed", false),
+            UseShiftMouthOpeningEmbed = GetBool(acoustic, "use_shift_mouth_opening_embed", false),
             KeyShiftMin = keyShiftMin,
             KeyShiftMax = keyShiftMax,
 

@@ -21,6 +21,7 @@ public static class DiffSingerDeclarations
     // —— 暴露给用户的参数键（避开宿主保留名 Volume / VibratoEnvelope）——
     public const string KeyGender = "gender";
     public const string KeySpeed = "speed";
+    public const string KeyMouthOpening = "shift_mouth_opening";  // SHMC alpha：键取偏移语义，给将来绝对口型轨留 "mouth_opening"
     public const string KeySpeaker = "speaker";    // legacy：part 默认说话人下拉
     public const string KeyLanguage = "language";
     public const string KeyModel = "model";        // manifest：模型下拉（part 属性）
@@ -53,6 +54,8 @@ public static class DiffSingerDeclarations
     // 归一化刻度：gender 中性 0、量程 [-1,1]；speed 中性 1（=原速）、量程 [0,2]（百分比小数化）。
     public const double GenderBaseline = 0, GenderMin = -1, GenderMax = 1;
     public const double SpeedBaseline = 1, SpeedMin = 0, SpeedMax = 2;
+    // SHMC 口型偏移 alpha：模型原生量程即 [-1,1]、0 = 不干预（相对模型隐式基线），无 convert 直接透传。
+    public const double MouthOpeningBaseline = 0, MouthOpeningMin = -1, MouthOpeningMax = 1;
 
     public readonly record struct VarianceSpec(
         string Key, string Display, string Color,
@@ -116,6 +119,9 @@ public static class DiffSingerDeclarations
             map.Add((KeyGender, L.Tr("Gender")), Continuous("#E5A573", GenderBaseline, GenderMin, GenderMax));
         if (config.UseSpeedEmbed)
             map.Add((KeySpeed, L.Tr("Speed")), Continuous("#73B5E5", SpeedBaseline, SpeedMin, SpeedMax));
+        if (config.UseShiftMouthOpeningEmbed)
+            map.Add((KeyMouthOpening, L.Tr("Mouth opening")),
+                Continuous("#C273E5", MouthOpeningBaseline, MouthOpeningMin, MouthOpeningMax));
 
         // seed 轨：仅当 manifest 声明对应 retake 能力时暴露（连续、基线 0、量程 [0,SeedCurveMax]）。
         if (retake.Pitch)

@@ -36,6 +36,7 @@ internal static class L
             ["Phoneme mix slots"] = "音素混合槽数",
             ["Gender"] = "性别",
             ["Speed"] = "语速",
+            ["Mouth opening"] = "口型",
             ["Energy"] = "能量",
             ["Breathiness"] = "气声",
             ["Voicing"] = "发声",

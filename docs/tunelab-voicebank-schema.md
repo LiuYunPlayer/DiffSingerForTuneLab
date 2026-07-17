@@ -406,6 +406,7 @@ TuneLab 在切换引擎 / 音源时，**不清空 part 里已存的属性与 aut
 |---|---|---|---|---|---|
 | `gender` | 加性 | `[-1, 1]` | `0` | ±1 = formant 增广满程；正=下移 | `GenderConvert`：`±1`→`12/KeyShift*` |
 | `speed` | 乘性(对数) | `[0, 2]` | `1` | 1=原速，每 +1 速度 ×2 | `SpeedConvert`：`2^(x-1)` |
+| `shift_mouth_opening` | 加性 | `[-1, 1]` | `0` | SHMC 口型偏移 alpha：0=不干预，±1=推满开/闭 | 透传（模型原生量程即 [-1,1]，无 convert） |
 | `energy` | 加性 delta | `[-1, 1]` | `0` | 1.0 = +12 dB 偏移 | `Delta: x + y*12` → clamp `[-96,0]`dB |
 | `breathiness` | 加性 delta | `[-1, 1]` | `0` | 1.0 = +12 dB 偏移 | `Delta: x + y*12` → clamp `[-96,0]`dB |
 | `voicing` | 混合 delta | `[0, 1.25]` | `1` | 1=不变，0 = 触底 −96 dB，1.25 = +12 dB | 下行 `x − 48(1−y)/(2−y) − (x+72)(1−y)¹²`；上行 `x + 48(y−1)` → clamp `[-96,0]`dB，见下 |
@@ -425,6 +426,8 @@ TuneLab 在切换引擎 / 音源时，**不清空 part 里已存的属性与 aut
 - 设计过程曾比较：加法 ±12/±48（前者够不着底、后者顶部灵敏度糙 4 倍且消声点 0.46 偏高）、归一化 lerp `(x+96)y−96`（顶部糙 ~7 倍、消声点 0.66）、线性+低次幂混合（p3/p4 起步斜率 12~24，"1 附近变化太小"）、分段 S 曲线（规格直接编码但非光滑）——现式为分段 S 的光滑等效替代。
 
 **mulaw 声库（dsconfig `voicing_domain: mulaw`，fork feat/mulaw-voicing 实验）**：voicing 线上值改为谐波 RMS 的 mu-law 压缩振幅（`voicing_mu` 缺省 255）线性映射到同一 `[-96,0]` 数值域（上游 API 冻结下的伪装 dB）。**上表与公式的 dB 语义不变**——十二次幂三锚定是感知规格、与模型编码无关；插件在模型边界做三明治转换（[VoicingDomainCodec.cs](../VoicingDomainCodec.cs)：线上值→振幅→dB 进公式，出公式反向编码；两种表示均为振幅的单调双射，转换精确），编辑轨/回显轨/工程文件在两种声库上语义完全一致。红利：公式触底 −96 时 mulaw 域编码为**精确零振幅**（真·静音，而非 db 域 clamp 出的 −96dB 余响）。域标记从声学与 dsvariance 各自的 dsconfig 读取，**缺省 `db` = 历史声库零迁移**；两侧同时在用却异域/异 μ = 坏导出，log 后按 acoustic 侧处理（[VoicebankConfig.cs](../VoicebankConfig.cs) `ReadVoicingDomain`）。数值契约由 SmokeTest `--mulaw-codec` 自检钉住（锚点+全值域往返+真零特判）。
+
+**SHMC 声库（dsconfig `use_shift_mouth_opening_embed: true`，fork PR#2 实验）**：声学接受帧级口型偏移 `shift_mouth_opening = alpha ∈ [-1,1]`（相对模型隐式基线的自蒸馏控制量，非绝对口型曲线；键取偏移语义，`mouth_opening` 留给将来可能的绝对曲线轨）。模型原生量程即编辑量程、中性 0 = 不喂即无偏移 → 老工程/无轨零影响；无域转换、无方差器基线（也就没有回显轨）。冻结导出（`--freeze_shift_mouth_opening`）时导出器写 flag 为 false，轨随能力 gating 消失。alpha→偏移曲线的映射公式烘焙在 student 训练期，插件侧只透传——手感问题（分段 (1−α) 插值的增益漂移/压扁/闭合保真）属训练侧议题。
 
 ### 14.3 seed：标称值（nominal），不是幅度（magnitude）
 
