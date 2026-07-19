@@ -50,7 +50,8 @@ public sealed class VoicebankConfig
 
     // 多说话人：>1 时声明 part 级说话人选择（值为 dsconfig 原始条目，如 "260509a.Miku"）。
     public IReadOnlyList<string> Speakers { get; private init; } = [];
-    // 多语言：use_lang_id 且 languages>1 时声明 part 默认语言 + per-note 语言。
+    // 多语言：languages>1 即声明 part 默认语言 + per-note 语言（前缀音素库 use_lang_id=false 也算多语言）。
+    //   use_lang_id 只标记模型有无 lang embed；喂不喂 languages 张量由 ONNX HasInput 决定，此标志现仅作参考。
     public bool UseLanguageId { get; private init; }
     public IReadOnlyList<string> Languages { get; private init; } = [];
 

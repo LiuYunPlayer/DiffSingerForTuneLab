@@ -253,8 +253,10 @@ public static class DiffSingerDeclarations
         return ObjectConfig.Create(props);
     }
 
+    // 多语言判据只看语言表：languages 表管「有哪些语言」；use_lang_id（→ ONNX languages 输入）只管「要不要 lang embed」，
+    //   前缀音素库（多词典多语言）use_lang_id=false 照样多语言（对齐 OpenUtau：语言=phonemizer 选择，与 use_lang_id 解耦）。
     public static bool HasLanguageChoice(PartContext pc)
-        => pc.Config.UseLanguageId && EffectiveLanguages(pc).Count > 1;
+        => EffectiveLanguages(pc).Count > 1;
 
     // 有效语言 (id, 显示名)：id 来自 dsconfig 语言表；manifest 的 languages.expose 非空则按其白名单 + 顺序 + 显示名/i18n 叠加。
     public static List<(string Id, string Display)> EffectiveLanguages(PartContext pc)
