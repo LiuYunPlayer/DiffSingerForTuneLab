@@ -10,7 +10,11 @@ namespace DiffSingerForTuneLab;
 // 图片字段返回相对声库根的文件名，由调用方拼绝对路径并校验存在。
 internal static class CharacterMetadata
 {
-    public sealed record Result(string? Name, string? Author, string? ImageFile, string? DefaultPhonemizer = null);
+    public sealed record Result(string? Name, string? Author, string? ImageFile, string? PortraitFile = null, string? DefaultPhonemizer = null)
+    {
+        // 立绘显示用：portrait 缺失才退头像（OpenUtau 中 image=头像、portrait=立绘，语义不混用）。
+        public string? PortraitOrImage => PortraitFile ?? ImageFile;
+    }
 
     public static Result Read(string bankDir)
     {
@@ -43,11 +47,11 @@ internal static class CharacterMetadata
             fields.TryGetValue("name", out var name);
             if (!fields.TryGetValue("author", out var author))
                 fields.TryGetValue("voice", out author);
-            if (!fields.TryGetValue("image", out var image))
-                fields.TryGetValue("portrait", out image);
+            fields.TryGetValue("image", out var image);
+            fields.TryGetValue("portrait", out var portrait);
             fields.TryGetValue("default_phonemizer", out var phonemizer);   // OpenUtau 作者声明（默认语言回退依据）
 
-            return new Result(name, author, image, phonemizer);
+            return new Result(name, author, image, portrait, phonemizer);
         }
         catch
         {
@@ -57,7 +61,7 @@ internal static class CharacterMetadata
 
     static Result FromTxt(string path)
     {
-        string? name = null, author = null, image = null;
+        string? name = null, author = null, image = null, portrait = null;
         try
         {
             foreach (var raw in File.ReadAllLines(path))
@@ -76,8 +80,8 @@ internal static class CharacterMetadata
                         case "name": name ??= value; break;
                         case "author":
                         case "voice": author ??= value; break;
-                        case "image":
-                        case "portrait": image ??= value; break;
+                        case "image": image ??= value; break;
+                        case "portrait": portrait ??= value; break;
                     }
                 }
                 else
@@ -90,6 +94,6 @@ internal static class CharacterMetadata
         {
             // 读取失败按各字段缺省（null）处理。
         }
-        return new Result(name, author, image);
+        return new Result(name, author, image, portrait);
     }
 }
