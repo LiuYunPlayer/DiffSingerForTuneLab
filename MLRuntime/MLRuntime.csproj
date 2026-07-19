@@ -21,6 +21,7 @@
 
   <ItemGroup>
     <!-- 与插件共享的可移植核（零 TuneLab 依赖）：链接编译进本 exe，不新增共享 DLL。 -->
+    <Compile Include="..\DirectMlNative.cs" Link="Shared\DirectMlNative.cs" />
     <Compile Include="..\TensorCodec.cs" Link="Shared\TensorCodec.cs" />
     <Compile Include="..\RuntimeProtocol.cs" Link="Shared\RuntimeProtocol.cs" />
     <Compile Include="..\RuntimeHost.cs" Link="Shared\RuntimeHost.cs" />

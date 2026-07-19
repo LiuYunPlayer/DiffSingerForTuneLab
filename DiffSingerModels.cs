@@ -181,6 +181,8 @@ public sealed class DiffSingerModelCache : IDisposable
 
         try
         {
+            // 预载随包 DirectML.dll（否则 DML EP delay-load 会走到 System32 的旧版而失败，见 DirectMlNative 说明）。
+            DirectMlNative.Preload(Path.GetDirectoryName(typeof(DiffSingerModelCache).Assembly.Location)!);
             var options = new SessionOptions();
             options.AppendExecutionProvider_DML(0);
             var session = new InferenceSession(modelPath, options);
