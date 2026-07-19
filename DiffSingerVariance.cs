@@ -50,7 +50,7 @@ public static class DiffSingerVariance
             var li = new List<NamedOnnxValue> { NvL("tokens", toks, nTokens) };
             if (v.LinguisticUsesWordBoundary)
             {
-                var isVowel = phones.Select(p => v.IsVowel(p.Symbol)).ToArray();
+                var isVowel = phones.Select(p => p.IsVowel).ToArray();   // 用 phonemizer 定型的类型（dur 表+引擎补全），本预测器 dsdict 可能缺跨语言符号
                 var (wordDiv, wordDur) = DiffSingerFrames.PaddedWordDivAndDur(isVowel, phDur);
                 li.Add(NvL("word_div", wordDiv, wordDiv.Length));
                 li.Add(NvL("word_dur", wordDur, wordDur.Length));

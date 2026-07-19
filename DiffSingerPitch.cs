@@ -44,7 +44,7 @@ public static class DiffSingerPitch
             var li = new List<NamedOnnxValue> { NvL("tokens", toks, nTokens) };
             if (v.LinguisticUsesWordBoundary)
             {
-                var isVowel = phones.Select(p => v.IsVowel(p.Symbol)).ToArray();   // 结构按 base 音素分组（目标共用）
+                var isVowel = phones.Select(p => p.IsVowel).ToArray();   // 结构按 base 音素分组（目标共用）；类型取 phonemizer 定型值
                 var (wordDiv, wordDur) = DiffSingerFrames.PaddedWordDivAndDur(isVowel, phDur);
                 li.Add(NvL("word_div", wordDiv, wordDiv.Length));
                 li.Add(NvL("word_dur", wordDur, wordDur.Length));
@@ -75,7 +75,7 @@ public static class DiffSingerPitch
         var encDense = Encode(tokens);
 
         // —— note 序列：head padding + 各 note（间隙插 rest）+ tail padding；rest 组 tone 由最近非 rest 填充 ——
-        var (noteMidi, noteDur, noteRest) = BuildNotes(v, phones, notes, renderStart, frameSec, totalFrames, head, tail);
+        var (noteMidi, noteDur, noteRest) = BuildNotes(phones, notes, renderStart, frameSec, totalFrames, head, tail);
 
         // —— pitch 模型共享条件（不含 pitch/retake/noise，那三个按下方重摇逻辑逐趟追加）——
         var model = v.Model("pitch");
@@ -178,7 +178,7 @@ public static class DiffSingerPitch
     //   phonemizer/声学侧的截断时间线同口径——否则 pitch 模型按 note 全长走、轮廓越过后一 note 起点（不让位）。
     //   同起点和弦退化为 dur=0 塌缩（排序长者在前先塌，短者存活）。
     static (float[] midi, int[] durFrames, bool[] rest) BuildNotes(
-        DiffSingerPredictor v, IReadOnlyList<PhonemeSpan> phones,
+        IReadOnlyList<PhonemeSpan> phones,
         IReadOnlyList<VoiceSynthesisNoteSnapshot> notes,
         double renderStart, double frameSec, int totalFrames, int head, int tail)
     {
@@ -225,7 +225,7 @@ public static class DiffSingerPitch
                 foreach (var p in phones)
                 {
                     if (p.NoteIndex != i) continue;
-                    if (p.Symbol != "AP" && p.Symbol != "SP" && v.IsVowel(p.Symbol)) { isRest = false; break; }
+                    if (p.Symbol != "AP" && p.Symbol != "SP" && p.IsVowel) { isRest = false; break; }
                 }
                 restList.Add(isRest);
             }
