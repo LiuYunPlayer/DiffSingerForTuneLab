@@ -37,6 +37,8 @@ internal static class L
             ["Gender"] = "性别",
             ["Speed"] = "语速",
             ["Mouth opening"] = "口型",
+            ["Expressiveness"] = "表现力",
+            ["Tone shift"] = "音区偏移",
             ["Energy"] = "能量",
             ["Breathiness"] = "气声",
             ["Voicing"] = "发声",

@@ -46,6 +46,14 @@
     <Content Include="packaging\README.zh-CN.md" Link="README.zh-CN.md" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
+  <!-- 把 DirectML.dll 拷进 runtimes/win-x64/native/（与 onnxruntime.dll 同目录）——见上方 PackageReference 注释。
+       deploy-dev / pack-tlx 均复制 bin 输出整树，故落到此处即随部署与 .tlx 一并分发。 -->
+  <Target Name="CopyDirectMLNative" AfterTargets="Build;Publish">
+    <Copy SourceFiles="$(PkgMicrosoft_AI_DirectML)\bin\x64-win\DirectML.dll"
+          DestinationFolder="$(OutDir)runtimes\win-x64\native"
+          SkipUnchangedFiles="true" />
+  </Target>
+
   <!-- G2P 算法引擎的语言包（移植自 OpenUtau，MIT；各含 dict.txt + phones.txt + g2p.onnx）。
        嵌入插件程序集，运行时经 G2pPack.LoadEmbeddedPack 按 LogicalName 读取。 -->
   <ItemGroup>
@@ -59,6 +67,13 @@
   <ItemGroup>
     <PackageReference Include="YamlDotNet" Version="18.0.0" />
     <PackageReference Include="Microsoft.ML.OnnxRuntime.DirectML" Version="1.20.1" />
+    <!-- DirectML.dll 必须随包分发：OnnxRuntime.DirectML 单包只带 onnxruntime.dll，其硬依赖的 DirectML.dll
+         由传递包 Microsoft.AI.DirectML 提供、却躺在 bin/x64-win/（非 runtimes/<rid>/native 布局），SDK 默认
+         不随输出复制。于是运行时只能吃用户 System32 里那份——旧 Windows（如 Win10 19045）自带的是 2020 年的
+         DirectML 1.0，而 onnxruntime 1.20 的 DML EP 用到 1.15 才有的 API → AppendExecutionProvider_DML 直接失败
+         （实测某测试者 GTX1660Ti 就栽在此）。故显式引该包、把 DirectML.dll 拷进 runtimes/win-x64/native/（与
+         onnxruntime.dll 同目录，NativeLibrary 的 altered-search-path 令其优先于 System32 被加载，已实测生效）。 -->
+    <PackageReference Include="Microsoft.AI.DirectML" Version="1.15.2" GeneratePathProperty="true" />
     <!-- 张量缓存键哈希：XxHash64（模型文件内容哈希 + 序列化输入）。 -->
     <PackageReference Include="System.IO.Hashing" Version="8.0.0" />
   </ItemGroup>

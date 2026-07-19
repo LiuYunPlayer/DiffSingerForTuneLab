@@ -411,6 +411,8 @@ TuneLab 在切换引擎 / 音源时，**不清空 part 里已存的属性与 aut
 | `breathiness` | 加性 delta | `[-1, 1]` | `0` | 1.0 = +12 dB 偏移 | `Delta: x + y*12` → clamp `[-96,0]`dB |
 | `voicing` | 混合 delta | `[0, 1.25]` | `1` | 1=不变，0 = 触底 −96 dB，1.25 = +12 dB | 下行 `x − 48(1−y)/(2−y) − (x+72)(1−y)¹²`；上行 `x + 48(y−1)` → clamp `[-96,0]`dB，见下 |
 | `tension` | 加性 delta | `[-1, 1]` | `0` | 1.0 = +5（声学单位） | `Delta: x + y*5` → clamp `[-10,10]` |
+| `expressiveness` | 混合比 | `[0, 1]` | `1` | 1=满表现力（模型自由轮廓）、0=贴谱面音高（OpenUtau PEXP 0~100 小数化） | 逐帧喂 pitch 模型 `expr` 口；仅 dspitch `use_expr` 时暴露 |
+| `tone_shift` | 加性 | `[-12, 12]` | `0` | 半音（物理单位不归一；OpenUtau SHFC ±1200 音分）：听感音高不变、音色换音区 | 声学 `f0 × 2^(v/12)`、variance pitch `+v`、声码器吃原始 f0；仅 `pitch_controllable` 声码器时暴露 |
 | `mix:<suffix>` | 比例 | `[0, 1]` | `0` | 0=不混入；逐帧标准化(Σ>1 归一) | 直接累积（[DiffSingerSpeakerMix.cs](../DiffSingerSpeakerMix.cs)） |
 | `seed_pitch`/`seed_variance`/`seed_acoustic` | 标称 | `[0, 1]` | `0` | 见 §14.3 | `round(v·uint.MaxValue)`→uint32 哈希 |
 

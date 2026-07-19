@@ -22,6 +22,8 @@ public static class DiffSingerDeclarations
     public const string KeyGender = "gender";
     public const string KeySpeed = "speed";
     public const string KeyMouthOpening = "shift_mouth_opening";  // SHMC alpha：键取偏移语义，给将来绝对口型轨留 "mouth_opening"
+    public const string KeyExpressiveness = "expressiveness";   // pitch 表现力（PEXP）：仅 dspitch use_expr 时暴露
+    public const string KeyToneShift = "tone_shift";            // 音区偏移（SHFC）：仅 pitch_controllable 声码器时暴露
     public const string KeySpeaker = "speaker";    // legacy：part 默认说话人下拉
     public const string KeyLanguage = "language";
     public const string KeyModel = "model";        // manifest：模型下拉（part 属性）
@@ -56,6 +58,11 @@ public static class DiffSingerDeclarations
     public const double SpeedBaseline = 1, SpeedMin = 0, SpeedMax = 2;
     // SHMC 口型偏移 alpha：模型原生量程即 [-1,1]、0 = 不干预（相对模型隐式基线），无 convert 直接透传。
     public const double MouthOpeningBaseline = 0, MouthOpeningMin = -1, MouthOpeningMax = 1;
+    // 表现力：混合比（OpenUtau PEXP 0~100 的小数化），1 = 满表现力（模型自由轮廓）、0 = 贴谱面音高。
+    public const double ExpressivenessBaseline = 1, ExpressivenessMin = 0, ExpressivenessMax = 1;
+    // 音区偏移：半音（物理单位，不归一——对齐 §14.2「归一化只对可任意定标的量做」；OpenUtau SHFC ±1200 音分 = ±12）。
+    //   听感音高不变（声码器吃原始 f0）、声学按偏移后的 f0 取音色——「用另一个音区的嗓子唱这个音」。
+    public const double ToneShiftBaseline = 0, ToneShiftMin = -12, ToneShiftMax = 12;
 
     public readonly record struct VarianceSpec(
         string Key, string Display, string Color,
@@ -122,6 +129,11 @@ public static class DiffSingerDeclarations
         if (config.UseShiftMouthOpeningEmbed)
             map.Add((KeyMouthOpening, L.Tr("Mouth opening")),
                 Continuous("#C273E5", MouthOpeningBaseline, MouthOpeningMin, MouthOpeningMax));
+        // 表现力（pitch 模型 expr 口，dspitch use_expr 声明）；音区偏移（宿主 f0 技巧，仅 pitch_controllable 声码器可行）。
+        if (config.UseExpr)
+            map.Add((KeyExpressiveness, L.Tr("Expressiveness")), Continuous("#E573E5", ExpressivenessBaseline, ExpressivenessMin, ExpressivenessMax));
+        if (config.VocoderPitchControllable)
+            map.Add((KeyToneShift, L.Tr("Tone shift")), Continuous("#73E573", ToneShiftBaseline, ToneShiftMin, ToneShiftMax));
 
         // seed 轨：仅当 manifest 声明对应 retake 能力时暴露（连续、基线 0、量程 [0,SeedCurveMax]）。
         if (retake.Pitch)
@@ -282,15 +294,72 @@ public static class DiffSingerDeclarations
         return configLangs.Select(id => (id, id)).ToList();
     }
 
-    // 默认语言：manifest 模型级 default → 当前 voice 的 default → 有效语言首项。
+    // 默认语言回退链：manifest 模型级 default → 当前 voice 的 default → character.yaml default_phonemizer
+    //   （OpenUtau 生态既有的作者声明，类名关键词映射语言）→ 宿主界面语言命中 → 语言表首键。
+    //   每层都要求命中 dsconfig 语言表才采用；语言表键序来自训练配置、与“主语言”无必然关系，故首键仅作末位兜底。
     public static string DefaultLanguageId(VoicebankConfig config, ResolvedVoice resolved)
     {
-        var ids = new HashSet<string>(config.Languages, StringComparer.Ordinal);
-        if (resolved.Manifest?.DefaultLanguage is { } md && ids.Contains(md))
-            return md;
-        if (resolved.CurrentVoice?.DefaultLanguage is { } vd && ids.Contains(vd))
-            return vd;
-        return config.Languages.Count > 0 ? config.Languages[0] : string.Empty;
+        var (id, source) = Resolve();
+        LogDefaultLanguageOnce(resolved.RootPath, id, source);
+        return id;
+
+        (string Id, string Source) Resolve()
+        {
+            var ids = new HashSet<string>(config.Languages, StringComparer.Ordinal);
+            if (resolved.Manifest?.DefaultLanguage is { } md && ids.Contains(md))
+                return (md, "manifest");
+            if (resolved.CurrentVoice?.DefaultLanguage is { } vd && ids.Contains(vd))
+                return (vd, "voice");
+            if (PhonemizerLanguage(CharacterMetadata.Read(resolved.RootPath).DefaultPhonemizer) is { } pl && ids.Contains(pl))
+                return (pl, "default_phonemizer");
+            if (HostLang is { } host)
+            {
+                var hostLang = LangPart(host);
+                if (config.Languages.FirstOrDefault(x => string.Equals(x, hostLang, StringComparison.OrdinalIgnoreCase)) is { } hl)
+                    return (hl, "host");
+            }
+            return config.Languages.Count > 0 ? (config.Languages[0], "first-key") : (string.Empty, "none");
+        }
+    }
+
+    // 诊断：每 (包, 宿主语言, 结果, 判据) 只记一次——“默认语言不符预期”类问题的现场证据，量极小不刷屏。
+    static readonly HashSet<string> mLoggedLangDefaults = [];
+    static void LogDefaultLanguageOnce(string rootPath, string id, string source)
+    {
+        var host = HostLang ?? "(null)";
+        lock (mLoggedLangDefaults)
+        {
+            if (!mLoggedLangDefaults.Add($"{rootPath}|{host}|{id}|{source}"))
+                return;
+        }
+        TuneLabContext.Global.GetLogger().Info(
+            $"DiffSinger：默认语言 \"{id}\"（判据 {source}，宿主语言 \"{host}\"）—— {Path.GetFileName(rootPath)}");
+    }
+
+    // OpenUtau phonemizer 类名 → 语言 id（按关键词包含匹配；如 DiffSingerARPAPlusEnglishPhonemizer → en）。
+    //   查无返回 null，由上层回退链继续。Jyutping 须先于 Chinese 无所谓——两词无包含关系，表序仅习惯。
+    static readonly (string Keyword, string Lang)[] PhonemizerLangKeywords =
+    {
+        ("Jyutping", "yue"), ("Cantonese", "yue"), ("Chinese", "zh"), ("English", "en"),
+        ("Japanese", "ja"), ("Korean", "ko"), ("Russian", "ru"), ("Spanish", "es"),
+        ("German", "de"), ("French", "fr"), ("Italian", "it"), ("Portuguese", "pt"),
+    };
+
+    static string? PhonemizerLanguage(string? phonemizer)
+    {
+        if (string.IsNullOrWhiteSpace(phonemizer))
+            return null;
+        foreach (var (keyword, lang) in PhonemizerLangKeywords)
+            if (phonemizer.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+                return lang;
+        return null;
+    }
+
+    // "zh-CN" → "zh"（宿主 culture 的语言部；语言表键即语言码）。
+    static string LangPart(string locale)
+    {
+        int dash = locale.IndexOf('-');
+        return dash > 0 ? locale[..dash] : locale;
     }
 
     static string? HostLang => TuneLabContext.Global.Language;

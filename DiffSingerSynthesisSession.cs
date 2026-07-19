@@ -268,6 +268,29 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         var seedVarianceCurve = SampleSeedCurve(KeySeedVariance);
         var seedAcousticCurve = SampleSeedCurve(KeySeedAcoustic);
 
+        // —— 表现力 / 音区偏移曲线（轨按能力 gating 暴露；无轨/未画/NaN 即中性）——
+        //   expressiveness → pitch 模型 expr 口 [0,1]，NaN→1（满表现力，等于 OpenUtau 无曲线默认）；
+        //   tone_shift → 半音 ±12，NaN→0；两者皆合成期 clamp 兜底（宿主数据层无量程硬契约，同 CombineVariance）。
+        float[]? exprCurve = null;
+        if (config.UseExpr && snapshot.Automations.TryGetValue(KeyExpressiveness, out var exprAuto))
+        {
+            var sampled = exprAuto.Evaluator.Evaluate(frameTimes);
+            exprCurve = new float[nFrames];
+            for (int f = 0; f < nFrames; f++)
+                exprCurve[f] = (float)Math.Clamp(double.IsNaN(sampled[f]) ? 1 : sampled[f], ExpressivenessMin, ExpressivenessMax);
+        }
+        var toneShift = new float[nFrames];
+        bool anyToneShift = false;
+        if (config.VocoderPitchControllable && snapshot.Automations.TryGetValue(KeyToneShift, out var shiftAuto))
+        {
+            var sampled = shiftAuto.Evaluator.Evaluate(frameTimes);
+            for (int f = 0; f < nFrames; f++)
+            {
+                toneShift[f] = (float)Math.Clamp(double.IsNaN(sampled[f]) ? 0 : sampled[f], ToneShiftMin, ToneShiftMax);
+                anyToneShift |= toneShift[f] != 0;
+            }
+        }
+
         // tokens/languages：声学表，前后加 SP。
         var tokens = new long[nTokens];
         var langs = new long[nTokens];
@@ -331,7 +354,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         //   用户已画处（Pitch 非 NaN）用户值覆盖；NaN 自由区用预测轮廓（无 dspitch ⇒ 仍用矩形 framePitch）；PITD/vibrato 叠加在上。
         var predictedPitch = DiffSingerPitch.Predict(
             models.GetPredictor("dspitch"), phones, notes, durations,
-            renderStart, frameSec, speakerMix, config, mSamplingSteps, seedPitchCurve, mTensorCache, blendRows);
+            renderStart, frameSec, speakerMix, config, mSamplingSteps, seedPitchCurve, mTensorCache, exprCurve, blendRows);
         progress?.Report(0.28);
         if (cancellation.IsCancellationRequested)
             return null;
@@ -352,6 +375,20 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
             f0[f] = DiffSingerFrames.ToneToFreq(semitone);
             pitchReadback.Add(new Point(frameTimes[f], semitone));
         }
+        // 音区偏移分叉（对齐 OpenUtau SHFC 宿主侧技巧）：声学吃移调 f0（音色取自偏移后的音区）、声码器仍吃原始 f0
+        //   （听感音高不变）；variance 的 pitch 输入同步加偏移（预测反映目标音区）。pitch 预测与回显不受影响。
+        var varSemis = semis;
+        var acousticF0 = f0;
+        if (anyToneShift)
+        {
+            varSemis = new float[nFrames];
+            acousticF0 = new float[nFrames];
+            for (int f = 0; f < nFrames; f++)
+            {
+                varSemis[f] = semis[f] + toneShift[f];
+                acousticF0[f] = f0[f] * MathF.Pow(2f, toneShift[f] / 12f);
+            }
+        }
         progress?.Report(0.3);
         if (cancellation.IsCancellationRequested)
             return null;
@@ -359,7 +396,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         // —— variance 预测（基线；下方与用户 delta 合成喂声学、同一份实参产回显）——
         var varCurves = DiffSingerVariance.Predict(
             models.GetPredictor("dsvariance"), phones,
-            durations, semis, speakerMix, config, mSamplingSteps, seedVarianceCurve, mTensorCache, blendRows);
+            durations, varSemis, speakerMix, config, mSamplingSteps, seedVarianceCurve, mTensorCache, blendRows);
         progress?.Report(0.45);
         if (cancellation.IsCancellationRequested)
             return null;
@@ -385,7 +422,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         }
         AddL("tokens_b", tokensBFlat, new[] { mixRows, nTokens });
         AddF("blend", blendFlat, new[] { mixRows, nFrames });
-        AddF("f0", f0, new[] { 1, nFrames });
+        AddF("f0", acousticF0, new[] { 1, nFrames });   // 声学吃移调 f0（无音区偏移时即原始 f0 同引用）
 
         // —— variance：预测 + 用户 delta 合成喂声学，同一份实参产回显 ——
         //   用户曲线按帧求值（连续轨：未编辑处=中性基线 → Delta 恒得纯预测；编辑处 → 叠加），clamp 到声学值域。
@@ -504,7 +541,7 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         if (cancellation.IsCancellationRequested)
             return null;
 
-        // —— 声码器：mel (+ f0) → 波形 ——
+        // —— 声码器：mel (+ f0) → 波形（恒喂原始 f0，音区偏移只影响声学——听感音高不变是 tone shift 的语义所在）——
         var voc = models.Vocoder;
         var vInputs = new List<NamedOnnxValue> { NamedOnnxValue.CreateFromTensor("mel", mel) };
         if (voc.HasInput("f0"))
