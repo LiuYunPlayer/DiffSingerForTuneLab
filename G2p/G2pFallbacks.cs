@@ -1,3 +1,5 @@
+using OpenUtau.Api;
+
 namespace DiffSingerForTuneLab.G2p;
 
 // 移植自 OpenUtau（MIT）——OpenUtau.Core/Api/G2pFallbacks.cs。见仓库根 THIRD-PARTY-NOTICES.md。

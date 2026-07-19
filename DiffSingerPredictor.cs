@@ -6,6 +6,7 @@ using Microsoft.ML.OnnxRuntime;
 using YamlDotNet.Serialization;
 
 using DiffSingerForTuneLab.G2p;
+using OpenUtau.Api;
 
 namespace DiffSingerForTuneLab;
 
@@ -40,11 +41,16 @@ public sealed class DiffSingerPredictor : IDisposable
     readonly Dictionary<string, ulong> mModelHashes = new(StringComparer.Ordinal);
     public ulong ModelHash(string role) => mModelHashes.TryGetValue(role, out var h) ? h : 0;
 
+    // 声库自带音素器集（可空）：G2P 引擎与词典名按语言从中解析，优先于内置默认绑定。
+    readonly ExternalPhonemizerSet? mExternal;
+
     // onlyRole 非空 ⇒ 只加载该职责 role（对齐 OpenUtau：各预测器只用自己那一个 role，忽略 dsconfig 里其余 role 字段，
     //   哪怕它们指向不存在的文件）；为空（未知子目录）⇒ 保守加载全部声明的 role，不改老行为。
-    public DiffSingerPredictor(string dir, Func<string, IModelSession> load, string? onlyRole = null)
+    public DiffSingerPredictor(string dir, Func<string, IModelSession> load, string? onlyRole = null,
+        ExternalPhonemizerSet? external = null)
     {
         mDir = dir;
+        mExternal = external;
         var yaml = new DeserializerBuilder().Build();
         var cfg = yaml.Deserialize<Dictionary<string, object?>>(File.ReadAllText(Path.Combine(dir, "dsconfig.yaml")))
             ?? new Dictionary<string, object?>();
@@ -162,7 +168,12 @@ public sealed class DiffSingerPredictor : IDisposable
 
     IG2p? BuildChain(string lang)
     {
-        var dictData = LoadDsDictFile(lang);
+        // 引擎来源：声库自带音素器（外部 DLL）> 内置默认绑定；词典名跟随引擎来源
+        //   （外部 GetDictionaryName() / 内置描述符 DictionaryName，如 dsdict-fr-millefeuille.yaml——
+        //   该方案的 replacements 表住在这个变体词典里，必须先于 dsdict-{lang}.yaml 命中）。
+        var external = mExternal?.ForLang(lang);
+        var desc = external is { HasEngine: true } ? null : G2pEngines.ForLanguage(lang);
+        var dictData = LoadDsDictFile(lang, external?.DictionaryName ?? desc?.DictionaryName);
         var layers = new List<IG2p>();
 
         // 1) 词典层：dsdict 的 symbols(类型) + entries(grapheme→声库音素) + SP/AP。先声明符号再加词条（否则词条里未声明符号被丢）。
@@ -183,15 +194,29 @@ public sealed class DiffSingerPredictor : IDisposable
             if (!string.IsNullOrEmpty(s.symbol))
                 AddSymbolTypeIfAbsent(s.symbol.Trim(), NormalizeType(s.type));
 
-        // 2) 算法引擎 + remap 层（按语言绑定；无绑定 = 纯词典）。
-        var desc = G2pEngines.ForLanguage(lang);
-        if (desc != null)
+        // 2) 算法引擎 + remap 层：外部/内置二选一已在上方定源；都无 = 纯词典。
+        //   外部引擎初始化失败（Engine() 返回 null）不回落内置——该语言是作者显式声明由自带音素器负责的，
+        //   换内置引擎音素方案多半对不上，纯词典降级更稳（对齐 OpenUtau：选中的 phonemizer 坏了不会偷换）。
+        IG2p? engine;
+        string[] vowels, consonants;
+        if (external is { HasEngine: true })
         {
-            var engine = desc.Create();
+            engine = external.Engine();
+            vowels = external.Vowels;
+            consonants = external.Consonants;
+        }
+        else
+        {
+            engine = desc?.Create();
+            vowels = desc?.Vowels ?? Array.Empty<string>();
+            consonants = desc?.Consonants ?? Array.Empty<string>();
+        }
+        if (engine != null)
+        {
             var replacements = dictData.replacementsDict();           // dsdict 显式覆盖（最高优先）
             var phonemeSymbols = new Dictionary<string, bool>(StringComparer.Ordinal); // 声库符号 → isVowel
             var glide = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var ph in desc.Vowels.Concat(desc.Consonants))
+            foreach (var ph in vowels.Concat(consonants))
             {
                 // 规范符号 ph → 声库符号 resolved：dsdict 覆盖 > 前缀版存在 > 裸版存在 > 默认前缀。
                 //   这条 bare/prefix 回退是「让单语(裸符号)与多语言(前缀)库都能用」的关键，比 OpenUtau 无条件前缀更稳。
@@ -239,10 +264,18 @@ public sealed class DiffSingerPredictor : IDisposable
         _ => "consonant",
     };
 
-    // 按 dsdict-{lang}.yaml → dsdict-zh-{lang}.yaml → dsdict.yaml 顺序取首个存在的词典文件。
-    DsDictFile LoadDsDictFile(string lang)
+    // 按 声库自带音素器的 GetDictionaryName()（如 dsdict-fr-millefeuille.yaml，对齐 OpenUtau
+    //   DiffSingerBasePhonemizer.LoadG2p 的 dictionaryNames）→ dsdict-{lang}.yaml → dsdict-zh-{lang}.yaml
+    //   → dsdict.yaml 顺序取首个存在的词典文件。
+    DsDictFile LoadDsDictFile(string lang, string? externalDictName = null)
     {
-        foreach (var file in new[] { $"dsdict-{lang}.yaml", $"dsdict-zh-{lang}.yaml", "dsdict.yaml" })
+        var candidates = new List<string>(4);
+        if (!string.IsNullOrEmpty(externalDictName))
+            candidates.Add(externalDictName);
+        candidates.Add($"dsdict-{lang}.yaml");
+        candidates.Add($"dsdict-zh-{lang}.yaml");
+        candidates.Add("dsdict.yaml");
+        foreach (var file in candidates)
         {
             var path = Path.Combine(mDir, file);
             if (File.Exists(path)) return DeserializeDsDict(path);

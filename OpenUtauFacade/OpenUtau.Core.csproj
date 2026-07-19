@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- OpenUtau.Core 门面程序集：让声库自带的 OpenUtau 自定义音素器 DLL（引用 "OpenUtau.Core, Version=1.0.0.0"）
+       在本插件进程内原样解析。只承载这些 DLL 实际绑定的 G2P API 面（忠实移植自 OpenUtau，MIT，见仓库根
+       THIRD-PARTY-NOTICES.md）：OpenUtau.Api.{IG2p, G2pDictionary, G2pPack, PhonemizerAttribute} +
+       OpenUtau.Core.DiffSinger.{DiffSingerBasePhonemizer, DiffSingerG2pPhonemizer}（空壳基类）。
+       程序集名/版本必须钉死 OpenUtau.Core / 1.0.0.0——外部 DLL 按此身份引用。
+       同时是插件自身 G2P 栈的规范类型来源（ArpabetPlusG2p/KoreanG2p/词典层皆建于其上），单一真源。 -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <!-- OpenUtau 原码风格（nullable 关闭）；签名保持二进制兼容，勿加注解改动风格。 -->
+    <Nullable>disable</Nullable>
+    <RootNamespace>OpenUtau</RootNamespace>
+    <AssemblyName>OpenUtau.Core</AssemblyName>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 与插件同版：门面 G2pPack 的神经 G2P 推理用（外部 DLL 对 OnnxRuntime 的引用是 0.0.0.0 任意版）。 -->
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.DirectML" Version="1.20.1" />
+  </ItemGroup>
+
+</Project>
