@@ -116,12 +116,13 @@ public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSet
         return result;
     }
 
-    // 声库能力集按物理 RootPath 缓存（解析每次 commit 都调，避免重复解析 dsconfig）；config 随包不可变，扫描重建时清空。
+    // 声库能力集按物理 RootPath 缓存（解析每次 commit 都调，避免重复解析 dsconfig）；config 随包不可变，扫描重建时清空
+    //   （「声码器目录」设置变更 → ApplySettings → Rescan 清缓存 ⇒ pitch_controllable 判定随新目录即时重算）。
     VoicebankConfig ConfigForRoot(string rootPath)
     {
         if (mConfigCache.TryGetValue(rootPath, out var cached))
             return cached;
-        var config = VoicebankConfig.Load(rootPath, TuneLabContext.Global.GetLogger());
+        var config = VoicebankConfig.Load(rootPath, TuneLabContext.Global.GetLogger(), CollectVocoderRoots());
         mConfigCache[rootPath] = config;
         return config;
     }

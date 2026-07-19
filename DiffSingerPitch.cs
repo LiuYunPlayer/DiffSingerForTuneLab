@@ -13,7 +13,7 @@ namespace DiffSingerForTuneLab;
 //   不吃用户音高（用户编辑事后合并）；seed 轨驱动帧级 retake mask（对齐 acoustic 语义）：
 //   全保留/全重摇单趟全量预测（pitch 基值全 60、retake 全 true），混合时先 seed=0 算 take-0 参照、
 //   再正式趟 retake=逐帧 mask + pitch 口喂参照 ⇒ 保留帧被条件钉住（硬局部化，输出=take-0）。
-//   PEXP（expr）本阶段喂中性 1.0（满表现力）；steps 暂与声学共用（OpenUtau 另有 DiffSingerStepsPitch，后续统一）。
+//   PEXP（expr）吃 expressiveness 轨逐帧曲线（无轨 → 恒 1 满表现力）；steps 暂与声学共用（OpenUtau 另有 DiffSingerStepsPitch，后续统一）。
 // 调用方（Render）拿到预测轮廓后，用它替代自由区（用户音高 NaN 处）的矩形 note-step 兜底；用户已画处用户值覆盖，
 // PITD/vibrato 永远叠加在上（见共识：自由区填 f0 + 回显、事后合并）。无 dspitch ⇒ 返回 null 降级。
 public static class DiffSingerPitch
@@ -24,7 +24,7 @@ public static class DiffSingerPitch
         DiffSingerPredictor? v, IReadOnlyList<PhonemeSpan> phones,
         IReadOnlyList<VoiceSynthesisNoteSnapshot> notes, int[] phDur,
         double renderStart, double frameSec, DiffSingerSpeakerMix mix, VoicebankConfig cfg, int steps, uint[] seedPerFrame, bool tensorCache,
-        float[][]? blendRows = null)
+        float[]? exprCurve = null, float[][]? blendRows = null)
     {
         if (v is null || !v.HasModel("pitch") || phones.Count == 0 || notes.Count == 0)
             return null;
@@ -111,11 +111,16 @@ public static class DiffSingerPitch
 
         AddAccel(inputs, model, cfg, steps);
 
-        // 表现力（PEXP）：本阶段喂中性 1.0（满表现力）；可编辑 PEXP 轨后续再加。
+        // 表现力（PEXP）：expressiveness 轨逐帧 [0,1]（调用方已采样/钳制；无轨 → 恒 1 满表现力）。
+        //   属共享条件——take-0 参照与正式趟同值（改曲线 = 换条件 = 新 take，与 spk_embed 同语义）。
         if (model.HasInput("expr"))
         {
-            var expr = new float[totalFrames];
-            Array.Fill(expr, 1f);
+            var expr = exprCurve;
+            if (expr is null)
+            {
+                expr = new float[totalFrames];
+                Array.Fill(expr, 1f);
+            }
             inputs.Add(NvF("expr", expr, totalFrames));
         }
         if (model.HasInput("spk_embed"))

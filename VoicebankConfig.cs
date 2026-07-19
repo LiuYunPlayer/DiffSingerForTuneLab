@@ -13,7 +13,8 @@ namespace DiffSingerForTuneLab;
 //   · use_*_embed（声学接受为帧级输入）⇒ 暴露该量为可编辑曲线才有意义（声学不读则编辑无效）；
 //   · predict_*（方差器能自动产出该量）⇒ 自由区有内容感知的基线可回显。
 // 声学主配置在声库根 dsconfig.yaml；方差预测器配置在 dsvariance/dsconfig.yaml（predict_* 在此，
-// 缺该目录即视作无方差器、各量无基线）。字段缺失或解析失败一律降级到安全默认，不抛。
+// 缺该目录即视作无方差器、各量无基线）；pitch 预测器配置在 dspitch/dsconfig.yaml（use_expr/use_note_rest 在此）；
+// 声码器能力（pitch_controllable）在解析出的 vocoder.yaml。字段缺失或解析失败一律降级到安全默认，不抛。
 public sealed class VoicebankConfig
 {
     // Gender(key_shift) 量程缺省回退（半音）：声库未声明增广范围时的中性兜底。
@@ -44,9 +45,14 @@ public sealed class VoicebankConfig
     public double RawMaxDepth { get; private init; } = 1.0;
     public double MaxDepth => UseContinuousAcceleration ? RawMaxDepth : RawMaxDepth / 1000.0;
 
-    // pitch 预测器相关（stage 4）。
+    // pitch 预测器相关（来源 dspitch/dsconfig.yaml，对齐 OpenUtau DsPitch 读自己目录的配置；缺该目录即 false）。
+    //   UseExpr ⇒ pitch 模型有 expr 口（表现力 0~1 帧级混合），声明期据此暴露 expressiveness 轨。
     public bool UseExpr { get; private init; }
     public bool UseNoteRest { get; private init; }
+
+    // 声码器 pitch_controllable（解析出的 vocoder.yaml；查无声码器 → false）：
+    //   true ⇒ 声学吃移调 f0 而声码器吃原始 f0 可行 ⇒ 声明期暴露 tone_shift 轨（对齐 OpenUtau SHFC 语义）。
+    public bool VocoderPitchControllable { get; private init; }
 
     // 多说话人：>1 时声明 part 级说话人选择（值为 dsconfig 原始条目，如 "260509a.Miku"）。
     public IReadOnlyList<string> Speakers { get; private init; } = [];
@@ -74,13 +80,18 @@ public sealed class VoicebankConfig
     public bool PredictVoicing { get; private init; }
     public bool PredictTension { get; private init; }
 
-    public static VoicebankConfig Load(string rootPath, ILogger logger)
+    // vocoderRoots = 全局声码器搜索根（引擎设置）；null → 仅默认目录（注册表扫描等不关心声码器的调用点）。
+    public static VoicebankConfig Load(string rootPath, ILogger logger, IReadOnlyList<string>? vocoderRoots = null)
     {
         var acoustic = ReadYaml(Path.Combine(rootPath, "dsconfig.yaml"), logger);
 
         // 方差预测器配置（原生 DiffSinger 约定子目录）；缺失则各量无基线（predict_* 全 false）。
         var variancePath = Path.Combine(rootPath, "dsvariance", "dsconfig.yaml");
         var variance = File.Exists(variancePath) ? ReadYaml(variancePath, logger) : null;
+
+        // pitch 预测器配置（use_expr/use_note_rest 属 dspitch 自己的 dsconfig，非声库根）；缺失即无 pitch 侧能力。
+        var pitchPath = Path.Combine(rootPath, "dspitch", "dsconfig.yaml");
+        var pitch = File.Exists(pitchPath) ? ReadYaml(pitchPath, logger) : null;
 
         var (keyShiftMin, keyShiftMax) = ReadRange(
             Dig(acoustic, "augmentation_args", "random_pitch_shifting", "range"))
@@ -106,8 +117,9 @@ public sealed class VoicebankConfig
             UseContinuousAcceleration = GetBool(acoustic, "use_continuous_acceleration", false),
             UseVariableDepth = GetBool(acoustic, "use_variable_depth", GetBool(acoustic, "use_shallow_diffusion", false)),
             RawMaxDepth = GetFloat(acoustic, "max_depth", 1.0),
-            UseExpr = GetBool(acoustic, "use_expr", false),
-            UseNoteRest = GetBool(acoustic, "use_note_rest", false),
+            UseExpr = pitch is not null && GetBool(pitch, "use_expr", false),
+            UseNoteRest = pitch is not null && GetBool(pitch, "use_note_rest", false),
+            VocoderPitchControllable = ReadVocoderPitchControllable(rootPath, GetString(acoustic, "vocoder"), vocoderRoots, logger),
             Speakers = GetStringList(acoustic, "speakers"),
             UseLanguageId = GetBool(acoustic, "use_lang_id", false),
             Languages = ResolveLanguages(acoustic, rootPath, logger),
@@ -126,6 +138,19 @@ public sealed class VoicebankConfig
             PredictVoicing = variance is not null && GetBool(variance, "predict_voicing", false),
             PredictTension = variance is not null && GetBool(variance, "predict_tension", false),
         };
+    }
+
+    // 声码器 pitch_controllable：按与加载期同一解析链（bundled dsvocoder 优先 → 全局目录按名，见
+    //   DiffSingerModelCache.ResolveVocoderDir）定位 vocoder.yaml 后读布尔。查无声码器 / 解析失败 → false（轨不暴露，
+    //   合成期加载声码器会另行报错）。roots 为 null 时用默认 Vocoders 目录兜底。
+    static bool ReadVocoderPitchControllable(string rootPath, string vocoderName, IReadOnlyList<string>? roots, ILogger logger)
+    {
+        var dir = DiffSingerModelCache.ResolveVocoderDir(rootPath, vocoderName,
+            roots ?? [DiffSingerModelCache.VocodersDirectory]);
+        if (dir is null)
+            return false;
+        var yaml = ReadYaml(Path.Combine(dir, "vocoder.yaml"), logger);
+        return GetBool(yaml, "pitch_controllable", false);
     }
 
     // languages 在 dsconfig 里通常是引用的 JSON 文件名（{"en":1,...}，键即语言）；也兼容内联序列/映射或单个语言名。

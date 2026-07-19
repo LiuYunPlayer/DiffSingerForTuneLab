@@ -125,25 +125,33 @@ public sealed class DiffSingerModelCache : IDisposable
         return entry;
     }
 
-    // 声码器目录解析，对齐 OpenUtau 的 getVocoder()（两级）：
+    string? ResolveVocoderDir(VoicebankConfig config)
+    {
+        var dir = ResolveVocoderDir(config.RootPath, config.VocoderName, VocoderRoots);
+        if (dir is not null && string.Equals(Path.GetFileName(dir), "dsvocoder", StringComparison.OrdinalIgnoreCase))
+            mLogger.Info($"DiffSinger：使用声库自带声码器 dsvocoder/（忽略 dsconfig 的 vocoder 字段「{config.VocoderName}」）。");
+        return dir;
+    }
+
+    // 声码器目录解析，对齐 OpenUtau 的 getVocoder()（两级）。静态共享：加载期（本缓存）与声明期
+    //   （VoicebankConfig 读 pitch_controllable）同一条链，杜绝两处各自解析产生分歧。
     //   0) bundled：声库根下 dsvocoder/vocoder.yaml 存在即无条件用之，忽略 dsconfig 的 vocoder 字段
     //      （OpenUtau 语义：声库自带声码器优先。常见于 dsconfig 从模板复制、vocoder 行没改，但库里塞了自己的 dsvocoder）；
     //   1) 全局：<root>/<dsconfig.vocoder>/vocoder.yaml——按目录名命中（对应 OpenUtau 的「依赖目录/dsconfig.vocoder」）。
-    string? ResolveVocoderDir(VoicebankConfig config)
+    public static string? ResolveVocoderDir(string voicebankRoot, string vocoderName, IReadOnlyList<string> roots)
     {
         // 0) bundled：声库自带 dsvocoder/ 优先（OpenUtau 语义，无条件压过 dsconfig.vocoder）
-        var bundled = Path.Combine(config.RootPath, "dsvocoder");
+        var bundled = Path.Combine(voicebankRoot, "dsvocoder");
         if (File.Exists(Path.Combine(bundled, "vocoder.yaml")))
-        {
-            mLogger.Info($"DiffSinger：使用声库自带声码器 dsvocoder/（忽略 dsconfig 的 vocoder 字段「{config.VocoderName}」）。");
             return bundled;
-        }
-        // 1) 全局：按目录名命中 dsconfig.vocoder
-        foreach (var root in VocoderRoots)
+        // 1) 全局：按目录名命中 dsconfig.vocoder（名为空必查无——Path.Combine 落到根目录本身，无 vocoder.yaml）
+        if (string.IsNullOrWhiteSpace(vocoderName))
+            return null;
+        foreach (var root in roots)
         {
             if (string.IsNullOrWhiteSpace(root))
                 continue;
-            var dir = Path.Combine(root, config.VocoderName);
+            var dir = Path.Combine(root, vocoderName);
             if (File.Exists(Path.Combine(dir, "vocoder.yaml")))
                 return dir;
         }
