@@ -172,7 +172,8 @@ public sealed class DiffSingerPredictor : IDisposable
         //   （外部 GetDictionaryName() / 内置描述符 DictionaryName，如 dsdict-fr-millefeuille.yaml——
         //   该方案的 replacements 表住在这个变体词典里，必须先于 dsdict-{lang}.yaml 命中）。
         var external = mExternal?.ForLang(lang);
-        var desc = external is { HasEngine: true } ? null : G2pEngines.ForLanguage(lang);
+        var desc = external is { HasEngine: true } ? null
+            : G2pEngines.ForLanguage(lang, null, name => File.Exists(Path.Combine(mDir, name)));
         var dictData = LoadDsDictFile(lang, external?.DictionaryName ?? desc?.DictionaryName);
         var layers = new List<IG2p>();
 

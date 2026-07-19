@@ -71,6 +71,13 @@
     <EmbeddedResource Include="G2p\Data\g2p-arpabet-plus.zip" LogicalName="DiffSingerForTuneLab.G2p.Data.g2p-arpabet-plus.zip" />
     <EmbeddedResource Include="G2p\Data\g2p-ko.zip" LogicalName="DiffSingerForTuneLab.G2p.Data.g2p-ko.zip" />
     <EmbeddedResource Include="G2p\Data\g2p-fr-millefeuille.zip" LogicalName="DiffSingerForTuneLab.G2p.Data.g2p-fr-millefeuille.zip" />
+    <EmbeddedResource Include="G2p\Data\g2p-de.zip" LogicalName="DiffSingerForTuneLab.G2p.Data.g2p-de.zip" />
+    <EmbeddedResource Include="G2p\Data\g2p-de-marzipan.zip" LogicalName="DiffSingerForTuneLab.G2p.Data.g2p-de-marzipan.zip" />
+    <EmbeddedResource Include="G2p\Data\g2p-es.zip" LogicalName="DiffSingerForTuneLab.G2p.Data.g2p-es.zip" />
+    <EmbeddedResource Include="G2p\Data\g2p-it.zip" LogicalName="DiffSingerForTuneLab.G2p.Data.g2p-it.zip" />
+    <EmbeddedResource Include="G2p\Data\g2p-pt.zip" LogicalName="DiffSingerForTuneLab.G2p.Data.g2p-pt.zip" />
+    <EmbeddedResource Include="G2p\Data\g2p-ru.zip" LogicalName="DiffSingerForTuneLab.G2p.Data.g2p-ru.zip" />
+    <EmbeddedResource Include="G2p\Data\g2p-fil.zip" LogicalName="DiffSingerForTuneLab.G2p.Data.g2p-fil.zip" />
   </ItemGroup>
   <!-- 私有依赖：随包分发、进本插件专属 ALC。
        · YamlDotNet 解析声库的 dsconfig / character / dsdict。
