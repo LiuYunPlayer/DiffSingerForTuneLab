@@ -276,15 +276,72 @@ public static class DiffSingerDeclarations
         return configLangs.Select(id => (id, id)).ToList();
     }
 
-    // 默认语言：manifest 模型级 default → 当前 voice 的 default → 有效语言首项。
+    // 默认语言回退链：manifest 模型级 default → 当前 voice 的 default → character.yaml default_phonemizer
+    //   （OpenUtau 生态既有的作者声明，类名关键词映射语言）→ 宿主界面语言命中 → 语言表首键。
+    //   每层都要求命中 dsconfig 语言表才采用；语言表键序来自训练配置、与“主语言”无必然关系，故首键仅作末位兜底。
     public static string DefaultLanguageId(VoicebankConfig config, ResolvedVoice resolved)
     {
-        var ids = new HashSet<string>(config.Languages, StringComparer.Ordinal);
-        if (resolved.Manifest?.DefaultLanguage is { } md && ids.Contains(md))
-            return md;
-        if (resolved.CurrentVoice?.DefaultLanguage is { } vd && ids.Contains(vd))
-            return vd;
-        return config.Languages.Count > 0 ? config.Languages[0] : string.Empty;
+        var (id, source) = Resolve();
+        LogDefaultLanguageOnce(resolved.RootPath, id, source);
+        return id;
+
+        (string Id, string Source) Resolve()
+        {
+            var ids = new HashSet<string>(config.Languages, StringComparer.Ordinal);
+            if (resolved.Manifest?.DefaultLanguage is { } md && ids.Contains(md))
+                return (md, "manifest");
+            if (resolved.CurrentVoice?.DefaultLanguage is { } vd && ids.Contains(vd))
+                return (vd, "voice");
+            if (PhonemizerLanguage(CharacterMetadata.Read(resolved.RootPath).DefaultPhonemizer) is { } pl && ids.Contains(pl))
+                return (pl, "default_phonemizer");
+            if (HostLang is { } host)
+            {
+                var hostLang = LangPart(host);
+                if (config.Languages.FirstOrDefault(x => string.Equals(x, hostLang, StringComparison.OrdinalIgnoreCase)) is { } hl)
+                    return (hl, "host");
+            }
+            return config.Languages.Count > 0 ? (config.Languages[0], "first-key") : (string.Empty, "none");
+        }
+    }
+
+    // 诊断：每 (包, 宿主语言, 结果, 判据) 只记一次——“默认语言不符预期”类问题的现场证据，量极小不刷屏。
+    static readonly HashSet<string> mLoggedLangDefaults = [];
+    static void LogDefaultLanguageOnce(string rootPath, string id, string source)
+    {
+        var host = HostLang ?? "(null)";
+        lock (mLoggedLangDefaults)
+        {
+            if (!mLoggedLangDefaults.Add($"{rootPath}|{host}|{id}|{source}"))
+                return;
+        }
+        TuneLabContext.Global.GetLogger().Info(
+            $"DiffSinger：默认语言 \"{id}\"（判据 {source}，宿主语言 \"{host}\"）—— {Path.GetFileName(rootPath)}");
+    }
+
+    // OpenUtau phonemizer 类名 → 语言 id（按关键词包含匹配；如 DiffSingerARPAPlusEnglishPhonemizer → en）。
+    //   查无返回 null，由上层回退链继续。Jyutping 须先于 Chinese 无所谓——两词无包含关系，表序仅习惯。
+    static readonly (string Keyword, string Lang)[] PhonemizerLangKeywords =
+    {
+        ("Jyutping", "yue"), ("Cantonese", "yue"), ("Chinese", "zh"), ("English", "en"),
+        ("Japanese", "ja"), ("Korean", "ko"), ("Russian", "ru"), ("Spanish", "es"),
+        ("German", "de"), ("French", "fr"), ("Italian", "it"), ("Portuguese", "pt"),
+    };
+
+    static string? PhonemizerLanguage(string? phonemizer)
+    {
+        if (string.IsNullOrWhiteSpace(phonemizer))
+            return null;
+        foreach (var (keyword, lang) in PhonemizerLangKeywords)
+            if (phonemizer.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+                return lang;
+        return null;
+    }
+
+    // "zh-CN" → "zh"（宿主 culture 的语言部；语言表键即语言码）。
+    static string LangPart(string locale)
+    {
+        int dash = locale.IndexOf('-');
+        return dash > 0 ? locale[..dash] : locale;
     }
 
     static string? HostLang => TuneLabContext.Global.Language;

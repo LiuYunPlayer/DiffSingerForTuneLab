@@ -10,7 +10,7 @@ namespace DiffSingerForTuneLab;
 // 图片字段返回相对声库根的文件名，由调用方拼绝对路径并校验存在。
 internal static class CharacterMetadata
 {
-    public sealed record Result(string? Name, string? Author, string? ImageFile);
+    public sealed record Result(string? Name, string? Author, string? ImageFile, string? DefaultPhonemizer = null);
 
     public static Result Read(string bankDir)
     {
@@ -45,8 +45,9 @@ internal static class CharacterMetadata
                 fields.TryGetValue("voice", out author);
             if (!fields.TryGetValue("image", out var image))
                 fields.TryGetValue("portrait", out image);
+            fields.TryGetValue("default_phonemizer", out var phonemizer);   // OpenUtau 作者声明（默认语言回退依据）
 
-            return new Result(name, author, image);
+            return new Result(name, author, image, phonemizer);
         }
         catch
         {
