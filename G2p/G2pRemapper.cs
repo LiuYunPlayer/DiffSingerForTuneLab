@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Linq;
+using OpenUtau.Api;
 
 namespace DiffSingerForTuneLab.G2p;
 

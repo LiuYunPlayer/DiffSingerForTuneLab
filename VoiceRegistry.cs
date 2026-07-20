@@ -96,7 +96,7 @@ public sealed class VoiceRegistry
         if (suffixes.Count == 0)
         {
             // 无 speakers（单说话人模型，无 spk_embed）：整模型即一个 voice，id=模型id、名取 character。
-            list.Add(new ManifestVoice(modelId, string.Empty, modelName, EmptyMap, null, meta.ImageFile, null));
+            list.Add(new ManifestVoice(modelId, string.Empty, modelName, EmptyMap, null, meta.PortraitOrImage, null));
         }
         else
         {
@@ -105,7 +105,7 @@ public sealed class VoiceRegistry
             foreach (var entry in suffixes)
             {
                 var suffix = DiffSingerDeclarations.Suffix(entry);
-                list.Add(new ManifestVoice(suffix, entry, suffix, EmptyMap, null, meta.ImageFile, null));
+                list.Add(new ManifestVoice(suffix, entry, suffix, EmptyMap, null, meta.PortraitOrImage, null));
             }
         }
         return (pmL, list);
@@ -230,9 +230,9 @@ public sealed class VoiceRegistry
                 if (File.Exists(p)) return new FileImageResource(p);
             }
             var meta = CharacterMetadata.Read(root);
-            if (!string.IsNullOrWhiteSpace(meta.ImageFile))
+            if (!string.IsNullOrWhiteSpace(meta.PortraitOrImage))
             {
-                var p = Path.Combine(root, meta.ImageFile);
+                var p = Path.Combine(root, meta.PortraitOrImage);
                 if (File.Exists(p)) return new FileImageResource(p);
             }
             return null;

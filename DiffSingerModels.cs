@@ -289,7 +289,8 @@ public sealed class VoiceModels : IDisposable
             {
                 // 未知子目录（无映射）退化为加载全部 role，保守不改老行为。
                 var role = PredictorRole.GetValueOrDefault(subdir);
-                try { predictor = new DiffSingerPredictor(dir, mLoad, role); }
+                // 声库自带音素器（OpenUtau 音素器 DLL）：按声库根扫描/装载一次（静态缓存），供 G2P 链与词典解析。
+                try { predictor = new DiffSingerPredictor(dir, mLoad, role, ExternalPhonemizerSet.For(mConfig.RootPath, mLogger)); }
                 catch (Exception ex) { mLogger.Warning($"DiffSinger：加载预测器 {subdir} 失败：{ex.Message}"); }
             }
             mPredictors[subdir] = predictor;

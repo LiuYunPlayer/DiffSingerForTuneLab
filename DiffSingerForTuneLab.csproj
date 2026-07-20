@@ -26,6 +26,17 @@
     <Compile Remove="MLRuntime/**/*.cs" />
     <Content Remove="MLRuntime/**" />
     <None Remove="MLRuntime/**" />
+    <!-- OpenUtau.Core 门面是独立程序集（声库自带音素器 DLL 按其身份绑定），经下方 ProjectReference 进包；
+         从插件自身编译中排除其源码。 -->
+    <Compile Remove="OpenUtauFacade/**/*.cs" />
+    <Content Remove="OpenUtauFacade/**" />
+    <None Remove="OpenUtauFacade/**" />
+  </ItemGroup>
+
+  <!-- OpenUtau.Core 门面：插件 G2P 栈的规范类型来源 + 声库自带 OpenUtau 音素器 DLL 的绑定目标。
+       Private 默认 true → OpenUtau.Core.dll 随输出进包目录（宿主 ALC / 外部 DLL 皆由此解析）。 -->
+  <ItemGroup>
+    <ProjectReference Include="OpenUtauFacade\OpenUtau.Core.csproj" />
   </ItemGroup>
 
   <!-- SDK 契约：宿主统一提供、所有插件共享，Private=false 不复制进输出、打包时别带。 -->
@@ -59,6 +70,14 @@
   <ItemGroup>
     <EmbeddedResource Include="G2p\Data\g2p-arpabet-plus.zip" LogicalName="DiffSingerForTuneLab.G2p.Data.g2p-arpabet-plus.zip" />
     <EmbeddedResource Include="G2p\Data\g2p-ko.zip" LogicalName="DiffSingerForTuneLab.G2p.Data.g2p-ko.zip" />
+    <EmbeddedResource Include="G2p\Data\g2p-fr-millefeuille.zip" LogicalName="DiffSingerForTuneLab.G2p.Data.g2p-fr-millefeuille.zip" />
+    <EmbeddedResource Include="G2p\Data\g2p-de.zip" LogicalName="DiffSingerForTuneLab.G2p.Data.g2p-de.zip" />
+    <EmbeddedResource Include="G2p\Data\g2p-de-marzipan.zip" LogicalName="DiffSingerForTuneLab.G2p.Data.g2p-de-marzipan.zip" />
+    <EmbeddedResource Include="G2p\Data\g2p-es.zip" LogicalName="DiffSingerForTuneLab.G2p.Data.g2p-es.zip" />
+    <EmbeddedResource Include="G2p\Data\g2p-it.zip" LogicalName="DiffSingerForTuneLab.G2p.Data.g2p-it.zip" />
+    <EmbeddedResource Include="G2p\Data\g2p-pt.zip" LogicalName="DiffSingerForTuneLab.G2p.Data.g2p-pt.zip" />
+    <EmbeddedResource Include="G2p\Data\g2p-ru.zip" LogicalName="DiffSingerForTuneLab.G2p.Data.g2p-ru.zip" />
+    <EmbeddedResource Include="G2p\Data\g2p-fil.zip" LogicalName="DiffSingerForTuneLab.G2p.Data.g2p-fil.zip" />
   </ItemGroup>
   <!-- 私有依赖：随包分发、进本插件专属 ALC。
        · YamlDotNet 解析声库的 dsconfig / character / dsdict。

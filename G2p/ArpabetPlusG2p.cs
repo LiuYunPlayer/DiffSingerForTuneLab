@@ -2,12 +2,14 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using Microsoft.ML.OnnxRuntime;
+using OpenUtau.Api;
 
 namespace DiffSingerForTuneLab.G2p;
 
 // 移植自 OpenUtau（MIT）——OpenUtau.Core/G2p/ArpabetPlusG2p.cs。见仓库根 THIRD-PARTY-NOTICES.md。
 // 英语 ARPA+ 算法 G2P：词表(CMUdict 系) + 神经 OOV。规范符号为小写 arpabet（aa ae … 无尾数字重音）。
 //   资源包改为从插件嵌入资源加载（原 OpenUtau 走 Data.Resources）。静态包共享、线程安全初始化。
+//   基类 G2pPack 住 OpenUtau.Core 门面程序集（与声库自带音素器 DLL 共用同一实现）。
 public sealed class ArpabetPlusG2p : G2pPack
 {
     static readonly string[] graphemes =
@@ -45,7 +47,7 @@ public sealed class ArpabetPlusG2p : G2pPack
                     .Select((g, i) => Tuple.Create(g, i))
                     .ToDictionary(t => t.Item1, t => t.Item2 + 4);
                 var tuple = LoadPack(
-                    LoadEmbeddedPack("g2p-arpabet-plus.zip"),
+                    EmbeddedG2pPacks.Load("g2p-arpabet-plus.zip"),
                     s => s.ToLowerInvariant(),
                     s => RemoveTailDigits(s.ToLowerInvariant()));
                 dict = tuple.Item1;
