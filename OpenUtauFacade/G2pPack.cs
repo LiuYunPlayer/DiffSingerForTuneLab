@@ -169,5 +169,40 @@ namespace OpenUtau.Api {
                 }
             }
         }
+
+        // —— cfg.yaml 支持（可选，zip 内含此文件时训练配置精确覆盖硬编码）——
+        //    由子类在 LoadPack 后调用，成功时用 cfg 的 mapping 覆盖 GraphemeIndexes / Phonemes。
+        protected static string[] s_LoadedGraphemes;
+        protected static string[] s_LoadedPhonemes;
+
+        // 从 zip byte[] 中解析 cfg.yaml，提取 encoder.graphemes / decoder.phonemes 列表。
+        protected static bool TryLoadCfg(byte[] zipData, out string[] graphemes, out string[] phonemes) {
+            graphemes = null;
+            phonemes = null;
+            try {
+                using var ms = new MemoryStream(zipData);
+                using var zip = new ZipArchive(ms, ZipArchiveMode.Read);
+                var entry = zip.GetEntry("cfg.yaml");
+                if (entry == null) return false;
+                using var reader = new StreamReader(entry.Open(), Encoding.UTF8);
+                var lines = reader.ReadToEnd().Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+                var gList = new List<string>();
+                var pList = new List<string>();
+                List<string> current = null;
+                foreach (var raw in lines) {
+                    var line = raw.TrimEnd();
+                    if (line.Contains("graphemes:")) { current = gList; continue; }
+                    if (line.Contains("phonemes:")) { current = pList; continue; }
+                    if (line.StartsWith("- ") && current != null)
+                        current.Add(line.Substring(2).Trim());
+                }
+                if (gList.Count > 0 && pList.Count > 0) {
+                    graphemes = gList.ToArray();
+                    phonemes = pList.ToArray();
+                    return true;
+                }
+                return false;
+            } catch { return false; }
+        }
     }
 }

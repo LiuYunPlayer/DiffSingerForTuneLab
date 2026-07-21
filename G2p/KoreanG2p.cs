@@ -10,7 +10,6 @@ namespace DiffSingerForTuneLab.G2p;
 // 移植自 OpenUtau（MIT）——OpenUtau.Core/G2p/KoreanG2p.cs。见仓库根 THIRD-PARTY-NOTICES.md。
 // 韩语算法 G2P：Predict 前先把每个谚文音节按 Unicode 规则拆成 초성/중성/종성 jamo（纯算术、无模型），
 //   再走词表 + 神经 OOV。规范符号见 phonemes 表。资源包改为从插件嵌入资源加载。
-//   基类 G2pPack 住 OpenUtau.Core 门面程序集（与声库自带音素器 DLL 共用同一实现）。
 public sealed class KoreanG2p : G2pPack
 {
     static readonly string[] graphemes =
@@ -37,6 +36,9 @@ public sealed class KoreanG2p : G2pPack
     static InferenceSession? session;
     static readonly Dictionary<string, string[]> predCache = new();
 
+    // 由 cfg.yaml 覆盖后的 phonemes（静态化，跨实例共享）
+    static string[]? s_CfgPhonemes;
+
     public KoreanG2p()
     {
         lock (lockObj)
@@ -47,16 +49,27 @@ public sealed class KoreanG2p : G2pPack
                     .Skip(4)
                     .Select((g, i) => Tuple.Create(g, i))
                     .ToDictionary(t => t.Item1, t => t.Item2 + 4);
+                var zipData = EmbeddedG2pPacks.Load("g2p-ko.zip");
                 var tuple = LoadPack(
-                    EmbeddedG2pPacks.Load("g2p-ko.zip"),
+                    zipData,
                     s => s.ToLowerInvariant(),
                     s => RemoveTailDigits(s.ToLowerInvariant()));
                 dict = tuple.Item1;
                 session = tuple.Item2;
+
+                // 若 zip 内有 cfg.yaml，则以其 mapping 为准覆盖硬编码（基类 G2pPack.TryLoadCfg）
+                if (TryLoadCfg(zipData, out var cfgGraphemes, out var cfgPhonemes))
+                {
+                    graphemeIndexes = cfgGraphemes
+                        .Skip(4)
+                        .Select((g, i) => Tuple.Create(g, i))
+                        .ToDictionary(t => t.Item1, t => t.Item2 + 4);
+                    s_CfgPhonemes = cfgPhonemes;
+                }
             }
         }
         GraphemeIndexes = graphemeIndexes;
-        Phonemes = phonemes;
+        Phonemes = s_CfgPhonemes ?? phonemes;
         Dict = dict!;
         Session = session;
         PredCache = predCache;
