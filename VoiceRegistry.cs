@@ -18,16 +18,20 @@ public sealed class VoiceRegistry
 {
     public IReadOnlyOrderedMap<string, VoiceSourceInfo> Infos { get; }
 
+    // 选择器分组布局（与 Infos 平行、只管「怎么摆」）：legacy 多说话人包收成组、其余顶层平铺。空 = 全平铺。
+    public IReadOnlyList<VoiceSourceLayoutItem> Layout { get; }
+
     readonly IReadOnlyDictionary<string, VoiceNode> mVoices;   // 全局 voice id → 节点
 
-    VoiceRegistry(OrderedMap<string, VoiceSourceInfo> infos, Dictionary<string, VoiceNode> voices)
+    VoiceRegistry(OrderedMap<string, VoiceSourceInfo> infos, Dictionary<string, VoiceNode> voices, IReadOnlyList<VoiceSourceLayoutItem> layout)
     {
         Infos = infos;
         mVoices = voices;
+        Layout = layout;
     }
 
     public static VoiceRegistry Empty { get; } = new(
-        new OrderedMap<string, VoiceSourceInfo>(), new Dictionary<string, VoiceNode>(StringComparer.Ordinal));
+        new OrderedMap<string, VoiceSourceInfo>(), new Dictionary<string, VoiceNode>(StringComparer.Ordinal), []);
 
     public bool Contains(string voiceId) => mVoices.ContainsKey(voiceId);
 
@@ -35,12 +39,16 @@ public sealed class VoiceRegistry
     public static VoiceRegistry Build(IEnumerable<string> packagePaths, string? hostLang, ILogger logger)
     {
         var voices = new Dictionary<string, VoiceNode>(StringComparer.Ordinal);
+        // legacy 多说话人包（manifest 缺席且一个包展开出 >1 个 voice）：modelId → 本地化组名。分组归属唯一按 voice 的展示 model 定。
+        var legacyGroupNames = new Dictionary<string, string>(StringComparer.Ordinal);
 
         foreach (var root in packagePaths)
         {
             var manifest = TunelabManifest.Load(root, logger);
             var meta = CharacterMetadata.Read(root);
             var (model, entries) = PackageVoices(root, manifest, meta, logger);
+            if (model.Manifest is null && entries.Count > 1)
+                legacyGroupNames[model.ModelId] = I18n.Resolve(model.Name, model.NameI18n, hostLang);
             foreach (var v in entries)
             {
                 var node = voices.TryGetValue(v.Id, out var existing) ? existing : voices[v.Id] = new VoiceNode(v.Id);
@@ -54,12 +62,35 @@ public sealed class VoiceRegistry
             node.Localize(hostLang);
         }
 
+        var ordered = voices.Values.OrderBy(v => v.Info.Name, StringComparer.CurrentCulture).ToList();
+
         var infos = new OrderedMap<string, VoiceSourceInfo>();
-        foreach (var node in voices.Values.OrderBy(v => v.Info.Name, StringComparer.CurrentCulture))
+        foreach (var node in ordered)
             infos.Add(node.VoiceId, node.Info);
 
-        logger.Info($"DiffSinger：注册表——{voices.Count} 个 voice（来自 {packagePaths.Count()} 个包）。");
-        return new VoiceRegistry(infos, voices);
+        // 布局：按展示序遍历；voice 的展示 model 是 legacy 多说话人包 → 归入该组（组在首个成员处就位、保序），否则顶层。
+        //   组内部序 = 遍历序（即声库名序）；同一物理包重导出成多文件夹时各 voice 只归其最新那个 model 的组，故不产生空组。
+        var layout = new List<VoiceSourceLayoutItem>();
+        var groupItems = new Dictionary<string, List<VoiceSourceLayoutItem>>(StringComparer.Ordinal);
+        foreach (var node in ordered)
+        {
+            if (legacyGroupNames.TryGetValue(node.DisplayModelId, out var groupName))
+            {
+                if (!groupItems.TryGetValue(node.DisplayModelId, out var items))
+                {
+                    items = groupItems[node.DisplayModelId] = new List<VoiceSourceLayoutItem>();
+                    layout.Add(VoiceSourceLayoutItem.Group(groupName, items));   // items 后续原地追加（引用共享）
+                }
+                items.Add(VoiceSourceLayoutItem.Voice(node.VoiceId));
+            }
+            else
+            {
+                layout.Add(VoiceSourceLayoutItem.Voice(node.VoiceId));
+            }
+        }
+
+        logger.Info($"DiffSinger：注册表——{voices.Count} 个 voice（来自 {packagePaths.Count()} 个包），{groupItems.Count} 个 legacy 分组。");
+        return new VoiceRegistry(infos, voices, layout);
     }
 
     // 一个包暴露的 voice 列表 + 模型层信息。manifest 有 voices 用之；否则从 dsconfig speakers 自动生成。
@@ -175,12 +206,14 @@ public sealed class VoiceRegistry
         public string VoiceId { get; }
         public VoiceSourceInfo Info { get; private set; }
         public List<ModelNode> Models { get; } = new();
+        // 展示 model = 排序后首个（最新 released）；分组归属看它是不是 legacy 多说话人包。Finish 后有效。
+        public string DisplayModelId => Models[0].ModelId;
         readonly Dictionary<string, ModelNode> mByModel = new(StringComparer.Ordinal);
         PkgModel? mDisplayModel;
         ManifestVoice? mDisplayVoice;
         string mDisplayRoot = string.Empty;
 
-        public VoiceNode(string voiceId) { VoiceId = voiceId; Info = new VoiceSourceInfo { Name = voiceId }; }
+        public VoiceNode(string voiceId) { VoiceId = voiceId; Info = new VoiceSourceInfo { Name = voiceId, Description = string.Empty }; }
 
         public void Add(PkgModel pm, ManifestVoice voice, string root, IReadOnlyList<ManifestVoice> packageVoices, string? hostLang, ILogger logger)
         {

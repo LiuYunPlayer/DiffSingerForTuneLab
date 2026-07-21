@@ -158,7 +158,7 @@ public static class DiffSingerPhonemizer
             int count = noteSymbolCount[i];
             if (count <= 0) continue;                   // 延音符 / 空 note：无音素，元音由前一发声 note 铺过
             int baseFlat = notePhIndex[i];
-            var ph = notes[i].Phonemes;
+            var ph = notes[i].AllPhonemes();
             bool isPinned = pinned[i];
             var items = new SynthesizedPhoneme[count];
             var mix = new string[count][];   // mix[k] = 音素 k 的逐槽目标(string[mixSlots])；非钉死/无槽保持 null = 不混
@@ -217,7 +217,7 @@ public static class DiffSingerPhonemizer
             int leadCut = layoutLeadCut[ln];
             var layoutNote = layoutNotes[ln];
             var times = resolved[ln];
-            int n = layoutNote.PhonemeCount;            // 全序列（引导 ++ 主体，与 times / items 原序一致）
+            int n = layoutNote.LeadingPhonemes.Count + layoutNote.BodyPhonemes.Count;   // 全序列（引导 ++ 主体，与 times / items 原序一致）
             for (int k = 0; k < n; k++)
             {
                 var it = k < leadCut ? layoutNote.LeadingPhonemes[k] : layoutNote.BodyPhonemes[k - leadCut];
@@ -319,13 +319,20 @@ public static class DiffSingerPhonemizer
     // 取音素符号串：钉死=用 note.Phonemes 符号；否则 G2P。过滤到「类型已定义 且 dur 表可 tokenize」；空则 [SP]。
     static string[] GetSymbols(DiffSingerPredictor dur, VoiceSynthesisNoteSnapshot note, string lang, out bool pinned)
     {
-        pinned = note.Phonemes.Count > 0;
+        pinned = note.LeadingPhonemes.Count + note.BodyPhonemes.Count > 0;
         IEnumerable<string> raw = pinned
-            ? note.Phonemes.Select(p => ResolvePinnedSymbol(dur, p, lang))
+            ? note.AllPhonemes().Select(p => ResolvePinnedSymbol(dur, p, lang))
             : dur.G2P(note.Lyric ?? string.Empty, lang);
         var symbols = raw.Where(s => dur.IsKnownSymbol(s) && dur.TryPhoneme(s, out _)).ToArray();
         return symbols.Length > 0 ? symbols : new[] { Pause };
     }
+
+    // 快照音素全序列投影（引导 ++ 主体，时间序）：SDK 只承载结构化双列表，扁平索引寻址仅本插件需要。
+    //   任一列表空时直接返回另一列表（自由 note 两列表皆空 → 空 BodyPhonemes），仅双列表俱非空才物化拼接。
+    static IReadOnlyList<VoiceSynthesisPhonemeSnapshot> AllPhonemes(this VoiceSynthesisNoteSnapshot note)
+        => note.LeadingPhonemes.Count == 0 ? note.BodyPhonemes
+         : note.BodyPhonemes.Count == 0 ? note.LeadingPhonemes
+         : [.. note.LeadingPhonemes, .. note.BodyPhonemes];
 
     // 钉死音素符号还原：音素符号保持干净（无 lang/ 前缀），语种来自 per-phoneme「language」属性（空 = 跟随 note）。
     //   忠实 OpenUtau ValidatePhoneme 次序：先试裸符号（命中语言无关符号如 SP/AP，或兼容历史带前缀数据），

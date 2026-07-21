@@ -27,6 +27,10 @@ public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSet
 
     public IReadOnlyOrderedMap<string, VoiceSourceInfo> VoiceSourceInfos => mRegistry.Infos;
 
+    // 选择器分组布局：legacy 多说话人包（一个物理包 spk_embed 展开出的多个 voice）收进一个以声库名命名的组，
+    //   不再平铺到顶层；manifest 声库与单说话人 legacy 各自是独立身份、留在顶层（宿主对未引用 id 兜底平铺）。
+    public IReadOnlyList<VoiceSourceLayoutItem> VoiceSourceLayout => mRegistry.Layout;
+
     public void Init()
     {
         EnsureDefaultDirectory();
@@ -45,9 +49,9 @@ public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSet
         if (!mRegistry.Contains(voiceId))
             throw new ArgumentException($"未知 voice: {voiceId}");
 
-        var samplingSteps = mSettings.GetInt(KeySamplingSteps, 20);
-        var tensorCache = mSettings.GetBool(KeyTensorCache, true);
-        var cacheMaxSizeMb = mSettings.GetInt(KeyCacheMaxSizeMb, 4096);
+        var samplingSteps = (int)mSettings.GetDouble(KeySamplingSteps, 20);
+        var tensorCache = mSettings.GetBoolean(KeyTensorCache, true);
+        var cacheMaxSizeMb = (int)mSettings.GetDouble(KeyCacheMaxSizeMb, 4096);
         // 会话按需（每次合成）从 part 属性解析到具体物理包——故传解析委托而非固定 config。
         return new DiffSingerSynthesisSession(
             voiceId, context, rp => Resolve(voiceId, rp), EnsureModelCache(),
@@ -77,14 +81,21 @@ public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSet
     public ObjectConfig GetNotePropertyConfig(IVoiceSynthesisNotePropertyContext context)
         => Resolve(context.Part.VoiceId, context.Part.PartProperties) is { } pc ? DiffSingerDeclarations.BuildNoteConfig(pc, context) : EmptyConfig;
 
-    public IReadOnlyList<ObjectConfig> GetPhonemePropertyConfigs(IVoiceSynthesisNotePropertyContext context)
+    // 音素属性声明（核相对 slot 键控 map，口径 = SDK PhonemeSlots）：本插件 schema 只是 part 形状的函数
+    //（语言覆盖 + N 组音素混合目标，N = part 属性 phoneme_mix_slots），不依赖任一音素/slot 的当前值——
+    //   故所有 slot 授同一份 config，无需按 slot 合并成员值。多语言 / 能力声库才有内容，否则空 map。
+    public IReadOnlyMap<int, ObjectConfig> GetPhonemePropertyConfigs(IVoiceSynthesisNotePropertyContext context)
     {
-        // per-phoneme 面板 = 语言覆盖（多语言）+ N 组音素混合目标（N = part 属性 phoneme_mix_slots，仅能力声库）。
+        var map = new Map<int, ObjectConfig>();
         if (Resolve(context.Part.VoiceId, context.Part.PartProperties) is not { } pc)
-            return [];
+            return map;
         int slots = DiffSingerDeclarations.HasPhonemeMix(pc) ? DiffSingerDeclarations.MixSlots(context.Part.PartProperties) : 0;
         var phonemeConfig = DiffSingerDeclarations.BuildPhonemeConfig(pc, slots);
-        return context.Notes.SelectMany(n => n.Phonemes).Select(_ => phonemeConfig).ToList();
+        if (phonemeConfig.Properties.Count == 0)
+            return map;
+        foreach (int slot in context.Notes.UnionSlots())
+            map.Add(slot, phonemeConfig);
+        return map;
     }
 
     // 选中 part 去重后的已知解析上下文集（未知/解析失败过滤掉）。
