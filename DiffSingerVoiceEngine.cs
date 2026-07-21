@@ -27,8 +27,8 @@ public sealed class DiffSingerVoiceEngine : IVoiceSynthesisEngine, IExtensionSet
 
     public IReadOnlyOrderedMap<string, VoiceSourceInfo> VoiceSourceInfos => mRegistry.Infos;
 
-    // 选择器分组布局：legacy 多说话人包（一个物理包 spk_embed 展开出的多个 voice）收进一个以声库名命名的组，
-    //   不再平铺到顶层；manifest 声库与单说话人 legacy 各自是独立身份、留在顶层（宿主对未引用 id 兜底平铺）。
+    // 选择器分组布局（按模型一级分组）：多角色模型（legacy spk_embed 展开、或 manifest voices 声明的 >1 个 voice）
+    //   收进一个以模型名命名的组；solo 声库（单角色模型）直接留顶层、不套壳。未来要模型内更细层级再在此扩 layout。
     public IReadOnlyList<VoiceSourceLayoutItem> VoiceSourceLayout => mRegistry.Layout;
 
     public void Init()
