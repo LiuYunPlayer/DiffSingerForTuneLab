@@ -145,7 +145,14 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
             return;
 
         // 同步前缀（数据线程）：物化不可变快照（本块 note 全集 + 按 note 范围开窗）。
-        var snapshot = mContext.GetSnapshot(piece.Notes, piece.Notes[0].StartTime.Value, piece.Notes.Max(n => n.EndTime.Value));
+        // 冻结窗须覆盖实际采样范围：帧网格从 renderStart（首 note 前 PaddingSec 前导 SP + head 帧）起、
+        //   到末 note 后 tail 帧止，两端都落在 [首note起, 末note终] 之外。此处在音素化/dur 模型之前、
+        //   尚不知辅音时长与帧长，按 SDK 契约保守传大窗（冻的是控制点、请求大方也便宜，见宿主
+        //   SynthesisEvaluatorDebug.AssertWithinWindow）。1s 余量覆盖 PaddingSec(0.5)+head/tail 帧+前置辅音余量。
+        const double snapshotMargin = 1.0;
+        var snapshot = mContext.GetSnapshot(piece.Notes,
+            piece.Notes[0].StartTime.Value - snapshotMargin,
+            piece.Notes.Max(n => n.EndTime.Value) + snapshotMargin);
         piece.Dirty = false;
         piece.Synthesizing = true;
         piece.Progress = 0;
