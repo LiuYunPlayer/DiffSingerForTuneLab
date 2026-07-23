@@ -26,6 +26,9 @@
     <Compile Remove="MLRuntime/**/*.cs" />
     <Content Remove="MLRuntime/**" />
     <None Remove="MLRuntime/**" />
+    <Compile Remove="tests/**/*.cs" />
+    <Content Remove="tests/**" />
+    <None Remove="tests/**" />
     <!-- OpenUtau.Core 门面是独立程序集（声库自带音素器 DLL 按其身份绑定），经下方 ProjectReference 进包；
          从插件自身编译中排除其源码。 -->
     <Compile Remove="OpenUtauFacade/**/*.cs" />
