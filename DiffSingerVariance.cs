@@ -11,7 +11,8 @@ namespace DiffSingerForTuneLab;
 //   seed 轨驱动帧级 retake mask（对齐 acoustic/pitch）：全保留/全重摇单趟全量预测（基值 0、retake 全 true），
 //   混合时先 seed=0 算 take-0 参照、再正式趟 retake=逐帧 mask（单轨广播到全部通道）+ 各通道口喂参照 ⇒ 保留帧钉住。
 // 当前阶段只把预测值喂声学（无用户编辑/回显——留作下一阶段）。
-public readonly record struct VarianceCurves(float[]? Energy, float[]? Breathiness, float[]? Voicing, float[]? Tension)
+public readonly record struct VarianceCurves(
+    float[]? Energy, float[]? Breathiness, float[]? Voicing, float[]? Tension, float[]? MouthOpening)
 {
     // 按声学输入名取对应预测曲线（无该通道返回 null）。
     public float[]? this[string name] => name switch
@@ -20,6 +21,7 @@ public readonly record struct VarianceCurves(float[]? Energy, float[]? Breathine
         "breathiness" => Breathiness,
         "voicing" => Voicing,
         "tension" => Tension,
+        "mouth_opening" => MouthOpening,
         _ => null,
     };
 }
@@ -89,13 +91,15 @@ public static class DiffSingerVariance
             NvF("pitch", pitchSemis, totalFrames),
         };
 
-        // 预测通道（顺序固定 energy→breathiness→voicing→tension，仅 predict_* 为真者参与）。
-        //   通道基值 / retake / noise 不进共享条件，按下方重摇逻辑逐趟追加。
+        // 预测通道（顺序固定 energy→breathiness→voicing→tension→mouth_opening，仅 predict_* 为真者参与）。
+        //   retake 的通道数必须与模型声明的全量方差通道数一致；mouth_opening 虽不直接喂声学
+        //   （声学用 shift_mouth_opening），但方差器自身输出此通道，retake mask 必须包含它。
         var channels = new List<string>();
         if (cfg.PredictEnergy) channels.Add("energy");
         if (cfg.PredictBreathiness) channels.Add("breathiness");
         if (cfg.PredictVoicing) channels.Add("voicing");
         if (cfg.PredictTension) channels.Add("tension");
+        if (cfg.PredictMouthOpening) channels.Add("mouth_opening");
         int numVar = channels.Count;
 
         // 音素混合（帧级，N 槽）：role 模型把 encoder_out_b/blend 列为**必需**输入（导出恒有），故只要模型声明就**总是**喂。
@@ -159,7 +163,8 @@ public static class DiffSingerVariance
                 Out(cfg.PredictEnergy, "energy_pred"),
                 Out(cfg.PredictBreathiness, "breathiness_pred"),
                 Out(cfg.PredictVoicing, "voicing_pred"),
-                Out(cfg.PredictTension, "tension_pred"));
+                Out(cfg.PredictTension, "tension_pred"),
+                Out(cfg.PredictMouthOpening, "mouth_opening_pred"));
         }
 
         var allTrue = new bool[totalFrames];

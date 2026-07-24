@@ -68,6 +68,9 @@ public sealed class VoicebankConfig
     public bool UseBreathinessEmbed { get; private init; }
     public bool UseVoicingEmbed { get; private init; }
     public bool UseTensionEmbed { get; private init; }
+    // SHMC（fork PR#2）：声学接受帧级口型偏移 alpha ∈ [-1,1]（相对隐式基线，0 = 不干预）。
+    // 冻结导出（--freeze_shift_mouth_opening）时导出器写 false ⇒ 不暴露轨。
+    public bool UseShiftMouthOpeningEmbed { get; private init; }
 
     // Gender 轨量程（半音）：取声学增广 augmentation_args.random_pitch_shifting.range，缺省回退 ±DefaultKeyShiftRange。
     public double KeyShiftMin { get; private init; } = -DefaultKeyShiftRange;
@@ -75,10 +78,18 @@ public sealed class VoicebankConfig
 
     // 方差器能否自动产出该量（predict_*）：true ⇒ 自由区有基线，回显有意义。
     // 能量/气声默认 true、发声/张力默认 false——仅当方差配置存在时这些默认才适用。
+    // mouth_opening 默认 false（与 use_mouth_opening_embed 解耦，仅方差器自身输出通道）。
     public bool PredictEnergy { get; private init; }
     public bool PredictBreathiness { get; private init; }
     public bool PredictVoicing { get; private init; }
     public bool PredictTension { get; private init; }
+    public bool PredictMouthOpening { get; private init; }
+
+    // —— voicing 线上编码域（fork feat/mulaw-voicing 实验声库）——
+    // "db"（缺省 = 历史声库）或 "mulaw"（binarize 期谐波 RMS 压 mu-law 后线性映射到 [-96,0] 伪装 dB）。
+    // 消费点 VoicingDomainCodec：Delta 公式/回显/clamp 恒 dB 语义、仅模型边界转换；μ 仅 mulaw 有意义。
+    public string VoicingDomain { get; private init; } = "db";
+    public float VoicingMu { get; private init; } = 255f;
 
     // vocoderRoots = 全局声码器搜索根（引擎设置）；null → 仅默认目录（注册表扫描等不关心声码器的调用点）。
     public static VoicebankConfig Load(string rootPath, ILogger logger, IReadOnlyList<string>? vocoderRoots = null)
@@ -96,6 +107,10 @@ public sealed class VoicebankConfig
         var (keyShiftMin, keyShiftMax) = ReadRange(
             Dig(acoustic, "augmentation_args", "random_pitch_shifting", "range"))
             ?? (-DefaultKeyShiftRange, DefaultKeyShiftRange);
+
+        bool useVoicingEmbed = GetBool(acoustic, "use_voicing_embed", false);
+        bool predictVoicing = variance is not null && GetBool(variance, "predict_voicing", false);
+        var (voicingDomain, voicingMu) = ReadVoicingDomain(acoustic, variance, useVoicingEmbed, predictVoicing, logger);
 
         return new VoicebankConfig
         {
@@ -128,16 +143,46 @@ public sealed class VoicebankConfig
             UseSpeedEmbed = GetBool(acoustic, "use_speed_embed", false),
             UseEnergyEmbed = GetBool(acoustic, "use_energy_embed", false),
             UseBreathinessEmbed = GetBool(acoustic, "use_breathiness_embed", false),
-            UseVoicingEmbed = GetBool(acoustic, "use_voicing_embed", false),
+            UseVoicingEmbed = useVoicingEmbed,
             UseTensionEmbed = GetBool(acoustic, "use_tension_embed", false),
+            UseShiftMouthOpeningEmbed = GetBool(acoustic, "use_shift_mouth_opening_embed", false),
             KeyShiftMin = keyShiftMin,
             KeyShiftMax = keyShiftMax,
 
             PredictEnergy = variance is not null && GetBool(variance, "predict_energy", true),
             PredictBreathiness = variance is not null && GetBool(variance, "predict_breathiness", true),
-            PredictVoicing = variance is not null && GetBool(variance, "predict_voicing", false),
+            PredictVoicing = predictVoicing,
             PredictTension = variance is not null && GetBool(variance, "predict_tension", false),
+            PredictMouthOpening = variance is not null && GetBool(variance, "predict_mouth_opening", false),
+            VoicingDomain = voicingDomain,
+            VoicingMu = voicingMu,
         };
+    }
+
+    // voicing 域解析：声学与 dsvariance 的 dsconfig 各自可带 voicing_domain / voicing_mu（缺省 db / 255）。
+    //   域只在该模型实际消费 voicing 时有意义；两侧同时在用却异域/异 μ = 坏导出（成对训练是导出契约），
+    //   log 后按 acoustic 侧处理（终端消费者）。未知域名不猜：log 后回退 db（与"降级到安全默认"总原则一致）。
+    static (string Domain, float Mu) ReadVoicingDomain(
+        IReadOnlyDictionary<string, object?> acoustic, IReadOnlyDictionary<string, object?>? variance,
+        bool useEmbed, bool predict, ILogger logger)
+    {
+        (string Domain, float Mu) Of(IReadOnlyDictionary<string, object?> map)
+        {
+            string d = GetStringOr(map, "voicing_domain", "db");
+            if (d is not ("db" or "mulaw"))
+            {
+                logger.Warning($"DiffSinger：未知 voicing_domain '{d}'，按 db 处理");
+                d = "db";
+            }
+            return (d, (float)GetFloat(map, "voicing_mu", 255));
+        }
+
+        var acu = Of(acoustic);
+        var vari = variance is null ? acu : Of(variance);
+        if (useEmbed && predict && (acu.Domain != vari.Domain || (acu.Domain == "mulaw" && acu.Mu != vari.Mu)))
+            logger.Warning($"DiffSinger：acoustic 与 variance 的 voicing 域不一致" +
+                $"（{acu.Domain}/μ{acu.Mu} vs {vari.Domain}/μ{vari.Mu}），按 acoustic 侧处理——声库导出损坏，请重导");
+        return useEmbed ? acu : vari;
     }
 
     // 声码器 pitch_controllable：按与加载期同一解析链（bundled dsvocoder 优先 → 全局目录按名，见
