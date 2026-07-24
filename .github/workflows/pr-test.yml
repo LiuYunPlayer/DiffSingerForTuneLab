@@ -43,7 +43,11 @@ jobs:
         shell: pwsh
         run: |
           Set-Location DiffSingerForTuneLab
+          # 主插件、测试项目、冒烟工具是三个独立项目（测试/工具不被主 csproj 引用，
+          #   裸 dotnet restore 只覆盖主插件），后续 build 步骤用 --no-restore，故此处逐个 restore。
           dotnet restore
+          dotnet restore tests/DiffSinger.Tests/DiffSinger.Tests.csproj
+          dotnet restore tools/DiffSingerSmokeTest/DiffSingerSmokeTest.csproj
 
       - name: Build plugin (Release)
         shell: pwsh
