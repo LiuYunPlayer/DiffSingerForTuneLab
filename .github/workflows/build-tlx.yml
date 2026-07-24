@@ -1,5 +1,6 @@
-# DiffSingerForTuneLab Nightly Build
+# DiffSingerForTuneLab TLX Build
 # 构建插件并打包为 .tlx（= zip，内含 manifest.json + DiffSingerForTuneLab.dll + 依赖树）。
+# 触发：push 到 master（有实质变更才出包）+ 手动 dispatch。产出为 14 天临时 artifact（非 Release）。
 #
 # .tlx 结构（参考 TuneLab/tests/pack-tlx.ps1）：
 #   manifest.json          ← 插件清单（根目录）
@@ -12,13 +13,11 @@
 # 构建前提：TuneLab SDK 以 sibling 目录形式引用（ProjectReference ..\TuneLab\TuneLab.SDK\）。
 #   本 workflow 克隆 TuneLab release/2.0.0（与 manifest sdk-version "1.0" 对齐）到 ../TuneLab。
 
-name: Build TLX Nightly
+name: Build TLX
 
 on:
   push:
-    branches: [ "nightly0723" ]
-  pull_request:
-    branches: [ "nightly0723" ]
+    branches: [ "master" ]
   workflow_dispatch:
 
 jobs:
