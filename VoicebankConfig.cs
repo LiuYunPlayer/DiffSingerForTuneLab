@@ -50,9 +50,50 @@ public sealed class VoicebankConfig
     public bool UseExpr { get; private init; }
     public bool UseNoteRest { get; private init; }
 
-    // 声码器 pitch_controllable（解析出的 vocoder.yaml；查无声码器 → false）：
-    //   true ⇒ 声学吃移调 f0 而声码器吃原始 f0 可行 ⇒ 声明期暴露 tone_shift 轨（对齐 OpenUtau SHFC 语义）。
+    // 声码器 pitch_controllable + mel 规格（解析出的 vocoder.yaml；与声学 dsconfig 对应字段对比，校验一致性）。
     public bool VocoderPitchControllable { get; private init; }
+    public int VocoderNumMelBins { get; private init; }
+    public int VocoderHopSize { get; private init; }
+    public int VocoderWinSize { get; private init; }
+    public int VocoderFftSize { get; private init; }
+    public double VocoderMelFmin { get; private init; }
+    public double VocoderMelFmax { get; private init; }
+    public string VocoderMelBase { get; private init; } = "e";
+    public string VocoderMelScale { get; private init; } = "slaney";
+
+    // 声学-声码器参数一致性校验（对齐 OpenUtau DiffSingerRenderer.InvokeDiffsinger 入口校验）。
+    //   返回空列表 = 全部通过；否则每项为可读错误描述（调用方汇总或逐项抛）。
+    public List<string> ValidateVocoderConsistency()
+    {
+        var errors = new List<string>();
+        if (VocoderNumMelBins < 1 || VocoderNumMelBins > 255)
+            errors.Add($"Vocoder num_mel_bins={VocoderNumMelBins} out of range [1, 255]");
+        if (NumMelBins < 1 || NumMelBins > 255)
+            errors.Add($"Acoustic num_mel_bins={NumMelBins} out of range [1, 255]");
+        if (VocoderNumMelBins > 0 && NumMelBins > 0 && VocoderNumMelBins != NumMelBins)
+            errors.Add($"num_mel_bins mismatch: vocoder={VocoderNumMelBins} vs acoustic={NumMelBins}");
+        if (VocoderHopSize > 0 && HopSize > 0 && VocoderHopSize != HopSize)
+            errors.Add($"hop_size mismatch: vocoder={VocoderHopSize} vs acoustic={HopSize}");
+        if (VocoderWinSize > 0 && WinSize > 0 && VocoderWinSize != WinSize)
+            errors.Add($"win_size mismatch: vocoder={VocoderWinSize} vs acoustic={WinSize}");
+        if (VocoderFftSize > 0 && FftSize > 0 && VocoderFftSize != FftSize)
+            errors.Add($"fft_size mismatch: vocoder={VocoderFftSize} vs acoustic={FftSize}");
+        if (VocoderMelFmin > 0 && MelFmin > 0 && Math.Abs(VocoderMelFmin - MelFmin) > 1e-5)
+            errors.Add($"mel_fmin mismatch: vocoder={VocoderMelFmin} vs acoustic={MelFmin}");
+        if (VocoderMelFmax > 0 && MelFmax > 0 && Math.Abs(VocoderMelFmax - MelFmax) > 1e-5)
+            errors.Add($"mel_fmax mismatch: vocoder={VocoderMelFmax} vs acoustic={MelFmax}");
+        if (VocoderMelBase != "10" && VocoderMelBase != "e")
+            errors.Add($"Vocoder mel_base must be \"10\" or \"e\", got \"{VocoderMelBase}\"");
+        if (MelBase != "10" && MelBase != "e")
+            errors.Add($"Acoustic mel_base must be \"10\" or \"e\", got \"{MelBase}\"");
+        if (VocoderMelScale != "slaney" && VocoderMelScale != "htk")
+            errors.Add($"Vocoder mel_scale must be \"slaney\" or \"htk\", got \"{VocoderMelScale}\"");
+        if (MelScale != "slaney" && MelScale != "htk")
+            errors.Add($"Acoustic mel_scale must be \"slaney\" or \"htk\", got \"{MelScale}\"");
+        if (SampleRate > 0 && VocoderHopSize > 0 && HopSize > 0 && SampleRate != 44100)
+            errors.Add($"sample_rate={SampleRate} is non-standard; ensure vocoder matches");
+        return errors;
+    }
 
     // 多说话人：>1 时声明 part 级说话人选择（值为 dsconfig 原始条目，如 "260509a.Miku"）。
     public IReadOnlyList<string> Speakers { get; private init; } = [];
@@ -134,7 +175,16 @@ public sealed class VoicebankConfig
             RawMaxDepth = GetFloat(acoustic, "max_depth", 1.0),
             UseExpr = pitch is not null && GetBool(pitch, "use_expr", false),
             UseNoteRest = pitch is not null && GetBool(pitch, "use_note_rest", false),
-            VocoderPitchControllable = ReadVocoderPitchControllable(rootPath, GetString(acoustic, "vocoder"), vocoderRoots, logger),
+            VocoderPitchControllable = ReadVocoderPitchControllable(rootPath, GetString(acoustic, "vocoder"), vocoderRoots, logger,
+                out var vMelBins, out var vHop, out var vWin, out var vFft, out var vFmin, out var vFmax, out var vMelBase, out var vMelScale),
+            VocoderNumMelBins = vMelBins,
+            VocoderHopSize = vHop,
+            VocoderWinSize = vWin,
+            VocoderFftSize = vFft,
+            VocoderMelFmin = vFmin,
+            VocoderMelFmax = vFmax,
+            VocoderMelBase = vMelBase,
+            VocoderMelScale = vMelScale,
             Speakers = GetStringList(acoustic, "speakers"),
             UseLanguageId = GetBool(acoustic, "use_lang_id", false),
             Languages = ResolveLanguages(acoustic, rootPath, logger),
@@ -185,16 +235,29 @@ public sealed class VoicebankConfig
         return useEmbed ? acu : vari;
     }
 
-    // 声码器 pitch_controllable：按与加载期同一解析链（bundled dsvocoder 优先 → 全局目录按名，见
-    //   DiffSingerModelCache.ResolveVocoderDir）定位 vocoder.yaml 后读布尔。查无声码器 / 解析失败 → false（轨不暴露，
-    //   合成期加载声码器会另行报错）。roots 为 null 时用默认 Vocoders 目录兜底。
-    static bool ReadVocoderPitchControllable(string rootPath, string vocoderName, IReadOnlyList<string>? roots, ILogger logger)
+    // 声码器 pitch_controllable + mel 规格：按与加载期同一解析链（bundled dsvocoder 优先 → 全局目录按名，见
+    //   DiffSingerModelCache.ResolveVocoderDir）定位 vocoder.yaml 后读布尔 + mel 规格（与声学 dsconfig 对应字段
+    //   对比、校验一致性）。查无声码器 / 解析失败 → false（轨不暴露，合成期加载声码器会另行报错）；out 参数留缺省
+    //   （0 / "e" / "slaney"）表示"未知、跳过该项校验"。roots 为 null 时用默认 Vocoders 目录兜底。
+    static bool ReadVocoderPitchControllable(string rootPath, string vocoderName, IReadOnlyList<string>? roots, ILogger logger,
+        out int outNumMelBins, out int outHopSize, out int outWinSize, out int outFftSize,
+        out double outMelFmin, out double outMelFmax, out string outMelBase, out string outMelScale)
     {
+        outNumMelBins = 0; outHopSize = 0; outWinSize = 0; outFftSize = 0;
+        outMelFmin = 0; outMelFmax = 0; outMelBase = "e"; outMelScale = "slaney";
         var dir = DiffSingerModelCache.ResolveVocoderDir(rootPath, vocoderName,
             roots ?? [DiffSingerModelCache.VocodersDirectory]);
         if (dir is null)
             return false;
         var yaml = ReadYaml(Path.Combine(dir, "vocoder.yaml"), logger);
+        outNumMelBins = GetInt(yaml, "num_mel_bins", 0);
+        outHopSize = GetInt(yaml, "hop_size", 0);
+        outWinSize = GetInt(yaml, "win_size", 0);
+        outFftSize = GetInt(yaml, "fft_size", 0);
+        outMelFmin = GetFloat(yaml, "mel_fmin", 0);
+        outMelFmax = GetFloat(yaml, "mel_fmax", 0);
+        outMelBase = GetStringOr(yaml, "mel_base", "e");
+        outMelScale = GetStringOr(yaml, "mel_scale", "slaney");
         return GetBool(yaml, "pitch_controllable", false);
     }
 

@@ -207,6 +207,16 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
         var config = pc.Config;
         var resolved = pc.Resolved;
 
+        // 声学-声码器参数一致性校验（对齐 OpenUtau DiffSingerRenderer.InvokeDiffsinger 入口校验）。
+        //   仅在声码器存在时校验（无声码器会在后续加载时报错，此处不重复）。
+        var vocErrors = config.ValidateVocoderConsistency();
+        if (vocErrors.Count > 0)
+        {
+            var msg = "DiffSinger 声学-声码器参数不一致：\n" + string.Join("\n", vocErrors);
+            TuneLabContext.Global.GetLogger().Error(msg);
+            throw new InvalidOperationException(msg);
+        }
+
         var models = mModelCache.GetOrLoad(config);
         int hop = models.HopSize, sr = models.SampleRate, hidden = models.HiddenSize;
         double frameSec = (double)hop / sr;
@@ -539,6 +549,25 @@ public sealed class DiffSingerSynthesisSession : IVoiceSynthesisSession
                 mel = RunAcoustic(ins);
             }
         }
+
+        // mel_base 变换（对齐 OpenUtau DiffSingerRenderer）：声学与声码器 mel_base 不一致时，
+        //   对 mel 张量做对数缩放（vocoder="e" & acoustic="10" → *= ln(10) ≈ 2.30259；
+        //   vocoder="10" & acoustic="e" → *= log10(e) ≈ 0.434294）。
+        if (config.VocoderMelBase != config.MelBase)
+        {
+            float k = config.VocoderMelBase == "e" && config.MelBase == "10" ? 2.30259f
+                : config.VocoderMelBase == "10" && config.MelBase == "e" ? 0.434294f
+                : 1f;  // 不可能（校验已拦），安全兜底
+            if (k != 1f)
+            {
+                var dims = mel.Dimensions;
+                for (int b = 0; b < dims[0]; b++)
+                    for (int t = 0; t < dims[1]; t++)
+                        for (int c = 0; c < dims[2]; c++)
+                            mel[b, t, c] *= k;
+            }
+        }
+
         progress?.Report(0.75);
         if (cancellation.IsCancellationRequested)
             return null;
