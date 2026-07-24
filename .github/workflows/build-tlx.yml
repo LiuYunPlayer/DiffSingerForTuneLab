@@ -1,0 +1,148 @@
+# DiffSingerForTuneLab Nightly Build
+# 构建插件并打包为 .tlx（= zip，内含 manifest.json + DiffSingerForTuneLab.dll + 依赖树）。
+#
+# .tlx 结构（参考 TuneLab/tests/pack-tlx.ps1）：
+#   manifest.json          ← 插件清单（根目录）
+#   DiffSingerForTuneLab.dll
+#   DiffSingerForTuneLab.deps.json
+#   runtimes/win-x64/native/       ← DirectML.dll + onnxruntime 原生库
+#   OpenUtau.Core.dll              ← G2P 门面
+#   ...（NuGet 私有依赖 YamlDotNet / System.IO.Hashing 等）
+#
+# 构建前提：TuneLab SDK 以 sibling 目录形式引用（ProjectReference ..\TuneLab\TuneLab.SDK\）。
+#   本 workflow 克隆 TuneLab release/2.0.0（与 manifest sdk-version "1.0" 对齐）到 ../TuneLab。
+
+name: Build TLX Nightly
+
+on:
+  push:
+    branches: [ "nightly0723" ]
+  pull_request:
+    branches: [ "nightly0723" ]
+  workflow_dispatch:
+
+jobs:
+  build-tlx:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Checkout DiffSingerForTuneLab
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: DiffSingerForTuneLab
+
+      - name: Checkout TuneLab SDK (release/2.0.0)
+        uses: actions/checkout@v4
+        with:
+          repository: LiuYunPlayer/TuneLab
+          ref: release/2.0.0
+          path: TuneLab
+          sparse-checkout: |
+            TuneLab.SDK
+            TuneLab.Foundation
+          sparse-checkout-cone-mode: false
+
+      - name: Setup .NET 8.0
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore NuGet packages
+        shell: pwsh
+        run: |
+          Set-Location DiffSingerForTuneLab
+          dotnet restore
+
+      - name: Build Release (win-x64)
+        shell: pwsh
+        run: |
+          Set-Location DiffSingerForTuneLab
+          dotnet build `
+            --configuration Release `
+            --no-restore `
+            -p:PlatformTarget=x64 `
+            -p:ContinuousIntegrationBuild=true
+
+      - name: Get short SHA
+        uses: benjlevesque/short-sha@v3.0
+        id: short-sha
+        with:
+          length: 7
+
+      - name: Pack .tlx
+        shell: pwsh
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $ErrorActionPreference = 'Stop'
+
+          # 构建输出目录（net8.0，EnableDynamicLoading 使依赖树完整落地）
+          $src = Join-Path $PWD "DiffSingerForTuneLab\bin\Release\net8.0"
+          if (-not (Test-Path $src)) {
+            Write-Error "构建输出不存在: $src"
+          }
+
+          # 输出 .tlx 目录
+          $outDir = Join-Path $PWD "tlx"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+          # 临时打包目录（复制输出内容）
+          $staging = Join-Path $outDir "staging"
+          if (Test-Path $staging) { Remove-Item $staging -Recurse -Force }
+          Copy-Item $src $staging -Recurse
+
+          # 确保 runtimes/win-x64/native/ 存在（DirectML.dll 等原生依赖）
+          # CopyDirectMLNative 目标在 Build 时已触发，但显式检查
+          $nativeDir = Join-Path $staging "runtimes\win-x64\native"
+          if (-not (Test-Path $nativeDir)) {
+            Write-Warning "runtimes/win-x64/native/ 不存在，DirectML 可能无法加载"
+          }
+
+          # manifest.json 已在输出目录（CopyToOutputDirectory=PreserveNewest）
+          $manifest = Join-Path $staging "manifest.json"
+          if (-not (Test-Path $manifest)) {
+            Write-Error "manifest.json 不在输出目录中"
+          }
+
+          # 插件 DLL 必须存在
+          $dll = Join-Path $staging "DiffSingerForTuneLab.dll"
+          if (-not (Test-Path $dll)) {
+            Write-Error "DiffSingerForTuneLab.dll 不存在"
+          }
+
+          # 打包为 .tlx（= zip，内容为 staging 根）
+          $version = (Get-Content $manifest | ConvertFrom-Json).version
+          $sha = $env:GITHUB_SHA.Substring(0, 7)
+          $tlxName = "DiffSingerForTuneLab-nightly-$sha.tlx"
+          $tlxPath = Join-Path $outDir $tlxName
+
+          if (Test-Path $tlxPath) { Remove-Item $tlxPath -Force }
+          [System.IO.Compression.ZipFile]::CreateFromDirectory($staging, $tlxPath)
+
+          Write-Host "打包完成: $tlxPath"
+          Write-Host "tlx_path=$tlxPath" >> $env:GITHUB_OUTPUT
+
+          # 清理临时目录
+          Remove-Item $staging -Recurse -Force
+
+      - name: Upload .tlx artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DiffSingerForTuneLab-nightly-${{ steps.short-sha.outputs.sha }}
+          path: tlx/*.tlx
+          retention-days: 14
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ steps.short-sha.outputs.sha }}
+          path: |
+            DiffSingerForTuneLab/**/bin/**/*.log
+          retention-days: 7

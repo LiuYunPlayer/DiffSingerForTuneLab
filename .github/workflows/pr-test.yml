@@ -1,0 +1,79 @@
+# PR 验证工作流：构建 + 单元测试 + 冒烟测试编译
+# 每次 PR 到 master 时自动触发，确保代码能编译、测试通过、冒烟测试可构建。
+# 与 build-tlx.yml（ nightly 打包 .tlx）互补：pr-test 轻量快速、tlx 构建重但产 artifact。
+
+name: PR Test
+
+on:
+  pull_request:
+    branches: [ "master" ]
+  push:
+    branches: [ "master" ]
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout DiffSingerForTuneLab
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: DiffSingerForTuneLab
+
+      - name: Checkout TuneLab SDK (release/2.0.0)
+        uses: actions/checkout@v4
+        with:
+          repository: LiuYunPlayer/TuneLab
+          ref: release/2.0.0
+          path: TuneLab
+          sparse-checkout: |
+            TuneLab.SDK
+            TuneLab.Foundation
+          sparse-checkout-cone-mode: false
+
+      - name: Setup .NET 8.0
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore NuGet packages
+        shell: pwsh
+        run: |
+          Set-Location DiffSingerForTuneLab
+          dotnet restore
+
+      - name: Build plugin (Release)
+        shell: pwsh
+        run: |
+          Set-Location DiffSingerForTuneLab
+          dotnet build --configuration Release --no-restore -v minimal
+
+      - name: Build unit tests
+        shell: pwsh
+        run: |
+          Set-Location DiffSingerForTuneLab
+          dotnet build tests/DiffSinger.Tests/DiffSinger.Tests.csproj --configuration Release --no-restore -v minimal
+
+      - name: Run unit tests
+        shell: pwsh
+        run: |
+          Set-Location DiffSingerForTuneLab
+          dotnet test tests/DiffSinger.Tests/DiffSinger.Tests.csproj --configuration Release --no-build --logger:"console;verbosity=normal"
+
+      - name: Build smoke test tool
+        shell: pwsh
+        run: |
+          Set-Location DiffSingerForTuneLab
+          dotnet build tools/DiffSingerSmokeTest/DiffSingerSmokeTest.csproj --configuration Release --no-restore -v minimal
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ github.sha }}
+          path: |
+            DiffSingerForTuneLab/tests/**/TestResult*.xml
+          retention-days: 7
