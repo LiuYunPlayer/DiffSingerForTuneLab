@@ -27,6 +27,15 @@ Copy-Item -Path (Join-Path $mlSource "*") -Destination $mlStage -Recurse -Force
 $mlRuntimes = Join-Path $mlStage "runtimes"
 if (Test-Path $mlRuntimes) { Remove-Item $mlRuntimes -Recurse -Force }
 
+# 剪除输出【根目录】冗余的原生库副本 + DirectML 调试符号：规范副本在 runtimes/<rid>/native/，
+# 宿主经 deps.json（AssemblyDependencyResolver）从那里解析、根部这几份用不上。某些 SDK 版本
+# （如 CI 的 10.x）会把它们额外拷到输出根、白占 ~17MB，某些（本机 8.x）不拷——显式剪除以保证
+# 跨环境产物一致、精简。只删根部，runtimes/ 整树不动。
+foreach ($f in 'DirectML.dll','DirectML.pdb','DirectML.Debug.dll','DirectML.Debug.pdb','onnxruntime.dll','onnxruntime.lib') {
+    $p = Join-Path $source $f
+    if (Test-Path $p) { Remove-Item $p -Force }
+}
+
 # 从 manifest.json 取 id + version 命名产物
 $desc = Get-Content (Join-Path $source "manifest.json") -Raw | ConvertFrom-Json
 $tlx = Join-Path $out ("$($desc.id)-$($desc.version).tlx")
