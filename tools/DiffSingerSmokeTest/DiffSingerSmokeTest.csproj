@@ -30,6 +30,7 @@
     <Compile Include="..\..\PipeTransport.cs" Link="Core\PipeTransport.cs" />
     <Compile Include="..\..\PipeFraming.cs" Link="Core\PipeFraming.cs" />
     <Compile Include="..\..\JobObject.cs" Link="Core\JobObject.cs" />
+    <Compile Include="..\..\VoicingDomainCodec.cs" Link="Core\VoicingDomainCodec.cs" />
   </ItemGroup>
 
 </Project>

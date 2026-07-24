@@ -21,6 +21,7 @@ public static class DiffSingerDeclarations
     // —— 暴露给用户的参数键（避开宿主保留名 Volume / VibratoEnvelope）——
     public const string KeyGender = "gender";
     public const string KeySpeed = "speed";
+    public const string KeyMouthOpening = "shift_mouth_opening";  // SHMC alpha：键取偏移语义，给将来绝对口型轨留 "mouth_opening"
     public const string KeyExpressiveness = "expressiveness";   // pitch 表现力（PEXP）：仅 dspitch use_expr 时暴露
     public const string KeyToneShift = "tone_shift";            // 音区偏移（SHFC）：仅 pitch_controllable 声码器时暴露
     public const string KeySpeaker = "speaker";    // legacy：part 默认说话人下拉
@@ -55,6 +56,8 @@ public static class DiffSingerDeclarations
     // 归一化刻度：gender 中性 0、量程 [-1,1]；speed 中性 1（=原速）、量程 [0,2]（百分比小数化）。
     public const double GenderBaseline = 0, GenderMin = -1, GenderMax = 1;
     public const double SpeedBaseline = 1, SpeedMin = 0, SpeedMax = 2;
+    // SHMC 口型偏移 alpha：模型原生量程即 [-1,1]、0 = 不干预（相对模型隐式基线），无 convert 直接透传。
+    public const double MouthOpeningBaseline = 0, MouthOpeningMin = -1, MouthOpeningMax = 1;
     // 表现力：混合比（OpenUtau PEXP 0~100 的小数化），1 = 满表现力（模型自由轮廓）、0 = 贴谱面音高。
     public const double ExpressivenessBaseline = 1, ExpressivenessMin = 0, ExpressivenessMax = 1;
     // 音区偏移：半音（物理单位，不归一——对齐 §14.2「归一化只对可任意定标的量做」；OpenUtau SHFC ±1200 音分 = ±12）。
@@ -123,6 +126,9 @@ public static class DiffSingerDeclarations
             map.Add((KeyGender, L.Tr("Gender")), Continuous("#E5A573", GenderBaseline, GenderMin, GenderMax));
         if (config.UseSpeedEmbed)
             map.Add((KeySpeed, L.Tr("Speed")), Continuous("#73B5E5", SpeedBaseline, SpeedMin, SpeedMax));
+        if (config.UseShiftMouthOpeningEmbed)
+            map.Add((KeyMouthOpening, L.Tr("Mouth opening")),
+                Continuous("#C273E5", MouthOpeningBaseline, MouthOpeningMin, MouthOpeningMax));
         // 表现力（pitch 模型 expr 口，dspitch use_expr 声明）；音区偏移（宿主 f0 技巧，仅 pitch_controllable 声码器可行）。
         if (config.UseExpr)
             map.Add((KeyExpressiveness, L.Tr("Expressiveness")), Continuous("#E573E5", ExpressivenessBaseline, ExpressivenessMin, ExpressivenessMax));
