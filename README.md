@@ -25,6 +25,21 @@ GitHub/
 dotnet build
 ```
 
+## 发版
+
+版本号存在**三处，必须同步**：`manifest.json` 的 `version`（宿主唯一读取处）、`DiffSingerForTuneLab.csproj` 的 `<Version>`（dll 元数据）、git tag `v<version>`。
+
+```
+pwsh tools/pack-tlx.ps1          # 本地出 tools/tlx/<id>-<version>.tlx
+git tag v1.0.0 && git push origin v1.0.0
+```
+
+推 tag 触发 `.github/workflows/release.yml`：校验 tag 与 manifest 版本一致 → 跑单测 → 打包 → 建**草稿** Release 并附 `.tlx`，人工过目发行说明后手动发布。
+
+## 许可
+
+本仓库以 [MIT](LICENSE.txt) 发布。移植/捆绑的第三方代码与数据（OpenUtau，MIT）另见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)；两份许可文本均随 `.tlx` 落到安装目录。
+
 ## 参考
 
 - 人类版开发文档：`../TuneLab/docs/plugin-development.md` §5（Voice）

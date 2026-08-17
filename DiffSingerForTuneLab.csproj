@@ -10,6 +10,11 @@
     <Nullable>enable</Nullable>
     <RootNamespace>DiffSingerForTuneLab</RootNamespace>
     <AssemblyName>DiffSingerForTuneLab</AssemblyName>
+    <!-- 版本号须与 manifest.json 的 "version" 手动同步（宿主只读 manifest；这里管的是 dll 元数据，
+         用户在文件属性/异常栈里看到的就是它）。发版流程：改 manifest → 改此处 → tag v<version>。 -->
+    <Version>1.0.0</Version>
+    <Product>DiffSinger for TuneLab</Product>
+    <Authors>Jingang</Authors>
     <!-- 插件作为动态加载的程序集：令 NuGet 私有依赖随输出复制进包目录（宿主 ALC 从包目录加载，
          不会从本机 NuGet 缓存解析），并生成适配动态加载的 deps.json。Private=false 的 SDK 引用不受影响、仍不复制。 -->
     <EnableDynamicLoading>true</EnableDynamicLoading>
@@ -53,6 +58,8 @@
     <Content Include="manifest.json" CopyToOutputDirectory="PreserveNewest" />
     <!-- 移植/捆绑第三方（OpenUtau MIT）的署名，随包分发。 -->
     <Content Include="THIRD-PARTY-NOTICES.md" CopyToOutputDirectory="PreserveNewest" />
+    <!-- 本插件自身许可（MIT）：与第三方声明一并随包落到安装目录，用户拿到二进制即拿到许可文本。 -->
+    <Content Include="LICENSE.txt" CopyToOutputDirectory="PreserveNewest" />
     <!-- 条目级 introduction（详情窗正文 + agent 按需拉取）：宿主只认 manifest 显式声明的路径，
          **不再**按 README.md 之类的约定名去发现，也没有 <base>.<culture>.md 那种隐式后缀约定
          —— 语言变体走 manifest 的 localizations.<lang>.introduction 指名（见 manifest.json）。

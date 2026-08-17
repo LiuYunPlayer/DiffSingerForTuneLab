@@ -1,12 +1,13 @@
 {
   "id": "diffsingerfortunelab",
   "name": "DiffSinger",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "author": "Jingang",
-  "description": "DiffSinger 歌声合成引擎。",
+  "description": "DiffSinger singing voice synthesis engine. Reads community-standard DiffSinger voicebanks directly.",
   "introduction": "Introduction.md",
   "localizations": {
     "zh-CN": {
+      "description": "DiffSinger 歌声合成引擎。直接读取社区标准格式的 DiffSinger 声库。",
       "introduction": "Introduction.zh-CN.md"
     }
   },
