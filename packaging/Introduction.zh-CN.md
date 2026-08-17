@@ -25,6 +25,7 @@ Voices\
    ├─ character.yaml         ← 角色元数据（character.yaml 或 character.txt，二选一，必需）
    ├─ acoustic.onnx
    ├─ dsdur\ dspitch\ dsvariance\ …   ← 各预测器子目录
+   ├─ （可选）dsvocoder\      ← 声库自带的声码器，见 §2
    └─ （可选）tunelab.yaml    ← TuneLab 专属描述，见 §5
 ```
 
@@ -38,7 +39,21 @@ Voices\
 
 ## 2. 安装声码器（Vocoder）
 
-DiffSinger 声学模型输出的是梅尔频谱，需要**声码器**才能还原成声音。默认声码器目录：
+DiffSinger 声学模型输出的是梅尔频谱，需要**声码器**才能还原成声音。声码器按下列**两级顺序**解析（与 OpenUtau 一致）：
+
+**① 声库自带 —— 无条件优先。** 若模型文件夹下有 `dsvocoder\vocoder.yaml`，就用它，并**忽略** `dsconfig.yaml` 里的 `vocoder` 字段：
+
+```
+MyModel\
+├─ dsconfig.yaml
+└─ dsvocoder\           ← 有这个就用它，什么都不用装
+   ├─ vocoder.yaml
+   └─ <模型>.onnx
+```
+
+这种情况很常见：`dsconfig.yaml` 多是从模板复制、`vocoder:` 那行没改，而声库把自己微调的声码器塞在 `dsvocoder\` 里。这类模型开箱即用——不必额外安装，名字对不上也无妨。
+
+**② 否则，在声码器目录里按文件夹名查找。** 默认声码器目录：
 
 ```
 %APPDATA%\DiffSingerForTuneLab\Vocoders\<声码器名>\
@@ -46,11 +61,11 @@ DiffSinger 声学模型输出的是梅尔频谱，需要**声码器**才能还�
    └─ <模型>.onnx
 ```
 
-`<声码器名>` 必须与模型 `dsconfig.yaml` 里 `vocoder` 字段的值**一致**（大小写敏感）。一个声码器可被多个模型共用，装一次即可。
+此时 `<声码器名>` 必须与模型 `dsconfig.yaml` 里 `vocoder` 字段的值**一致**（大小写敏感）。一个声码器可被多个模型共用，装一次即可。
 
 声码器也可放在别处：打开 **设置 → 扩展 → DiffSinger**，在 **「声码器目录」** 里逐行添加额外目录（每行一个）。默认目录始终生效，添加的目录是**追加**、按顺序查找。
 
-> 若合成后**没有声音**，多半是声码器没装、或名字与 `dsconfig.yaml` 的 `vocoder` 对不上。
+> 若合成后**没有声音**，说明模型既没有自带 `dsvocoder\`、也没找到同名声码器——装一个文件夹名等于 `dsconfig.yaml` 里 `vocoder` 的声码器，或把声码器放进模型自己的 `dsvocoder\`。
 
 ---
 

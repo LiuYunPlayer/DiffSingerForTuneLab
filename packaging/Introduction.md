@@ -25,6 +25,7 @@ Voices\
    ├─ character.yaml         ← character metadata (character.yaml OR character.txt, required)
    ├─ acoustic.onnx
    ├─ dsdur\ dspitch\ dsvariance\ …   ← predictor subdirectories
+   ├─ (optional) dsvocoder\   ← vocoder shipped with the model, see §2
    └─ (optional) tunelab.yaml ← TuneLab-specific descriptor, see §5
 ```
 
@@ -38,7 +39,21 @@ Open **Settings → Extensions → DiffSinger** and add folders to **"Voicebank 
 
 ## 2. Installing a vocoder
 
-A DiffSinger acoustic model outputs a mel-spectrogram; a **vocoder** is required to turn it into audio. Default vocoder directory:
+A DiffSinger acoustic model outputs a mel-spectrogram; a **vocoder** is required to turn it into audio. The vocoder is resolved in two steps, in this order (same rule as OpenUtau):
+
+**① Bundled with the model — wins unconditionally.** If the model folder contains `dsvocoder\vocoder.yaml`, that vocoder is used and the `vocoder` field in `dsconfig.yaml` is **ignored**:
+
+```
+MyModel\
+├─ dsconfig.yaml
+└─ dsvocoder\           ← if this exists, it is used — install nothing
+   ├─ vocoder.yaml
+   └─ <model>.onnx
+```
+
+This is common in practice: `dsconfig.yaml` is often copied from a template with its `vocoder:` line left untouched, while the voicebank ships its own fine-tuned vocoder in `dsvocoder\`. Such models work out of the box — you do not need to install anything, and the name mismatch is harmless.
+
+**② Otherwise, by folder name in the vocoder directories.** Default vocoder directory:
 
 ```
 %APPDATA%\DiffSingerForTuneLab\Vocoders\<vocoder-name>\
@@ -46,11 +61,11 @@ A DiffSinger acoustic model outputs a mel-spectrogram; a **vocoder** is required
    └─ <model>.onnx
 ```
 
-`<vocoder-name>` must **match** the `vocoder` field in the model's `dsconfig.yaml` (case-sensitive). One vocoder can be shared by many models — install it once.
+Here `<vocoder-name>` must **match** the `vocoder` field in the model's `dsconfig.yaml` (case-sensitive). One vocoder can be shared by many models — install it once.
 
 Vocoders can also live elsewhere: open **Settings → Extensions → DiffSinger** and add folders to **"Vocoder directories"** (one per row). The default directory is always active; the ones you add are **appended** and searched in order.
 
-> If synthesis produces **no sound**, the vocoder is most likely missing or its folder name doesn't match `dsconfig.yaml`'s `vocoder`.
+> If synthesis produces **no sound**, the model has no bundled `dsvocoder\` *and* no matching vocoder was found — install one whose folder name equals `dsconfig.yaml`'s `vocoder`, or drop the vocoder into the model's own `dsvocoder\`.
 
 ---
 
